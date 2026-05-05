@@ -14,11 +14,10 @@ use qdrant_client::qdrant::{
     DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, GetPointsBuilder,
     Match, PointId, PointStruct, QueryBatchPointsBuilder, QueryPointsBuilder, Range,
     RepeatedStrings, SparseIndexConfig, SparseVector, SparseVectorConfig,
-    SparseVectorParams, UpsertPointsBuilder, VectorInput, VectorParams, VectorParamsMap,
-    VectorsConfig, Modifier, Query, PayloadIncludeSelector,
+    SparseVectorParams, Timestamp, UpsertPointsBuilder, VectorInput, VectorParams,
+    VectorParamsMap, VectorsConfig, Modifier, Query, PayloadIncludeSelector,
 };
 use qdrant_client::Qdrant;
-use prost_types::Timestamp as ProstTimestamp;
 
 use crate::common::{
     string_to_uuid, sys_collection_name, DenseDistance,
@@ -837,7 +836,7 @@ fn convert_metadata_node(
                     .and_then(|s| {
                         chrono::DateTime::parse_from_rfc3339(&s.replace('Z', "+00:00")).ok()
                     })
-                    .map(|dt| ProstTimestamp {
+                    .map(|dt| Timestamp {
                         seconds: dt.timestamp(),
                         nanos: dt.timestamp_subsec_nanos() as i32,
                     });
