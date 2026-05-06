@@ -25,7 +25,7 @@ use encoder::{
 use encoder::search as encoder_search;
 use models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CollectionExistsResponse,
-    Document, OkResponse, SearchQuery, SearchResult, VectorConfigInternal,
+    Document, OkResponse, ReadyResponse, SearchQuery, SearchResult, VectorConfigInternal,
 };
 use qdrant::{DbError, QdrantDb};
 
@@ -42,6 +42,42 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Va
         status,
         Json(json!({ "detail": msg.into() })),
     )
+}
+
+/// `GET /v1/health/check` — process is up and serving HTTP (mirrors Python `health_check`).
+async fn health_check() -> Json<OkResponse> {
+    Json(OkResponse::ok())
+}
+
+/// `GET /v1/health/ready` — same status rules and JSON body as Python `readiness_check`.
+/// In **amgix-now** there is no RabbitMQ or separate index/query workers; those probes are
+/// reported `true` when not applicable so `ready` tracks Qdrant connectivity.
+async fn health_ready(State(app): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
+    const PARTIAL_READY: u16 = 218;
+
+    let database = app.db.is_connected().await;
+    let rabbitmq = true;
+    let index = true;
+    let query = true;
+    let ready = database && rabbitmq && index && query;
+
+    let body = ReadyResponse {
+        database,
+        rabbitmq,
+        index,
+        query,
+        ready,
+    };
+
+    let status = if !database || !rabbitmq || (!index && !query) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::from_u16(PARTIAL_READY).expect("218 is a valid status code")
+    };
+
+    (status, Json(body))
 }
 
 async fn create_collection(
@@ -329,6 +365,8 @@ async fn main() {
     };
 
     let app = Router::new()
+        .route("/v1/health/check", get(health_check))
+        .route("/v1/health/ready", get(health_ready))
         .route(
             "/v1/collections/{collection_name}",
             post(create_collection).delete(delete_collection),

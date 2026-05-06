@@ -125,6 +125,12 @@ impl QdrantDb {
         Ok(())
     }
 
+    /// Lightweight gRPC probe — mirrors Python `QdrantDatabase.is_connected` (`client.info()` /
+    /// health-style call).
+    pub async fn is_connected(&self) -> bool {
+        self.client.health_check().await.is_ok()
+    }
+
     // -----------------------------------------------------------------------
     // create_collection
     // -----------------------------------------------------------------------

@@ -36,6 +36,16 @@ impl OkResponse {
     }
 }
 
+/// Readiness body — same JSON shape as Python `ReadyResponse` in `amgix-server` (`main.py`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyResponse {
+    pub database: bool,
+    pub rabbitmq: bool,
+    pub index: bool,
+    pub query: bool,
+    pub ready: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionExistsResponse {
     pub exists: bool,

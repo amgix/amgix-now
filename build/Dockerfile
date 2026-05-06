@@ -45,7 +45,7 @@ RUN chmod +x /app/amgix-now /app/prefix-log-exec.sh /app/wait-for-deps.sh /app/e
 ENV AMGIX_DEFAULT_DATABASE_URL=qdrant://localhost:6334 \
     AMGIX_DATABASE_URL=qdrant://localhost:6334
 
-ARG AMGIX_VERSION=${AMGIX_VERSION}
+ARG AMGIX_VERSION=${AMGIX_VERSION:-0.1.0-dev}
 ENV AMGIX_VERSION=${AMGIX_VERSION}
 
 ENV AMGIX_VARIANT='Amgix-Now'
@@ -55,7 +55,7 @@ EXPOSE 8235
 
 VOLUME ["/data"]
 
-# HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
-#     CMD curl --silent --fail --max-time 3 http://127.0.0.1:8235/v1/health/ready || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+    CMD curl --silent --fail --max-time 3 http://127.0.0.1:8235/v1/health/ready || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
