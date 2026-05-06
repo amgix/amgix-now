@@ -333,6 +333,21 @@ async fn get_collection_stats(
     }))
 }
 
+/// `POST /v1/collections/{collection_name}/empty` — mirrors Python `empty_collection`.
+async fn empty_collection(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let ok = app.db.empty_collection(&real_collection_name).await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to empty collection: {e}"),
+        )
+    })?;
+    Ok(Json(OkResponse { ok, skipped: None }))
+}
+
 async fn upsert_document(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
@@ -514,6 +529,10 @@ async fn main() {
         .route(
             "/v1/collections/{collection_name}/stats",
             get(get_collection_stats),
+        )
+        .route(
+            "/v1/collections/{collection_name}/empty",
+            post(empty_collection),
         )
         .route(
             "/v1/collections/{collection_name}/documents",

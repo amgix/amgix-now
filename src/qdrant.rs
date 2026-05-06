@@ -291,6 +291,21 @@ impl QdrantDb {
         Ok(true)
     }
 
+    pub async fn empty_collection(&self, collection_name: &str) -> Result<bool, DbError> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(collection_name).points(Filter::default()),
+            )
+            .await?;
+
+        let stats_id = string_to_uuid(&format!("{collection_name}_stats")).to_string();
+        self.client
+            .delete_points(DeletePointsBuilder::new(&self.meta_collection).points(vec![stats_id]))
+            .await?;
+
+        Ok(true)
+    }
+
     // -----------------------------------------------------------------------
     // get_collection_info_internal
     // -----------------------------------------------------------------------
