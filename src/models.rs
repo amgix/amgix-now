@@ -98,6 +98,43 @@ pub struct CollectionStatsResponse {
     pub queue: QueueInfo,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QueuedDocumentStatus {
+    Queued,
+    Requeued,
+    Indexed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueOperationType {
+    Upsert,
+    Delete,
+}
+
+/// One row in `DocumentStatusResponse.statuses` — mirrors `document.py` `DocumentStatus`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentStatus {
+    pub status: QueuedDocumentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_type: Option<QueueOperationType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub try_count: Option<u32>,
+}
+
+/// Mirrors `document.py` `DocumentStatusResponse`. In **amgix-now** only `indexed` appears (no queue).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentStatusResponse {
+    pub statuses: Vec<DocumentStatus>,
+}
+
 // ---------------------------------------------------------------------------
 // Metadata index (used in both API and internal collection configs)
 // ---------------------------------------------------------------------------

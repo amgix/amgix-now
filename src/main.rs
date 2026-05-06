@@ -27,8 +27,9 @@ use encoder::{
 use encoder::search as encoder_search;
 use models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CollectionExistsResponse,
-    CollectionStatsResponse, Document, OkResponse, QueueInfo, ReadyResponse, SearchQuery,
-    SearchResult, SystemInfoResponse, VectorConfigInternal, VersionResponse,
+    CollectionStatsResponse, Document, DocumentStatus, DocumentStatusResponse, OkResponse,
+    QueueInfo, QueuedDocumentStatus, ReadyResponse, SearchQuery, SearchResult,
+    SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
 
@@ -431,6 +432,49 @@ async fn get_document(
     Ok(Json(Document::from(doc_with)))
 }
 
+/// `GET /v1/collections/{collection_name}/documents/{document_id}/status` — mirrors Python
+/// `get_document_status` / `get_queue_statuses`. No queue in **amgix-now**; only `indexed` when present.
+async fn get_document_status(
+    State(app): State<AppState>,
+    Path((collection_name, document_id)): Path<(String, String)>,
+) -> Result<Json<DocumentStatusResponse>, (StatusCode, Json<Value>)> {
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let rows = app
+        .db
+        .get_documents(&real_collection_name, &[document_id.as_str()], true)
+        .await
+        .map_err(|e| match e {
+            DbError::Config(m) => api_error(StatusCode::BAD_REQUEST, m),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {e}"),
+            ),
+        })?;
+
+    let doc_with = rows.into_iter().next().flatten();
+    let statuses = if let Some(doc) = doc_with {
+        vec![DocumentStatus {
+            status: QueuedDocumentStatus::Indexed,
+            op_type: None,
+            info: None,
+            timestamp: doc.timestamp,
+            queue_id: None,
+            try_count: None,
+        }]
+    } else {
+        vec![]
+    };
+
+    if statuses.is_empty() {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            format!("Document {document_id} not found in collection {collection_name}"),
+        ));
+    }
+
+    Ok(Json(DocumentStatusResponse { statuses }))
+}
+
 async fn delete_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
@@ -582,6 +626,10 @@ async fn main() {
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}/sync",
             delete(delete_document),
+        )
+        .route(
+            "/v1/collections/{collection_name}/documents/{document_id}/status",
+            get(get_document_status),
         )
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}",
