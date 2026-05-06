@@ -27,8 +27,8 @@ use encoder::{
 use encoder::search as encoder_search;
 use models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CollectionExistsResponse,
-    Document, OkResponse, ReadyResponse, SearchQuery, SearchResult, SystemInfoResponse,
-    VectorConfigInternal, VersionResponse,
+    CollectionStatsResponse, Document, OkResponse, QueueInfo, ReadyResponse, SearchQuery,
+    SearchResult, SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
 
@@ -296,6 +296,43 @@ async fn collection_exists(
     }
 }
 
+/// `GET /v1/collections/{collection_name}/stats` — mirrors Python `get_collection_stats`.
+/// `amgix-now` has no queue; `queue` is always all zeros.
+async fn get_collection_stats(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+) -> Result<Json<CollectionStatsResponse>, (StatusCode, Json<Value>)> {
+    let real_collection_name = get_real_collection_name(&collection_name);
+
+    match app.db.get_collection_info_internal(&real_collection_name).await {
+        Ok(_) => {}
+        Err(DbError::NotFound(_)) => {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to check collection: {e}"),
+            ));
+        }
+    }
+
+    let stats = app.db.get_collection_stats(&real_collection_name).await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get collection stats: {e}"),
+        )
+    })?;
+
+    Ok(Json(CollectionStatsResponse {
+        doc_count: stats.doc_count,
+        queue: QueueInfo::empty(),
+    }))
+}
+
 async fn upsert_document(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
@@ -473,6 +510,10 @@ async fn main() {
         .route(
             "/v1/collections/{collection_name}/exists",
             get(collection_exists),
+        )
+        .route(
+            "/v1/collections/{collection_name}/stats",
+            get(get_collection_stats),
         )
         .route(
             "/v1/collections/{collection_name}/documents",

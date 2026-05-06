@@ -67,6 +67,37 @@ pub struct CollectionExistsResponse {
     pub exists: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueInfo {
+    pub queued_upsert: i64,
+    pub queued_delete: i64,
+    pub requeued_upsert: i64,
+    pub requeued_delete: i64,
+    pub failed_upsert: i64,
+    pub failed_delete: i64,
+    pub total: i64,
+}
+
+impl QueueInfo {
+    pub fn empty() -> Self {
+        QueueInfo {
+            queued_upsert: 0,
+            queued_delete: 0,
+            requeued_upsert: 0,
+            requeued_delete: 0,
+            failed_upsert: 0,
+            failed_delete: 0,
+            total: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionStatsResponse {
+    pub doc_count: i64,
+    pub queue: QueueInfo,
+}
+
 // ---------------------------------------------------------------------------
 // Metadata index (used in both API and internal collection configs)
 // ---------------------------------------------------------------------------
