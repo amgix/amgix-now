@@ -398,6 +398,39 @@ async fn upsert_documents_bulk(
     }
 }
 
+/// `GET /v1/collections/{collection_name}/documents/{document_id}` — mirrors Python `get_document`.
+async fn get_document(
+    State(app): State<AppState>,
+    Path((collection_name, document_id)): Path<(String, String)>,
+) -> Result<Json<Document>, (StatusCode, Json<Value>)> {
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let rows = app
+        .db
+        .get_documents(&real_collection_name, &[document_id.as_str()], false)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(m) => api_error(StatusCode::NOT_FOUND, m),
+            DbError::Config(m) => api_error(StatusCode::BAD_REQUEST, m),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {e}"),
+            ),
+        })?;
+
+    let doc_with = rows
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("Document '{document_id}' not found"),
+            )
+        })?;
+
+    Ok(Json(Document::from(doc_with)))
+}
+
 async fn delete_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
@@ -552,7 +585,7 @@ async fn main() {
         )
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}",
-            delete(delete_document),
+            get(get_document).delete(delete_document),
         )
         .route(
             "/v1/collections/{collection_name}/search",

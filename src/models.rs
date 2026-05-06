@@ -388,6 +388,21 @@ pub struct DocumentWithVectors {
     pub token_lengths: HashMap<String, usize>,
 }
 
+impl From<DocumentWithVectors> for Document {
+    fn from(d: DocumentWithVectors) -> Self {
+        Document {
+            id: d.id,
+            timestamp: d.timestamp,
+            tags: d.tags,
+            name: d.name,
+            description: d.description,
+            content: d.content,
+            metadata: d.metadata,
+            custom_vectors: d.custom_vectors,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SearchQueryWithVectors — SearchQuery + pre-computed query vectors.
 // Mirrors vector.py SearchQueryWithVectors exactly.
