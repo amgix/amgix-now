@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use common::{
-    get_real_collection_name, qdrant_client_url, VectorType, DATABASE_KIND,
+    get_real_collection_name, get_user_collection_name, qdrant_client_url, VectorType, DATABASE_KIND,
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
@@ -116,6 +116,38 @@ async fn system_info(
         rabbitmq_version: "unknown".to_string(),
         collection_count: collection_names.len() as u64,
     }))
+}
+
+/// `GET /v1/collections` — mirrors Python `list_collections`.
+async fn list_collections(
+    State(app): State<AppState>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<Value>)> {
+    let names = app.db.list_collections().await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list collections: {e}"),
+        )
+    })?;
+    Ok(Json(names.iter().map(|n| get_user_collection_name(n).to_string()).collect()))
+}
+
+/// `GET /v1/collections/{collection_name}` — mirrors Python `get_collection_config`.
+async fn get_collection_config(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+) -> Result<Json<CollectionConfig>, (StatusCode, Json<Value>)> {
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let internal = app.db.get_collection_info_internal(&real_collection_name).await.map_err(|e| match e {
+        DbError::NotFound(_) => api_error(
+            StatusCode::NOT_FOUND,
+            format!("Collection '{collection_name}' not found"),
+        ),
+        e => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get collection config: {e}"),
+        ),
+    })?;
+    Ok(Json(CollectionConfig::from(internal)))
 }
 
 async fn create_collection(
@@ -433,9 +465,10 @@ async fn main() {
         .route("/v1/system/info", get(system_info))
         .route("/v1/health/check", get(health_check))
         .route("/v1/health/ready", get(health_ready))
+        .route("/v1/collections", get(list_collections))
         .route(
             "/v1/collections/{collection_name}",
-            post(create_collection).delete(delete_collection),
+            get(get_collection_config).post(create_collection).delete(delete_collection),
         )
         .route(
             "/v1/collections/{collection_name}/exists",

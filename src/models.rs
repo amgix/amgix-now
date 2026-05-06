@@ -227,6 +227,39 @@ impl From<VectorConfig> for VectorConfigInternal {
     }
 }
 
+impl From<VectorConfigInternal> for VectorConfig {
+    fn from(v: VectorConfigInternal) -> Self {
+        VectorConfig {
+            name: v.name,
+            vector_type: v.vector_type,
+            model: v.model,
+            revision: v.revision,
+            query_model: v.query_model,
+            query_revision: v.query_revision,
+            dimensions: v.dimensions,
+            top_k: v.top_k,
+            wmtr_word_weight: v.wmtr_word_weight,
+            index_fields: v.index_fields,
+            language_default_code: v.language_default_code,
+            language_detect: v.language_detect,
+            language_confidence: v.language_confidence,
+            normalization: v.normalization,
+            dense_distance: v.dense_distance,
+            keep_case: v.keep_case,
+        }
+    }
+}
+
+impl From<CollectionConfigInternal> for CollectionConfig {
+    fn from(c: CollectionConfigInternal) -> Self {
+        CollectionConfig {
+            vectors: c.vectors.into_iter().map(VectorConfig::from).collect(),
+            store_content: c.store_content,
+            metadata_indexes: c.metadata_indexes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionConfigInternal {
     #[serde(default = "default_version")]
