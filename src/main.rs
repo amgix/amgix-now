@@ -20,7 +20,7 @@ use uuid::Uuid;
 use common::{get_real_collection_name, qdrant_client_url, VectorType};
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
-    CollectionConfigCache, NamedLocks, SearchError, UpsertSyncError,
+    CollectionConfigCache, NamedLocks, SearchError, StatsUpdateBatcher, UpsertSyncError,
 };
 use encoder::search as encoder_search;
 use models::{
@@ -33,7 +33,7 @@ use qdrant::{DbError, QdrantDb};
 struct AppState {
     db: Arc<QdrantDb>,
     collection_cache: CollectionConfigCache,
-    stats_locks: NamedLocks,
+    stats_batcher: StatsUpdateBatcher,
     doc_locks: NamedLocks,
 }
 
@@ -70,7 +70,7 @@ async fn create_collection(
     let internal_for_validation: Vec<VectorConfigInternal> =
         config.vectors.iter().cloned().map(VectorConfigInternal::from).collect();
 
-    let validation = validate_models(&internal_for_validation);
+    let validation = validate_models(internal_for_validation).await;
     if let Some(err) = validation.error {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -199,7 +199,7 @@ async fn upsert_document(
     match document_upsert_sync(
         &app.db,
         &app.collection_cache,
-        &app.stats_locks,
+        &app.stats_batcher,
         &app.doc_locks,
         &real_collection_name,
         document,
@@ -224,7 +224,7 @@ async fn upsert_documents_bulk(
     match document_upsert_bulk(
         &app.db,
         &app.collection_cache,
-        &app.stats_locks,
+        &app.stats_batcher,
         &app.doc_locks,
         &real_collection_name,
         request.documents,
@@ -247,7 +247,7 @@ async fn delete_document(
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_delete_sync(
         &app.db,
-        &app.stats_locks,
+        &app.stats_batcher,
         &app.doc_locks,
         &real_collection_name,
         &document_id,
@@ -280,6 +280,28 @@ async fn search(
     }
 }
 
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let _ = sig.recv().await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = sigterm => {}
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let db_url = std::env::var("AMGIX_DATABASE_URL")
@@ -298,10 +320,11 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), NamedLocks::new());
     let state = AppState {
         db,
         collection_cache: CollectionConfigCache::new(),
-        stats_locks: NamedLocks::new(),
+        stats_batcher,
         doc_locks: NamedLocks::new(),
     };
 
@@ -338,5 +361,20 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8235").await.unwrap();
     println!("amgix-now listening on http://0.0.0.0:8235");
-    axum::serve(listener, app).await.unwrap();
+
+    let shutdown = async {
+        wait_for_shutdown_signal().await;
+        println!("shutdown signal received, finishing in-flight requests");
+    };
+
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await;
+
+    stats_shutdown.shutdown_and_wait().await;
+
+    if let Err(e) = serve_result {
+        eprintln!("server error: {e}");
+        std::process::exit(1);
+    }
 }

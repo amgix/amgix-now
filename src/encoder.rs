@@ -5,14 +5,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
 
 use crate::common::{VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT};
 use crate::models::{
     CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
-    ModelValidationResult, SearchQuery, VectorConfigInternal, VectorSearchWeight,
+    ModelValidationResult, SearchQuery, SearchQueryWithVectors, VectorConfigInternal,
+    VectorSearchWeight,
 };
-use crate::qdrant::{DbError, QdrantDb};
+use crate::qdrant::{CollectionStats, DbError, QdrantDb};
 use crate::vectors::vectorizer::Vectorizer;
 
 // ---------------------------------------------------------------------------
@@ -136,22 +137,14 @@ pub async fn get_collection_info_cached(
 }
 
 // ---------------------------------------------------------------------------
-// update_collection_stats — mirrors encoder.py update_collection_stats exactly
+// Collection stats persistence — mirrors encoder.py update_collection_stats
 // ---------------------------------------------------------------------------
 
-pub async fn update_collection_stats(
-    stats_locks: &NamedLocks,
-    db: &QdrantDb,
-    collection_name: &str,
+fn apply_token_length_updates_to_stats(
+    stats: &mut CollectionStats,
     updates: &HashMap<String, TokenLengthUpdate>,
-) -> Result<(), DbError> {
-    let _guard = stats_locks.lock(collection_name).await;
-
-    let mut stats = db.get_collection_stats(collection_name).await?;
-
+) {
     let old_doc_count = stats.doc_count;
-
-    // All fields share the same doc_count — take from the first entry.
     let new_docs_in_batch = updates.values().next().map(|u| u.new_doc_count).unwrap_or(0);
     let new_doc_count = old_doc_count + new_docs_in_batch;
 
@@ -166,7 +159,140 @@ pub async fn update_collection_stats(
     }
 
     stats.doc_count = new_doc_count;
+}
+
+async fn persist_stats_maps_for_collection(
+    stats_locks: &NamedLocks,
+    db: &QdrantDb,
+    collection_name: &str,
+    maps_in_order: &[&HashMap<String, TokenLengthUpdate>],
+) -> Result<(), DbError> {
+    let _guard = stats_locks.lock(collection_name).await;
+    let mut stats = db.get_collection_stats(collection_name).await?;
+    for u in maps_in_order {
+        apply_token_length_updates_to_stats(&mut stats, u);
+    }
     db.set_collection_stats(collection_name, &stats).await
+}
+
+const STATS_BATCH_MAX_JOBS: usize = 10;
+const STATS_BATCH_WAIT: Duration = Duration::from_millis(200);
+const STATS_BATCH_CHANNEL: usize = 1024;
+
+struct StatsJob {
+    collection_name: String,
+    updates: HashMap<String, TokenLengthUpdate>,
+}
+
+/// Coalesces many stat updates into fewer Qdrant writes (up to [`STATS_BATCH_MAX_JOBS`] jobs or
+/// [`STATS_BATCH_WAIT`] after the first job in a window).
+#[derive(Clone)]
+pub struct StatsUpdateBatcher {
+    tx: mpsc::Sender<StatsJob>,
+}
+
+/// Drop this **after** the HTTP [`Router`] (and any clones of [`StatsUpdateBatcher`]) are gone,
+/// then await [`Self::shutdown_and_wait`], so the worker sees the channel closed, drains the queue,
+/// flushes any partial batch, and exits.
+pub struct StatsBatcherShutdown {
+    keepalive: Option<mpsc::Sender<StatsJob>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl StatsBatcherShutdown {
+    pub async fn shutdown_and_wait(mut self) {
+        drop(self.keepalive.take());
+        if let Err(e) = self.join.await {
+            eprintln!("stats batcher task ended with error: {e}");
+        }
+    }
+}
+
+impl StatsUpdateBatcher {
+    pub fn new(db: Arc<QdrantDb>, stats_locks: NamedLocks) -> (Self, StatsBatcherShutdown) {
+        let (tx, mut rx) = mpsc::channel::<StatsJob>(STATS_BATCH_CHANNEL);
+        let join = tokio::spawn(async move {
+            while let Some(batch) = collect_stats_batch(&mut rx).await {
+                flush_stats_job_batch(&stats_locks, &db, batch).await;
+            }
+        });
+        let batcher = Self { tx: tx.clone() };
+        let shutdown = StatsBatcherShutdown {
+            keepalive: Some(tx),
+            join,
+        };
+        (batcher, shutdown)
+    }
+
+    /// Queues a stats delta for the background worker. Only waits for channel capacity (bounded
+    /// buffer); does **not** wait for Qdrant stats persistence — that is the point of micro-batching.
+    pub async fn enqueue(
+        &self,
+        collection_name: &str,
+        updates: HashMap<String, TokenLengthUpdate>,
+    ) -> Result<(), DbError> {
+        let job = StatsJob {
+            collection_name: collection_name.to_string(),
+            updates,
+        };
+        self.tx
+            .send(job)
+            .await
+            .map_err(|_| DbError::Config("stats update batcher shut down".to_string()))
+    }
+}
+
+async fn collect_stats_batch(rx: &mut mpsc::Receiver<StatsJob>) -> Option<Vec<StatsJob>> {
+    let first = rx.recv().await?;
+    let mut batch = vec![first];
+    if batch.len() >= STATS_BATCH_MAX_JOBS {
+        return Some(batch);
+    }
+    let mut sleep = Box::pin(tokio::time::sleep(STATS_BATCH_WAIT));
+    loop {
+        tokio::select! {
+            _ = sleep.as_mut() => return Some(batch),
+            job = rx.recv() => match job {
+                Some(j) => {
+                    batch.push(j);
+                    if batch.len() >= STATS_BATCH_MAX_JOBS {
+                        return Some(batch);
+                    }
+                }
+                None => return Some(batch),
+            },
+        }
+    }
+}
+
+async fn flush_stats_job_batch(
+    stats_locks: &NamedLocks,
+    db: &QdrantDb,
+    batch: Vec<StatsJob>,
+) {
+    let mut by_collection: HashMap<String, Vec<StatsJob>> = HashMap::new();
+    for job in batch {
+        by_collection
+            .entry(job.collection_name.clone())
+            .or_default()
+            .push(job);
+    }
+
+    for (collection_name, jobs) in by_collection {
+        let maps_in_order: Vec<_> = jobs.iter().map(|j| &j.updates).collect();
+        if let Err(e) = persist_stats_maps_for_collection(
+            stats_locks,
+            db,
+            &collection_name,
+            &maps_in_order,
+        )
+        .await
+        {
+            eprintln!(
+                "stats batch persist failed for collection {collection_name}: {e}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,12 +330,12 @@ impl From<DbError> for UpsertSyncError {
 pub async fn document_upsert_sync(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
-    stats_locks: &NamedLocks,
+    stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
     collection_name: &str,
     document: Document,
 ) -> Result<Vec<String>, UpsertSyncError> {
-    document_upsert_bulk(db, cache, stats_locks, doc_locks, collection_name, vec![document]).await
+    document_upsert_bulk(db, cache, stats_batcher, doc_locks, collection_name, vec![document]).await
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +346,7 @@ pub async fn document_upsert_sync(
 pub async fn document_upsert_bulk(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
-    stats_locks: &NamedLocks,
+    stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
     collection_name: &str,
     documents: Vec<Document>,
@@ -295,9 +421,13 @@ pub async fn document_upsert_bulk(
     let avgdl_dict: HashMap<String, f64> = stats.avgdls.clone();
 
     let docs_owned: Vec<Document> = to_process.iter().map(|d| (*d).clone()).collect();
-    let docs_with_vectors =
-        Vectorizer::vectorize_documents(&docs_owned, &collection_config.vectors, Some(&avgdl_dict))
-            .map_err(UpsertSyncError::Vectorization)?;
+    let vectors_cfg = collection_config.vectors.clone();
+    let docs_with_vectors = tokio::task::spawn_blocking(move || {
+        Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict))
+    })
+    .await
+    .map_err(|e| UpsertSyncError::Vectorization(format!("vectorize task: {e}")))?
+    .map_err(UpsertSyncError::Vectorization)?;
 
     db.add_documents(collection_name, &docs_with_vectors, collection_config.store_content)
         .await?;
@@ -332,7 +462,7 @@ pub async fn document_upsert_bulk(
     }
 
     if !updates.is_empty() {
-        update_collection_stats(stats_locks, db, collection_name, &updates).await?;
+        stats_batcher.enqueue(collection_name, updates).await?;
     }
 
     Ok(skipped)
@@ -346,7 +476,7 @@ pub async fn document_upsert_bulk(
 /// Returns `Ok(())` silently if the document does not exist (already deleted).
 pub async fn document_delete_sync(
     db: &QdrantDb,
-    stats_locks: &NamedLocks,
+    stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
     collection_name: &str,
     document_id: &str,
@@ -384,7 +514,7 @@ pub async fn document_delete_sync(
     }
 
     if !updates.is_empty() {
-        update_collection_stats(stats_locks, db, collection_name, &updates).await?;
+        stats_batcher.enqueue(collection_name, updates).await?;
     }
 
     Ok(())
@@ -397,8 +527,20 @@ pub async fn document_delete_sync(
 /// Validates vector configs by running [`Vectorizer::vectorize_search_query`] with
 /// `validation_mode=true` on a dummy query (`"x"`), then summarizing per config.
 ///
+/// Runs vectorization on the blocking thread pool so the Tokio runtime is not stalled.
+///
 /// On vectorization failure, [`ModelValidationResponse.error`] carries the message for API callers.
-pub fn validate_models(vector_configs: &[VectorConfigInternal]) -> ModelValidationResponse {
+pub async fn validate_models(vector_configs: Vec<VectorConfigInternal>) -> ModelValidationResponse {
+    match tokio::task::spawn_blocking(move || validate_models_inner(&vector_configs)).await {
+        Ok(r) => r,
+        Err(e) => ModelValidationResponse {
+            results: None,
+            error: Some(format!("validate_models task: {e}")),
+        },
+    }
+}
+
+fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValidationResponse {
     let vector_weights: Vec<VectorSearchWeight> = vector_configs
         .iter()
         .flat_map(|config| {
@@ -638,6 +780,22 @@ impl From<DbError> for SearchError {
     }
 }
 
+async fn vectorize_search_query_blocking(
+    collection_config: CollectionConfigInternal,
+    query: SearchQuery,
+) -> Result<SearchQueryWithVectors, SearchError> {
+    tokio::task::spawn_blocking(move || {
+        if let Some(ref filter) = query.metadata_filter {
+            validate_metadata_filter(&collection_config, filter)
+                .map_err(|e| SearchError::InvalidFilter(e.0))?;
+        }
+        Vectorizer::vectorize_search_query(query, &collection_config.vectors, false)
+            .map_err(SearchError::Vectorization)
+    })
+    .await
+    .map_err(|e| SearchError::Vectorization(format!("vectorize_search task: {e}")))?
+}
+
 pub async fn search(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
@@ -653,20 +811,12 @@ pub async fn search(
             }
         })?;
 
-    let run = |config: &CollectionConfigInternal,
-               query: crate::models::SearchQuery|
-     -> Result<_, SearchError> {
-        if let Some(ref filter) = query.metadata_filter {
-            validate_metadata_filter(config, filter)
-                .map_err(|e| SearchError::InvalidFilter(e.0))?;
-        }
-        let query_with_vectors =
-            Vectorizer::vectorize_search_query(query, &config.vectors, false)
-                .map_err(SearchError::Vectorization)?;
-        Ok(query_with_vectors)
-    };
-
-    let query_with_vectors = match run(&collection_config, query.clone()) {
+    let query_with_vectors = match vectorize_search_query_blocking(
+        collection_config.clone(),
+        query.clone(),
+    )
+    .await
+    {
         Ok(q) => q,
         Err(e) if from_cache => {
             // Retry once with fresh config — mirrors Python cache-invalidate-retry.
@@ -679,7 +829,7 @@ pub async fn search(
                         SearchError::Db(e)
                     }
                 })?;
-            run(&fresh_config, query).map_err(|_| e)?
+            vectorize_search_query_blocking(fresh_config, query).await.map_err(|_| e)?
         }
         Err(e) => return Err(e),
     };
