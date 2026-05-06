@@ -547,6 +547,10 @@ async fn main() {
             post(upsert_documents_bulk),
         )
         .route(
+            "/v1/collections/{collection_name}/documents/{document_id}/sync",
+            delete(delete_document),
+        )
+        .route(
             "/v1/collections/{collection_name}/documents/{document_id}",
             delete(delete_document),
         )
