@@ -191,3 +191,6 @@ pub fn qdrant_client_url(connection_string: &str) -> String {
         format!("http://{s}")
     }
 }
+
+/// Short product label from DB URL scheme — mirrors `amgix-server` `_database_kind_label`.
+pub const DATABASE_KIND: &str = "Qdrant";

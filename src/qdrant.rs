@@ -95,6 +95,12 @@ impl QdrantDb {
         })
     }
 
+    /// Mirrors Python `QdrantDatabase.probe()`: fetches server version via `health_check`.
+    pub async fn probe(&self) -> Result<String, DbError> {
+        let reply = self.client.health_check().await?;
+        Ok(reply.version)
+    }
+
     // -----------------------------------------------------------------------
     // configure — ensure amgix_sys_meta exists
     // -----------------------------------------------------------------------
@@ -125,10 +131,20 @@ impl QdrantDb {
         Ok(())
     }
 
-    /// Lightweight gRPC probe — mirrors Python `QdrantDatabase.is_connected` (`client.info()` /
-    /// health-style call).
     pub async fn is_connected(&self) -> bool {
         self.client.health_check().await.is_ok()
+    }
+
+    pub async fn list_collections(&self) -> Result<Vec<String>, DbError> {
+        let resp = self.client.list_collections().await?;
+        let user_prefix = format!("{}_", crate::common::APP_PREFIX);
+        let sys_prefix = format!("{}_sys_", crate::common::APP_PREFIX);
+        Ok(resp
+            .collections
+            .into_iter()
+            .map(|c| c.name)
+            .filter(|n| n.starts_with(&user_prefix) && !n.starts_with(&sys_prefix))
+            .collect())
     }
 
     // -----------------------------------------------------------------------

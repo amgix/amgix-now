@@ -22,5 +22,5 @@ else
     echo "Skipping Qdrant wait (external AMGIX_DATABASE_URL)"
 fi
 
-echo "All dependencies ready! Starting $@"
+echo "All dependencies ready!"
 exec "$@"

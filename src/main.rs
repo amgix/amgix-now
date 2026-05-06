@@ -17,7 +17,9 @@ use axum::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use common::{get_real_collection_name, qdrant_client_url, VectorType};
+use common::{
+    get_real_collection_name, qdrant_client_url, VectorType, DATABASE_KIND,
+};
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
     CollectionConfigCache, NamedLocks, SearchError, StatsUpdateBatcher, UpsertSyncError,
@@ -25,13 +27,20 @@ use encoder::{
 use encoder::search as encoder_search;
 use models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CollectionExistsResponse,
-    Document, OkResponse, ReadyResponse, SearchQuery, SearchResult, VectorConfigInternal,
+    Document, OkResponse, ReadyResponse, SearchQuery, SearchResult, SystemInfoResponse,
+    VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<QdrantDb>,
+    qdrant_version: String,
+    #[allow(dead_code)]
+    amgix_version: String,
+    #[allow(dead_code)]
+    amgix_variant: String,
+    amgix_version_display: String,
     collection_cache: CollectionConfigCache,
     stats_batcher: StatsUpdateBatcher,
     doc_locks: NamedLocks,
@@ -78,6 +87,35 @@ async fn health_ready(State(app): State<AppState>) -> (StatusCode, Json<ReadyRes
     };
 
     (status, Json(body))
+}
+
+/// `GET /v1/version` — mirrors Python `version`.
+async fn version_endpoint(State(app): State<AppState>) -> Json<VersionResponse> {
+    Json(VersionResponse {
+        version: app.amgix_version_display.clone(),
+    })
+}
+
+/// `GET /v1/system/info` — mirrors Python `system_info` (no connection URLs).
+async fn system_info(
+    State(app): State<AppState>,
+) -> Result<Json<SystemInfoResponse>, (StatusCode, Json<Value>)> {
+    let database_version = app.qdrant_version.clone();
+    let collection_names = app.db.list_collections().await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list collections: {e}"),
+        )
+    })?;
+
+    Ok(Json(SystemInfoResponse {
+        amgix_version: app.amgix_version_display.clone(),
+        database_kind: DATABASE_KIND.to_string(),
+        database_version,
+        database_features: Default::default(),
+        rabbitmq_version: "unknown".to_string(),
+        collection_count: collection_names.len() as u64,
+    }))
 }
 
 async fn create_collection(
@@ -356,15 +394,43 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let qdrant_version = match db.probe().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Qdrant probe failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let amgix_version = std::env::var("AMGIX_VERSION").unwrap_or_default();
+    let amgix_version = amgix_version.trim().to_string();
+    let amgix_variant = std::env::var("AMGIX_VARIANT").unwrap_or_default();
+    let amgix_variant = amgix_variant.trim().to_string();
+    let amgix_version_display = if amgix_variant.is_empty() {
+        amgix_version.clone()
+    } else {
+        format!("{} ({})", amgix_version, amgix_variant)
+    };
+
+    println!("Amgix version: {amgix_version_display}");
+    println!("Qdrant version: {qdrant_version}");
+
     let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), NamedLocks::new());
+
     let state = AppState {
         db,
+        qdrant_version,
+        amgix_version,
+        amgix_variant,
+        amgix_version_display,
         collection_cache: CollectionConfigCache::new(),
         stats_batcher,
         doc_locks: NamedLocks::new(),
     };
 
     let app = Router::new()
+        .route("/v1/version", get(version_endpoint))
+        .route("/v1/system/info", get(system_info))
         .route("/v1/health/check", get(health_check))
         .route("/v1/health/ready", get(health_ready))
         .route(
@@ -398,7 +464,7 @@ async fn main() {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8235").await.unwrap();
-    println!("amgix-now listening on http://0.0.0.0:8235");
+    println!("Listening  http://0.0.0.0:8235");
 
     let shutdown = async {
         wait_for_shutdown_signal().await;

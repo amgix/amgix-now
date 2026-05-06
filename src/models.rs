@@ -47,6 +47,22 @@ pub struct ReadyResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionResponse {
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfoResponse {
+    pub amgix_version: String,
+    pub database_kind: String,
+    pub database_version: String,
+    #[serde(default)]
+    pub database_features: HashMap<String, bool>,
+    pub rabbitmq_version: String,
+    pub collection_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionExistsResponse {
     pub exists: bool,
 }
