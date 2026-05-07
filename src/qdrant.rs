@@ -231,11 +231,14 @@ impl QdrantDb {
 
         // Index on tags
         self.client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                collection_name,
-                "tags",
-                FieldType::Keyword,
-            ))
+            .create_field_index(
+                CreateFieldIndexCollectionBuilder::new(
+                    collection_name,
+                    "tags",
+                    FieldType::Keyword,
+                )
+                .wait(true),
+            )
             .await?;
 
         // Indexes for declared metadata fields
@@ -263,11 +266,14 @@ impl QdrantDb {
             _ => return Ok(()), // unknown types skipped, matching Python `continue`
         };
         self.client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                collection_name,
-                &field_path,
-                field_type,
-            ))
+            .create_field_index(
+                CreateFieldIndexCollectionBuilder::new(
+                    collection_name,
+                    &field_path,
+                    field_type,
+                )
+                .wait(true),
+            )
             .await?;
         Ok(())
     }
