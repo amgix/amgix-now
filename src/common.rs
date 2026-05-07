@@ -50,7 +50,7 @@ pub const MAX_VECTOR_DIMENSIONS: u32 = 8192;
 // VectorType — all variants, mirrors enums.py exactly
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorType {
     DenseModel,
@@ -59,9 +59,35 @@ pub enum VectorType {
     Trigrams,
     Whitespace,
     Wmtr,
+    /// Legacy API alias deserialized as [`Wmtr`]; callers should use `wmtr`.
+    #[allow(dead_code)]
     Keyword,
     DenseCustom,
     SparseCustom,
+}
+
+impl<'de> serde::Deserialize<'de> for VectorType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let lowered = s.to_ascii_lowercase();
+        match lowered.as_str() {
+            "dense_model" => Ok(Self::DenseModel),
+            "sparse_model" => Ok(Self::SparseModel),
+            "full_text" => Ok(Self::FullText),
+            "trigrams" => Ok(Self::Trigrams),
+            "whitespace" => Ok(Self::Whitespace),
+            "wmtr" => Ok(Self::Wmtr),
+            "keyword" => Ok(Self::Wmtr),
+            "dense_custom" => Ok(Self::DenseCustom),
+            "sparse_custom" => Ok(Self::SparseCustom),
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown vector type: {lowered:?} (expected snake_case literal, e.g. dense_model)",
+            ))),
+        }
+    }
 }
 
 impl VectorType {

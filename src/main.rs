@@ -39,8 +39,9 @@ use models::{
 };
 use qdrant::{DbError, QdrantDb};
 use validation::{
-    validate_bulk_upload, validate_collection_config, validate_collection_name,
-    validate_document, validate_search_query,
+    normalize_document_python, normalize_search_query_python,
+    validate_bulk_upload, validate_collection_config, validate_collection_name, validate_document,
+    validate_search_query,
 };
 
 #[derive(Clone)]
@@ -431,8 +432,9 @@ async fn upsert_document(
     Path(collection_name): Path<String>,
     payload: Result<Json<Document>, JsonRejection>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
-    let Json(document) = payload.map_err(|e| json_rejection_response(e))?;
+    let Json(mut document) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
+    normalize_document_python(&mut document);
     validate_document(&document).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_upsert_sync(
@@ -460,9 +462,9 @@ async fn upsert_documents_bulk(
     Path(collection_name): Path<String>,
     payload: Result<Json<BulkUploadRequest>, JsonRejection>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
-    let Json(request) = payload.map_err(|e| json_rejection_response(e))?;
+    let Json(mut request) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
-    validate_bulk_upload(&request).map_err(validation_error)?;
+    validate_bulk_upload(&mut request).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_upsert_bulk(
         &app.db,
@@ -591,9 +593,10 @@ async fn search(
     Path(collection_name): Path<String>,
     payload: Result<Json<SearchQuery>, JsonRejection>,
 ) -> Result<Json<Vec<SearchResult>>, (StatusCode, Json<Value>)> {
-    let Json(query) = payload.map_err(|e| json_rejection_response(e))?;
+    let Json(mut query) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_search_query(&query).map_err(validation_error)?;
+    normalize_search_query_python(&mut query);
     let real_collection_name = get_real_collection_name(&collection_name);
     match encoder_search(&app.db, &app.collection_cache, &app.search_pool, &real_collection_name, query).await {
         Ok(results) => Ok(Json(results)),

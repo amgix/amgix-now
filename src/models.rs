@@ -178,6 +178,23 @@ fn default_store_content() -> bool {
     true
 }
 
+/// Mirrors `vector.py` `keep_case` Field(default=False).
+fn default_keep_case() -> Option<bool> {
+    Some(false)
+}
+
+/// Mirrors `vector.py` `VectorConfig.set_normalization_default`: dense → true, sparse → false when omitted.
+fn apply_normalization_default(norm: Option<bool>, vector_type: &VectorType) -> Option<bool> {
+    Some(norm.unwrap_or_else(|| vector_type.is_dense()))
+}
+
+fn canonical_vector_type(vt: VectorType) -> VectorType {
+    match vt {
+        VectorType::Keyword => VectorType::Wmtr,
+        vt => vt,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorConfig {
     pub name: String,
@@ -209,7 +226,7 @@ pub struct VectorConfig {
     pub normalization: Option<bool>,
     #[serde(default = "default_dense_distance")]
     pub dense_distance: DenseDistance,
-    #[serde(default)]
+    #[serde(default = "default_keep_case")]
     pub keep_case: Option<bool>,
 }
 
@@ -267,16 +284,18 @@ pub struct VectorConfigInternal {
     pub normalization: Option<bool>,
     #[serde(default = "default_dense_distance")]
     pub dense_distance: DenseDistance,
-    #[serde(default)]
+    #[serde(default = "default_keep_case")]
     pub keep_case: Option<bool>,
 }
 
 impl From<VectorConfig> for VectorConfigInternal {
     fn from(v: VectorConfig) -> Self {
+        let vector_type = canonical_vector_type(v.vector_type);
+        let normalization = apply_normalization_default(v.normalization, &vector_type);
         VectorConfigInternal {
             version: 1_u32,
             name: v.name,
-            vector_type: v.vector_type,
+            vector_type,
             model: v.model,
             revision: v.revision,
             query_model: v.query_model,
@@ -288,7 +307,7 @@ impl From<VectorConfig> for VectorConfigInternal {
             language_default_code: v.language_default_code,
             language_detect: v.language_detect,
             language_confidence: v.language_confidence,
-            normalization: v.normalization,
+            normalization,
             dense_distance: v.dense_distance,
             keep_case: v.keep_case,
         }
@@ -296,14 +315,19 @@ impl From<VectorConfig> for VectorConfigInternal {
 }
 
 impl From<VectorConfigInternal> for VectorConfig {
+    /// Mirrors `vector.py` `internal_to_user_config`: exposed API omits stored
+    /// `query_model` / `query_revision` / `keep_case` — they are reset to defaults
+    /// (`None`, `None`, `False`).
     fn from(v: VectorConfigInternal) -> Self {
+        let vector_type = canonical_vector_type(v.vector_type);
+        let normalization = apply_normalization_default(v.normalization, &vector_type);
         VectorConfig {
             name: v.name,
-            vector_type: v.vector_type,
+            vector_type,
             model: v.model,
             revision: v.revision,
-            query_model: v.query_model,
-            query_revision: v.query_revision,
+            query_model: None,
+            query_revision: None,
             dimensions: v.dimensions,
             top_k: v.top_k,
             wmtr_word_weight: v.wmtr_word_weight,
@@ -311,9 +335,9 @@ impl From<VectorConfigInternal> for VectorConfig {
             language_default_code: v.language_default_code,
             language_detect: v.language_detect,
             language_confidence: v.language_confidence,
-            normalization: v.normalization,
+            normalization,
             dense_distance: v.dense_distance,
-            keep_case: v.keep_case,
+            keep_case: default_keep_case(),
         }
     }
 }

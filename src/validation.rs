@@ -17,7 +17,10 @@ use crate::common::{
     MAX_SEARCH_LIMIT, MAX_SEARCH_QUERY_LENGTH, MAX_TOP_K_VALUE, MAX_VECTOR_DIMENSIONS,
     MAX_VECTOR_NAME_LENGTH,
 };
-use crate::models::{BulkUploadRequest, CollectionConfig, Document, SearchQuery, VectorConfig};
+use crate::models::{
+    BulkUploadRequest, CollectionConfig, CustomDocumentVector, Document, MetadataIndex,
+    SearchQuery, VectorConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Shared regex patterns
@@ -74,6 +77,27 @@ pub fn validate_collection_name(name: &str) -> VResult {
 // Mirrors: document.py Document field/model validators
 // ---------------------------------------------------------------------------
 
+/// Coercions matching Pydantic field validators that **mutate** the model (`return v.strip()`, etc.).
+/// Must run **before** [`validate_document`].
+pub fn normalize_document_python(doc: &mut Document) {
+    doc.id = doc.id.trim().to_string();
+    if let Some(tags) = &mut doc.tags {
+        let trimmed: Vec<String> = tags
+            .iter()
+            .filter_map(|t| {
+                let s = t.trim();
+                (!s.is_empty()).then(|| s.to_string())
+            })
+            .collect();
+        *tags = trimmed;
+    }
+    if let Some(ref mut cv) = doc.custom_vectors {
+        for c in cv.iter_mut() {
+            c.vector_name = c.vector_name.trim().to_string();
+        }
+    }
+}
+
 pub fn validate_document(doc: &Document) -> VResult {
     validate_document_id(&doc.id)?;
     if let Some(tags) = &doc.tags {
@@ -84,6 +108,11 @@ pub fn validate_document(doc: &Document) -> VResult {
     validate_document_content_opt(doc.content.as_deref())?;
     if let Some(metadata) = &doc.metadata {
         validate_metadata(metadata)?;
+    }
+    if let Some(cv) = &doc.custom_vectors {
+        for c in cv {
+            validate_custom_document_vector(c)?;
+        }
     }
     validate_at_least_one_field(doc)?;
     Ok(())
@@ -333,13 +362,14 @@ fn validate_at_least_one_field(doc: &Document) -> VResult {
 // Mirrors: MAX_BULK_UPLOAD constant check (main.py) + each Document validated
 // ---------------------------------------------------------------------------
 
-pub fn validate_bulk_upload(req: &BulkUploadRequest) -> VResult {
+pub fn validate_bulk_upload(req: &mut BulkUploadRequest) -> VResult {
     if req.documents.len() > MAX_BULK_UPLOAD {
         return Err(err(format!(
             "ensure this value has at most {MAX_BULK_UPLOAD} items"
         )));
     }
-    for doc in &req.documents {
+    for doc in &mut req.documents {
+        normalize_document_python(doc);
         validate_document(doc)?;
     }
     Ok(())
@@ -371,6 +401,11 @@ pub fn validate_collection_config(config: &CollectionConfig) -> VResult {
     }
     for v in &config.vectors {
         validate_vector_config(v)?;
+    }
+    if let Some(ref indexes) = config.metadata_indexes {
+        for mi in indexes {
+            validate_metadata_index(mi)?;
+        }
     }
     Ok(())
 }
@@ -411,21 +446,110 @@ fn validate_model_name_length(field: &str, s: &str) -> VResult {
 }
 
 /// @field_validator('name') on VectorConfig — validate_name_format
+/// Matches `vector.py`: pattern and max length apply to **raw** `name` (`v`), not trimmed.
 fn validate_vector_name(name: &str) -> VResult {
-    let stripped = name.trim();
-    if stripped.is_empty() {
+    if name.trim().is_empty() {
         return Err(err("Vector configuration name cannot be empty or whitespace"));
     }
-    if !RE_ALPHANUMERIC.is_match(stripped) {
+    if !RE_ALPHANUMERIC.is_match(name) {
         return Err(err(
             "Vector name can only contain letters, numbers, underscores, and hyphens",
         ));
     }
-    if stripped.len() > MAX_VECTOR_NAME_LENGTH {
+    if name.len() > MAX_VECTOR_NAME_LENGTH {
         return Err(err(format!(
             "Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
         )));
     }
+    Ok(())
+}
+
+/// Mirrors `vector.py` `MetadataIndex` field validators.
+fn validate_metadata_index(mi: &MetadataIndex) -> VResult {
+    if !RE_ALPHANUMERIC.is_match(&mi.key) {
+        return Err(err(format!(
+            "Metadata key '{}' can only contain letters, numbers, underscores, and hyphens",
+            mi.key
+        )));
+    }
+    if mi.key.len() > MAX_METADATA_KEY_LENGTH {
+        return Err(err(format!(
+            "Metadata key '{}' cannot exceed {MAX_METADATA_KEY_LENGTH} characters",
+            mi.key
+        )));
+    }
+    let allowed = ["string", "integer", "float", "boolean", "datetime"];
+    if !allowed.contains(&mi.value_type.as_str()) {
+        return Err(err(format!(
+            "Invalid metadata type '{}' for indexed key '{}'. Allowed types: {allowed:?}",
+            mi.value_type, mi.key
+        )));
+    }
+    Ok(())
+}
+
+/// Mirrors `CustomVector.vector` in `vector.py`.
+fn validate_custom_vector_data_value(v: &Value) -> VResult {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| err("Vector data cannot be empty"))?;
+    if arr.is_empty() {
+        return Err(err("Vector data cannot be empty"));
+    }
+    let first = &arr[0];
+    if first.is_number() {
+        for x in arr {
+            if !x.is_number() {
+                return Err(err("Dense vector must contain only numbers"));
+            }
+        }
+        return Ok(());
+    }
+    if first.is_array() {
+        for item in arr {
+            let tup = item.as_array().ok_or_else(|| {
+                err("Sparse vector must contain (index, value) tuples")
+            })?;
+            if tup.len() != 2 {
+                return Err(err(
+                    "Sparse vector must contain (index, value) tuples",
+                ));
+            }
+            let idx_ok = tup[0].as_i64().is_some() || tup[0].as_u64().is_some();
+            if !idx_ok || !tup[1].is_number() {
+                return Err(err(
+                    "Sparse vector tuples must be (int, float) pairs",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    Err(err(
+        "Vector must be either list of numbers (dense) or list of (index, value) tuples (sparse)",
+    ))
+}
+
+fn validate_custom_query_vector_name_stripped(raw: &str) -> VResult {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(err("Vector name cannot be empty or whitespace"));
+    }
+    if !RE_ALPHANUMERIC.is_match(t) {
+        return Err(err(
+            "Vector name can only contain letters, numbers, underscores, and hyphens",
+        ));
+    }
+    if t.len() > MAX_VECTOR_NAME_LENGTH {
+        return Err(err(format!(
+            "Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_custom_document_vector(c: &CustomDocumentVector) -> VResult {
+    validate_custom_query_vector_name_stripped(&c.vector_name)?;
+    validate_custom_vector_data_value(&c.vector)?;
     Ok(())
 }
 
@@ -560,6 +684,19 @@ fn validate_language_config(v: &VectorConfig) -> VResult {
 // Mirrors: vector.py SearchQuery field validators
 // ---------------------------------------------------------------------------
 
+/// Mirrors Pydantic `VectorSearchWeight` / `CustomVector.vector_name`: stored names are trimmed
+/// **after** validation (see validators returning `strip()`).
+pub fn normalize_search_query_python(q: &mut SearchQuery) {
+    for w in &mut q.vector_weights {
+        w.vector_name = w.vector_name.trim().to_string();
+    }
+    if let Some(ref mut cv) = q.custom_vectors {
+        for c in cv.iter_mut() {
+            c.vector_name = c.vector_name.trim().to_string();
+        }
+    }
+}
+
 pub fn validate_search_query(q: &SearchQuery) -> VResult {
     // @field_validator('query') — validate_query_not_empty
     if q.query.trim().is_empty() {
@@ -610,24 +747,40 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
     for w in &q.vector_weights {
         validate_search_vector_name(&w.vector_name)?;
     }
+    if let Some(ref cv) = q.custom_vectors {
+        for c in cv {
+            validate_custom_query_vector_name_stripped(&c.vector_name)?;
+            validate_custom_vector_data_value(&c.vector)?;
+        }
+    }
+    validate_fusion_mode(&q.fusion_mode)?;
     Ok(())
 }
 
-/// @field_validator('vector_name') on VectorSearchWeight
+/// @field_validator('vector_name') on VectorSearchWeight — pattern on raw `v`, max len on raw,
+/// modeled value trimmed (Rust: [`normalize_search_query_python`] afterward).
 fn validate_search_vector_name(name: &str) -> VResult {
-    let stripped = name.trim();
-    if stripped.is_empty() {
+    if name.trim().is_empty() {
         return Err(err("Vector name cannot be empty or whitespace"));
     }
-    if !RE_ALPHANUMERIC.is_match(stripped) {
+    if !RE_ALPHANUMERIC.is_match(name) {
         return Err(err(
             "Vector name can only contain letters, numbers, underscores, and hyphens",
         ));
     }
-    if stripped.len() > MAX_VECTOR_NAME_LENGTH {
+    if name.len() > MAX_VECTOR_NAME_LENGTH {
         return Err(err(format!(
             "Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
         )));
     }
     Ok(())
+}
+
+fn validate_fusion_mode(s: &str) -> VResult {
+    match s {
+        "rrf" | "linear" => Ok(()),
+        _ => Err(err(format!(
+            "fusion_mode must be one of ['rrf', 'linear'], got {s:?}"
+        ))),
+    }
 }
