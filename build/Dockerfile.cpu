@@ -1,14 +1,28 @@
-# amgix-now: single Rust binary + embedded Qdrant (no Python, RabbitMQ, or separate encoders)
+# amgix-now: single Rust binary + embedded Qdrant (CPU, no CUDA)
 #
 # Build from the amgix-now crate root:
-#   docker build -f build/Dockerfile .
+#   docker build -f build/Dockerfile.cpu .
+#
+# Uses cargo-chef so dependency compilation is cached when only src/ changes.
 
-FROM rust:1-bookworm AS rust-builder
+# -----------------------------------------------------------------------------
+FROM rust:1-bookworm AS chef
+RUN cargo install cargo-chef --locked
 
+# -----------------------------------------------------------------------------
+FROM chef AS planner
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
 
+# -----------------------------------------------------------------------------
+FROM chef AS builder
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN cargo build --locked --release
 
 # -----------------------------------------------------------------------------
@@ -31,7 +45,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm /tmp/qdrant.tar.gz && \
     chmod +x /usr/local/bin/qdrant
 
-COPY --from=rust-builder /app/target/release/amgix-now /app/amgix-now
+COPY --from=builder /app/target/release/amgix-now /app/amgix-now
 
 COPY build/prefix-log-exec.sh build/wait-for-deps.sh build/entrypoint.sh /app/
 COPY build/supervisord-now.conf /etc/supervisor/conf.d/amgix-now.conf

@@ -8,6 +8,8 @@ mod vectors;
 
 use std::sync::Arc;
 
+use rayon::ThreadPool;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -45,6 +47,8 @@ struct AppState {
     collection_cache: CollectionConfigCache,
     stats_batcher: StatsUpdateBatcher,
     doc_locks: NamedLocks,
+    index_pool: Arc<ThreadPool>,
+    search_pool: Arc<ThreadPool>,
 }
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -360,6 +364,7 @@ async fn upsert_document(
         &app.collection_cache,
         &app.stats_batcher,
         &app.doc_locks,
+        &app.index_pool,
         &real_collection_name,
         document,
     )
@@ -385,6 +390,7 @@ async fn upsert_documents_bulk(
         &app.collection_cache,
         &app.stats_batcher,
         &app.doc_locks,
+        &app.index_pool,
         &real_collection_name,
         request.documents,
     )
@@ -504,7 +510,7 @@ async fn search(
     Json(query): Json<SearchQuery>,
 ) -> Result<Json<Vec<SearchResult>>, (StatusCode, Json<Value>)> {
     let real_collection_name = get_real_collection_name(&collection_name);
-    match encoder_search(&app.db, &app.collection_cache, &real_collection_name, query).await {
+    match encoder_search(&app.db, &app.collection_cache, &app.search_pool, &real_collection_name, query).await {
         Ok(results) => Ok(Json(results)),
         Err(SearchError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(SearchError::InvalidFilter(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
@@ -578,6 +584,33 @@ async fn main() {
 
     let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), NamedLocks::new());
 
+    let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let index_threads = std::env::var("AMGIX_NOW_INDEX_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (num_cpus / 2).max(1));
+    let search_threads = std::env::var("AMGIX_NOW_SEARCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (num_cpus / 2).max(1));
+
+    let index_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(index_threads)
+            .thread_name(|i| format!("ingest-{i}"))
+            .build()
+            .expect("failed to build ingest thread pool"),
+    );
+    let search_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(search_threads)
+            .thread_name(|i| format!("search-{i}"))
+            .build()
+            .expect("failed to build search thread pool"),
+    );
+    let web_threads = std::env::var("TOKIO_WORKER_THREADS").unwrap_or_default();
+    println!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
+
     let state = AppState {
         db,
         qdrant_version,
@@ -587,6 +620,8 @@ async fn main() {
         collection_cache: CollectionConfigCache::new(),
         stats_batcher,
         doc_locks: NamedLocks::new(),
+        index_pool,
+        search_pool,
     };
 
     let app = Router::new()

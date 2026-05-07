@@ -4,6 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
+
 use crate::common::{
     DocumentField, VectorType, DEFAULT_WMTR_TRIGRAM_WEIGHT,
 };
@@ -406,18 +408,16 @@ impl Vectorizer {
             vector_groups.entry(vector_name).or_default().push(field);
         }
 
-        let mut vectors: Vec<VectorData> = Vec::new();
+        let groups: Vec<(String, Vec<DocumentField>)> = vector_groups.into_iter().collect();
 
-        for (vector_name, fields) in vector_groups.iter() {
-            let config =
-                config_map.get(vector_name).ok_or_else(|| {
-                    format!(
-                        "Vector configuration '{vector_name}' not found. Available vectors: {}",
-                        config_map.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )
-                })?;
-            let config = *config;
-
+        // Validate all groups before doing any embedding work.
+        for (vector_name, fields) in &groups {
+            let config = config_map.get(vector_name).ok_or_else(|| {
+                format!(
+                    "Vector configuration '{vector_name}' not found. Available vectors: {}",
+                    config_map.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?;
             for field in fields {
                 if !config.index_fields.contains(field) {
                     return Err(format!(
@@ -426,11 +426,31 @@ impl Vectorizer {
                     ));
                 }
             }
-
-            let batch = Self::generate_vector_for_query(config, &query, fields, validation_mode)
-                .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))?;
-            vectors.extend(batch);
         }
+
+        let vectors: Vec<VectorData> = if groups.len() > 1 {
+            groups
+                .par_iter()
+                .map(|(vector_name, fields)| {
+                    let config = *config_map.get(vector_name).expect("validated above");
+                    Self::generate_vector_for_query(config, &query, fields, validation_mode)
+                        .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect()
+        } else {
+            let mut out = Vec::new();
+            for (vector_name, fields) in &groups {
+                let config = *config_map.get(vector_name).expect("validated above");
+                let batch =
+                    Self::generate_vector_for_query(config, &query, fields, validation_mode)
+                        .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))?;
+                out.extend(batch);
+            }
+            out
+        };
 
         Ok(SearchQueryWithVectors {
             query: query.query,

@@ -332,10 +332,11 @@ pub async fn document_upsert_sync(
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
+    index_pool: &Arc<rayon::ThreadPool>,
     collection_name: &str,
     document: Document,
 ) -> Result<Vec<String>, UpsertSyncError> {
-    document_upsert_bulk(db, cache, stats_batcher, doc_locks, collection_name, vec![document]).await
+    document_upsert_bulk(db, cache, stats_batcher, doc_locks, index_pool, collection_name, vec![document]).await
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +349,7 @@ pub async fn document_upsert_bulk(
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
+    index_pool: &Arc<rayon::ThreadPool>,
     collection_name: &str,
     documents: Vec<Document>,
 ) -> Result<Vec<String>, UpsertSyncError> {
@@ -422,12 +424,19 @@ pub async fn document_upsert_bulk(
 
     let docs_owned: Vec<Document> = to_process.iter().map(|d| (*d).clone()).collect();
     let vectors_cfg = collection_config.vectors.clone();
-    let docs_with_vectors = tokio::task::spawn_blocking(move || {
-        Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict))
-    })
-    .await
-    .map_err(|e| UpsertSyncError::Vectorization(format!("vectorize task: {e}")))?
-    .map_err(UpsertSyncError::Vectorization)?;
+    let pool = Arc::clone(index_pool);
+    
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    pool.spawn(move || {
+        let result = Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict));
+        let _ = tx.send(result);
+    });
+
+    let docs_with_vectors = rx
+        .await
+        .map_err(|e| UpsertSyncError::Vectorization(format!("Rayon channel dropped: {e}")))?
+        .map_err(UpsertSyncError::Vectorization)?;
 
     db.add_documents(collection_name, &docs_with_vectors, collection_config.store_content)
         .await?;
@@ -783,22 +792,29 @@ impl From<DbError> for SearchError {
 async fn vectorize_search_query_blocking(
     collection_config: CollectionConfigInternal,
     query: SearchQuery,
+    search_pool: Arc<rayon::ThreadPool>,
 ) -> Result<SearchQueryWithVectors, SearchError> {
-    tokio::task::spawn_blocking(move || {
-        if let Some(ref filter) = query.metadata_filter {
-            validate_metadata_filter(&collection_config, filter)
-                .map_err(|e| SearchError::InvalidFilter(e.0))?;
-        }
-        Vectorizer::vectorize_search_query(query, &collection_config.vectors, false)
-            .map_err(SearchError::Vectorization)
-    })
-    .await
-    .map_err(|e| SearchError::Vectorization(format!("vectorize_search task: {e}")))?
+    if let Some(ref filter) = query.metadata_filter {
+        validate_metadata_filter(&collection_config, filter)
+            .map_err(|e| SearchError::InvalidFilter(e.0))?;
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    search_pool.spawn(move || {
+        let result = Vectorizer::vectorize_search_query(query, &collection_config.vectors, false)
+            .map_err(SearchError::Vectorization);
+        let _ = tx.send(result);
+    });
+
+    rx.await
+        .map_err(|e| SearchError::Vectorization(format!("Rayon channel dropped: {e}")))?
 }
 
 pub async fn search(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
+    search_pool: &Arc<rayon::ThreadPool>,
     collection_name: &str,
     query: crate::models::SearchQuery,
 ) -> Result<Vec<crate::models::SearchResult>, SearchError> {
@@ -814,6 +830,7 @@ pub async fn search(
     let query_with_vectors = match vectorize_search_query_blocking(
         collection_config.clone(),
         query.clone(),
+        Arc::clone(search_pool),
     )
     .await
     {
@@ -829,7 +846,9 @@ pub async fn search(
                         SearchError::Db(e)
                     }
                 })?;
-            vectorize_search_query_blocking(fresh_config, query).await.map_err(|_| e)?
+            vectorize_search_query_blocking(fresh_config, query, Arc::clone(search_pool))
+                .await
+                .map_err(|_| e)?
         }
         Err(e) => return Err(e),
     };

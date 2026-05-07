@@ -1,0 +1,113 @@
+# amgix-now: GPU binary + embedded Qdrant (CUDA via Candle)
+#
+# Build from the amgix-now crate root:
+#   docker build -f build/Dockerfile.gpu .
+#
+# Uses cargo-chef so dependency compilation is cached when only src/ changes.
+#
+# CUDA_COMPUTE_CAP: required for candle-kernels in Docker (no nvidia-smi at build).
+#   Default 80 (Ampere+). sm_75 breaks Candle's bf16 WMMA MoE kernels — use CPU image for T4.
+#   docker build -f build/Dockerfile.gpu --build-arg CUDA_COMPUTE_CAP=120 .
+#
+# CUDA_VERSION: pinned devel + runtime tag (nvidia/cuda on Ubuntu 24.04). Checked Docker Hub 2026-05-07:
+#   latest matching pair was 13.2.1 (no 13.3 devel-ubuntu24.04 yet). Override if a newer tag appears or Candle needs an older toolkit.
+#   docker build -f build/Dockerfile.gpu --build-arg CUDA_VERSION=12.8.1 .
+
+ARG CUDA_VERSION=12.9.1
+
+# -----------------------------------------------------------------------------
+# chef: CUDA devel + Rust + cargo-chef (shared by planner and builder)
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS chef
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libonig-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && rm -rf /root/.rustup/downloads /root/.rustup/tmp
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN cargo install cargo-chef --locked
+
+WORKDIR /app
+
+# -----------------------------------------------------------------------------
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+FROM chef AS builder
+WORKDIR /app
+
+ARG CUDA_COMPUTE_CAP=80
+ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --features cuda
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --locked --release --features cuda
+
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Embedded Qdrant (same pattern as amgix-one)
+ARG QDRANT_VERSION=v1.17.1
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then QDRANT_ARCH="x86_64"; else QDRANT_ARCH="$ARCH"; fi && \
+    curl -fsSL "https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/qdrant-${QDRANT_ARCH}-unknown-linux-musl.tar.gz" -o /tmp/qdrant.tar.gz && \
+    tar -xzf /tmp/qdrant.tar.gz -C /usr/local/bin && \
+    rm /tmp/qdrant.tar.gz && \
+    chmod +x /usr/local/bin/qdrant
+
+COPY --from=builder /app/target/release/amgix-now /app/amgix-now
+
+COPY build/prefix-log-exec.sh build/wait-for-deps.sh build/entrypoint.sh /app/
+COPY build/supervisord-now.conf /etc/supervisor/conf.d/amgix-now.conf
+COPY build/config.yaml /app/config.yaml
+
+RUN chmod +x /app/amgix-now /app/prefix-log-exec.sh /app/wait-for-deps.sh /app/entrypoint.sh \
+    && mkdir -p /data/qdrant \
+    && chmod 755 /data /data/qdrant
+
+# Default: talk to embedded Qdrant gRPC (paths/ports: config.yaml + Qdrant defaults)
+ENV AMGIX_DEFAULT_DATABASE_URL=qdrant://localhost:6334 \
+    AMGIX_DATABASE_URL=qdrant://localhost:6334
+
+ARG AMGIX_VERSION=${AMGIX_VERSION:-0.1.0-dev}
+ENV AMGIX_VERSION=${AMGIX_VERSION}
+
+ENV AMGIX_VARIANT='Amgix-Now'
+ENV AMGIX_NOW_WORKERS=4
+# ENV AMGIX_NOW_INDEX_THREADS=1
+# ENV AMGIX_NOW_SEARCH_THREADS=1
+
+EXPOSE 8235
+
+VOLUME ["/data"]
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+    CMD curl --silent --fail --max-time 3 http://127.0.0.1:8235/v1/health/ready || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]

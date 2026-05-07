@@ -1,6 +1,7 @@
 pub mod dense_custom;
 pub mod dense_model;
 pub mod full_text;
+pub mod model_cache;
 pub mod sparse_custom;
 pub mod sparse_model;
 pub mod trigrams;
