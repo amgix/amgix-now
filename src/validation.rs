@@ -76,7 +76,6 @@ pub fn validate_collection_name(name: &str) -> VResult {
 
 pub fn validate_document(doc: &Document) -> VResult {
     validate_document_id(&doc.id)?;
-    validate_document_timestamp(&doc.timestamp)?;
     if let Some(tags) = &doc.tags {
         validate_tags(tags)?;
     }
@@ -106,14 +105,6 @@ fn validate_document_id(id: &str) -> VResult {
             "ensure this value has at most {MAX_DOCUMENT_ID_LENGTH} characters"
         )));
     }
-    Ok(())
-}
-
-/// @field_validator('timestamp') — validate_timestamp_utc
-fn validate_document_timestamp(ts: &chrono::DateTime<chrono::Utc>) -> VResult {
-    // chrono::DateTime<Utc> is always UTC by type; serde will reject non-datetime JSON.
-    // Python also validates tzinfo is present and is UTC — guaranteed by the Rust type.
-    let _ = ts;
     Ok(())
 }
 

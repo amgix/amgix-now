@@ -12,7 +12,10 @@ use std::sync::Arc;
 use rayon::ThreadPool;
 
 use axum::{
-    extract::{Path, State},
+    extract::{
+        rejection::JsonRejection,
+        Path, State,
+    },
     http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
@@ -63,8 +66,61 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Va
     )
 }
 
+/// FastAPI / Pydantic shape: `{ "detail": [ { "type", "loc", "msg", "input" }, ... ] }`.
+fn validation_error_detail_list(msg: impl Into<String>) -> Value {
+    json!([
+        {
+            "type": "validation_error",
+            "loc": ["body"],
+            "msg": msg.into(),
+            "input": Value::Null
+        }
+    ])
+}
+
+fn infer_json_error_loc(msg: &str) -> Value {
+    const NEEDLE: &str = "missing field `";
+    if let Some(start) = msg.find(NEEDLE) {
+        let after = &msg[start + NEEDLE.len()..];
+        if let Some(end) = after.find('`') {
+            let field = &after[..end];
+            return json!(["body", field]);
+        }
+    }
+    json!(["body"])
+}
+
+fn json_rejection_response(rejection: JsonRejection) -> (StatusCode, Json<Value>) {
+    let (status, msg) = match &rejection {
+        JsonRejection::JsonDataError(err) => (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
+        JsonRejection::JsonSyntaxError(err) => (StatusCode::BAD_REQUEST, err.to_string()),
+        JsonRejection::MissingJsonContentType(_) => {
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, rejection.to_string())
+        }
+        JsonRejection::BytesRejection(err) => (StatusCode::BAD_REQUEST, err.to_string()),
+        _ => (StatusCode::BAD_REQUEST, rejection.to_string()),
+    };
+    let loc = infer_json_error_loc(&msg);
+    (
+        status,
+        Json(json!({
+            "detail": [
+                {
+                    "type": "validation_error",
+                    "loc": loc,
+                    "msg": msg,
+                    "input": Value::Null
+                }
+            ]
+        })),
+    )
+}
+
 fn validation_error(e: validation::ValidationError) -> (StatusCode, Json<Value>) {
-    api_error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "detail": validation_error_detail_list(e.to_string()) })),
+    )
 }
 
 /// `GET /v1/health/check` — process is up and serving HTTP (mirrors Python `health_check`).
@@ -168,8 +224,9 @@ async fn get_collection_config(
 async fn create_collection(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
-    Json(config): Json<CollectionConfig>,
+    payload: Result<Json<CollectionConfig>, JsonRejection>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    let Json(config) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_collection_config(&config).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
@@ -372,8 +429,9 @@ async fn empty_collection(
 async fn upsert_document(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
-    Json(document): Json<Document>,
+    payload: Result<Json<Document>, JsonRejection>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    let Json(document) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_document(&document).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
@@ -400,8 +458,9 @@ async fn upsert_document(
 async fn upsert_documents_bulk(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
-    Json(request): Json<BulkUploadRequest>,
+    payload: Result<Json<BulkUploadRequest>, JsonRejection>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    let Json(request) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_bulk_upload(&request).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
@@ -530,8 +589,9 @@ async fn delete_document(
 async fn search(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
-    Json(query): Json<SearchQuery>,
+    payload: Result<Json<SearchQuery>, JsonRejection>,
 ) -> Result<Json<Vec<SearchResult>>, (StatusCode, Json<Value>)> {
+    let Json(query) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_search_query(&query).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);

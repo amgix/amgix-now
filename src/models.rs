@@ -4,8 +4,8 @@
 //! Internal types (`*Internal`) mirror what `amgix-server` stores in Qdrant,
 //! so data written by either service is readable by the other.
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -341,6 +341,45 @@ pub struct CollectionConfigInternal {
 }
 
 // ---------------------------------------------------------------------------
+// Document.timestamp — mirrors `document.py` `@field_validator('timestamp')`
+// ---------------------------------------------------------------------------
+
+/// Parses request JSON strings only. Offset must be UTC (`Z` or `+00:00` / equivalent zero offset).
+/// Rejects naive datetimes and non-UTC offsets with the same messages as Python.
+pub fn parse_document_timestamp_for_api(s: &str) -> Result<DateTime<Utc>, String> {
+    let s = s.trim();
+    let z_norm = s.replacen('Z', "+00:00", 1);
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&z_norm) {
+        if dt.offset().local_minus_utc() != 0 {
+            return Err("Timestamp must be in UTC timezone".to_string());
+        }
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    const NAIVE_FMTS: [&str; 2] = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
+    for fmt in NAIVE_FMTS {
+        if NaiveDateTime::parse_from_str(s, fmt).is_ok() {
+            return Err("Timestamp must include timezone information".to_string());
+        }
+    }
+
+    Err("Timestamp must be a valid ISO 8601 datetime string".to_string())
+}
+
+fn deserialize_document_timestamp<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::String(s) => parse_document_timestamp_for_api(&s).map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "Timestamp must be a datetime object",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Document — API-facing (mirrors document.py)
 // ---------------------------------------------------------------------------
 
@@ -354,6 +393,7 @@ pub struct CustomDocumentVector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
+    #[serde(deserialize_with = "deserialize_document_timestamp")]
     pub timestamp: DateTime<Utc>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
