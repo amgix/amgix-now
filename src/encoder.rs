@@ -367,6 +367,12 @@ pub async fn document_upsert_bulk(
         Err(e) => return Err(UpsertSyncError::Db(e)),
     };
 
+    // Mirrors Python: validate_metadata_types(collection_config, document) per doc.
+    for doc in &documents {
+        validate_metadata_types(&collection_config, doc)
+            .map_err(|e| UpsertSyncError::Vectorization(e.0))?;
+    }
+
     // Acquire per-doc locks for all documents upfront (in stable order to avoid deadlock).
     let mut doc_ids: Vec<&str> = documents.iter().map(|d| d.id.as_str()).collect();
     doc_ids.sort_unstable();
@@ -629,6 +635,60 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
             results: None,
             error: Some(e),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validate_metadata_types — mirrors database/common.py validate_metadata_types
+// ---------------------------------------------------------------------------
+
+pub struct MetadataTypeError(pub String);
+
+/// Mirrors `validate_metadata_types` from `database/common.py`.
+/// Validates that document metadata value types match the types declared in collection config.
+pub fn validate_metadata_types(
+    collection_config: &CollectionConfigInternal,
+    document: &Document,
+) -> Result<(), MetadataTypeError> {
+    let indexes = match collection_config.metadata_indexes.as_deref() {
+        Some(idx) if !idx.is_empty() => idx,
+        _ => return Ok(()),
+    };
+
+    let metadata = match document.metadata.as_ref() {
+        Some(m) if !m.is_empty() => m,
+        _ => return Ok(()),
+    };
+
+    for idx in indexes {
+        if let Some(value) = metadata.get(&idx.key) {
+            let actual_type = infer_metadata_value_type(value);
+            if actual_type != idx.value_type {
+                return Err(MetadataTypeError(format!(
+                    "Metadata key '{}' has type '{}' but collection config expects type '{}'",
+                    idx.key, actual_type, idx.value_type
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn infer_metadata_value_type(value: &serde_json::Value) -> String {
+    // Handle both raw primitives and MetaValue dict form {"value": ..., "type": "..."}
+    if let Some(map) = value.as_object() {
+        if let Some(type_val) = map.get("type").and_then(|t| t.as_str()) {
+            return type_val.to_string();
+        }
+    }
+    match value {
+        serde_json::Value::String(_) => "string".to_string(),
+        serde_json::Value::Bool(_) => "boolean".to_string(),
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() { "integer".to_string() } else { "float".to_string() }
+        }
+        _ => "unknown".to_string(),
     }
 }
 

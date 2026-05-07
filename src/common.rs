@@ -26,6 +26,27 @@ pub const DEFAULT_LANGUAGE_CONFIDENCE: f64 = 0.9;
 pub const SEARCH_PREFETCH_MULTIPLIER: f64 = 1.5;
 
 // ---------------------------------------------------------------------------
+// Validation limits (mirrors constants.py)
+// ---------------------------------------------------------------------------
+
+pub const MAX_COLLECTION_NAME_LENGTH: usize = 100;
+pub const MAX_BULK_UPLOAD: usize = 100;
+pub const MAX_VECTOR_NAME_LENGTH: usize = 100;
+pub const MAX_MODEL_NAME_LENGTH: usize = 210;
+pub const MAX_DOCUMENT_ID_LENGTH: usize = 100;
+pub const MAX_DOCUMENT_NAME_LENGTH: usize = 1500;
+pub const MAX_DOCUMENT_DESCRIPTION_LENGTH: usize = 3000;
+pub const MAX_DOCUMENT_CONTENT_LENGTH: usize = 1_000_000;
+pub const MAX_METADATA_KEY_LENGTH: usize = 100;
+pub const MAX_METADATA_VALUE_LENGTH: usize = 1024;
+pub const MAX_DOCUMENT_TAGS_COUNT: usize = 50;
+pub const MAX_DOCUMENT_TAG_LENGTH: usize = 100;
+pub const MAX_SEARCH_QUERY_LENGTH: usize = 10_000;
+pub const MAX_SEARCH_LIMIT: u32 = 100;
+pub const MAX_TOP_K_VALUE: u32 = 10_000;
+pub const MAX_VECTOR_DIMENSIONS: u32 = 8192;
+
+// ---------------------------------------------------------------------------
 // VectorType — all variants, mirrors enums.py exactly
 // ---------------------------------------------------------------------------
 
@@ -121,6 +142,17 @@ pub enum DenseDistance {
 impl Default for DenseDistance {
     fn default() -> Self {
         DenseDistance::Cosine
+    }
+}
+
+impl std::fmt::Display for DenseDistance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DenseDistance::Cosine => "cosine",
+            DenseDistance::Dot => "dot",
+            DenseDistance::Euclid => "euclid",
+        };
+        write!(f, "{s}")
     }
 }
 

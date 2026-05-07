@@ -4,6 +4,7 @@ mod encoder;
 mod functions;
 mod models;
 mod qdrant;
+mod validation;
 mod vectors;
 
 use std::sync::Arc;
@@ -34,6 +35,10 @@ use models::{
     SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
+use validation::{
+    validate_bulk_upload, validate_collection_config, validate_collection_name,
+    validate_document, validate_search_query,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -56,6 +61,10 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Va
         status,
         Json(json!({ "detail": msg.into() })),
     )
+}
+
+fn validation_error(e: validation::ValidationError) -> (StatusCode, Json<Value>) {
+    api_error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
 }
 
 /// `GET /v1/health/check` — process is up and serving HTTP (mirrors Python `health_check`).
@@ -141,6 +150,7 @@ async fn get_collection_config(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
 ) -> Result<Json<CollectionConfig>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     let internal = app.db.get_collection_info_internal(&real_collection_name).await.map_err(|e| match e {
         DbError::NotFound(_) => api_error(
@@ -160,6 +170,8 @@ async fn create_collection(
     Path(collection_name): Path<String>,
     Json(config): Json<CollectionConfig>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    validate_collection_config(&config).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
 
     match app.db.get_collection_info_internal(&real_collection_name).await {
@@ -265,6 +277,7 @@ async fn delete_collection(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
 
     match app.db.delete_collection(&real_collection_name).await {
@@ -289,6 +302,7 @@ async fn collection_exists(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
 ) -> Result<Json<CollectionExistsResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
 
     match app.db.get_collection_info_internal(&real_collection_name).await {
@@ -307,6 +321,7 @@ async fn get_collection_stats(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
 ) -> Result<Json<CollectionStatsResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
 
     match app.db.get_collection_info_internal(&real_collection_name).await {
@@ -343,6 +358,7 @@ async fn empty_collection(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     let ok = app.db.empty_collection(&real_collection_name).await.map_err(|e| {
         api_error(
@@ -358,6 +374,8 @@ async fn upsert_document(
     Path(collection_name): Path<String>,
     Json(document): Json<Document>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    validate_document(&document).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_upsert_sync(
         &app.db,
@@ -384,6 +402,8 @@ async fn upsert_documents_bulk(
     Path(collection_name): Path<String>,
     Json(request): Json<BulkUploadRequest>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    validate_bulk_upload(&request).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_upsert_bulk(
         &app.db,
@@ -410,6 +430,7 @@ async fn get_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
 ) -> Result<Json<Document>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     let rows = app
         .db
@@ -444,6 +465,7 @@ async fn get_document_status(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
 ) -> Result<Json<DocumentStatusResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     let rows = app
         .db
@@ -485,6 +507,7 @@ async fn delete_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_delete_sync(
         &app.db,
@@ -509,6 +532,8 @@ async fn search(
     Path(collection_name): Path<String>,
     Json(query): Json<SearchQuery>,
 ) -> Result<Json<Vec<SearchResult>>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    validate_search_query(&query).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match encoder_search(&app.db, &app.collection_cache, &app.search_pool, &real_collection_name, query).await {
         Ok(results) => Ok(Json(results)),
