@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::models::{DocumentWithVectors, SearchResult, VectorScore};
+use crate::common::MAX_METADATA_VALUE_LENGTH;
+use crate::models::{Document, DocumentWithVectors, SearchResult, VectorScore};
 use crate::qdrant::DbError;
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,175 @@ pub fn linear_weighted_score_fuse(
     items.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     items.truncate(limit);
     items
+}
+
+// ---------------------------------------------------------------------------
+// Metadata normalization — mirrors `document.py` `Document.validate_metadata`
+// converting primitives + `{value,type}` dicts → canonical MetaValue maps for payload.
+// Qdrant / API JSON must match Python `Document.model_dump()` shape.
+// ---------------------------------------------------------------------------
+
+/// Mirrors Python `validate_metadata`: every entry becomes `{ "value": …, "type": "…" }`.
+///
+/// Caller must ensure API validation (`validation::validate_document`) already passed.
+pub fn normalize_document_metadata_inplace(doc: &mut Document) -> Result<(), String> {
+    let Some(ref mut md) = doc.metadata else {
+        return Ok(());
+    };
+
+    let mut out: HashMap<String, serde_json::Value> = HashMap::with_capacity(md.len());
+    for (key, value) in md.drain() {
+        let normalized = normalize_one_metadata_value(&key, value)?;
+        out.insert(key, normalized);
+    }
+    *md = out;
+    Ok(())
+}
+
+fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            let val = map.get("value").ok_or_else(|| {
+                format!(
+                    "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
+                )
+            })?;
+            let type_str = map
+                .get("type")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
+                    )
+                })?;
+            let allowed = ["string", "integer", "float", "boolean", "datetime"];
+            if !allowed.contains(&type_str) {
+                return Err(format!(
+                    "Invalid metadata type '{type_str}' for key '{key}'. Allowed types: {allowed:?}"
+                ));
+            }
+            let inner = validate_and_clone_meta_inner(key, type_str, val)?;
+            Ok(serde_json::json!({
+                "value": inner,
+                "type": type_str
+            }))
+        }
+        serde_json::Value::String(s) => {
+            if s.len() > MAX_METADATA_VALUE_LENGTH {
+                return Err(format!(
+                    "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
+                ));
+            }
+            Ok(serde_json::json!({
+                "value": s,
+                "type": "string"
+            }))
+        }
+        serde_json::Value::Bool(b) => Ok(serde_json::json!({
+            "value": b,
+            "type": "boolean"
+        })),
+        serde_json::Value::Number(n) => {
+            if n.as_i64().is_some() || n.as_u64().is_some() {
+                Ok(serde_json::json!({
+                    "value": n,
+                    "type": "integer"
+                }))
+            } else {
+                Ok(serde_json::json!({
+                    "value": n,
+                    "type": "float"
+                }))
+            }
+        }
+        other => Err(format!(
+            "Metadata value for key '{key}' must be string, int, float, bool, or MetaValue (required for datetime), got {}",
+            json_type_name(&other)
+        )),
+    }
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "int"
+            } else {
+                "float"
+            }
+        }
+        serde_json::Value::String(_) => "str",
+        serde_json::Value::Array(_) => "list",
+        serde_json::Value::Object(_) => "dict",
+    }
+}
+
+fn validate_and_clone_meta_inner(
+    key: &str,
+    type_str: &str,
+    val: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match type_str {
+        "string" => match val.as_str() {
+            Some(s) if s.len() > MAX_METADATA_VALUE_LENGTH => Err(format!(
+                "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
+            )),
+            Some(s) => Ok(serde_json::Value::String(s.to_string())),
+            None => Err(format!(
+                "Metadata value for key '{key}' must be string for type='string', got {}",
+                json_type_name(val)
+            )),
+        },
+        "integer" => {
+            if val.is_i64() || val.is_u64() {
+                Ok(val.clone())
+            } else {
+                Err(format!(
+                    "Metadata value for key '{key}' must be integer for type='integer', got {}",
+                    json_type_name(val)
+                ))
+            }
+        }
+        "float" => {
+            if val.is_number() {
+                Ok(val.clone())
+            } else {
+                Err(format!(
+                    "Metadata value for key '{key}' must be number for type='float', got {}",
+                    json_type_name(val)
+                ))
+            }
+        }
+        "boolean" => {
+            if val.is_boolean() {
+                Ok(val.clone())
+            } else {
+                Err(format!(
+                    "Metadata value for key '{key}' must be boolean for type='boolean', got {}",
+                    json_type_name(val)
+                ))
+            }
+        }
+        "datetime" => match val.as_str() {
+            Some(s) => {
+                let normalized = s.replace('Z', "+00:00");
+                if chrono::DateTime::parse_from_rfc3339(&normalized).is_ok() {
+                    Ok(serde_json::Value::String(s.to_string()))
+                } else {
+                    Err(format!(
+                        "Metadata value for key '{key}' must be a valid ISO 8601 datetime string, got '{s}'"
+                    ))
+                }
+            }
+            None => Err(format!(
+                "Metadata value for key '{key}' must be string (ISO 8601) for type='datetime', got {}",
+                json_type_name(val)
+            )),
+        },
+        _ => unreachable!(),
+    }
 }
 
 pub fn doc_to_payload(

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
 
 use crate::common::{VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT};
+use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
     CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
     ModelValidationResult, SearchQuery, SearchQueryWithVectors, VectorConfigInternal,
@@ -428,7 +429,11 @@ pub async fn document_upsert_bulk(
     }
     let avgdl_dict: HashMap<String, f64> = stats.avgdls.clone();
 
-    let docs_owned: Vec<Document> = to_process.iter().map(|d| (*d).clone()).collect();
+    let mut docs_owned: Vec<Document> = to_process.iter().map(|d| (*d).clone()).collect();
+    for doc in &mut docs_owned {
+        normalize_document_metadata_inplace(doc)
+            .map_err(UpsertSyncError::Vectorization)?;
+    }
     let vectors_cfg = collection_config.vectors.clone();
     let pool = Arc::clone(index_pool);
     
