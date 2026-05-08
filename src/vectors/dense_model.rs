@@ -4,7 +4,7 @@ use candle_core::{DType, Tensor};
 use embed_anything::embeddings::local::bert::BertEmbedder;
 
 use crate::models::VectorConfigInternal;
-use crate::vectors::model_cache::{is_gpu_inference, model_inference_lock, trusted_organizations, DenseModelCache};
+use crate::vectors::model_cache::{maybe_gpu_inference_permit, trusted_organizations, DenseModelCache};
 use crate::vectors::vector_base::VectorBase;
 
 const DENSE_MODEL_BATCH_SIZE: usize = 32;
@@ -71,11 +71,7 @@ fn embed_dense_batch(
             .map_err(|e| format!("Tokenization failed for '{model_id}': {e}"))?;
 
         // Serialize GPU model inference across all threads when running on GPU.
-        let _gpu_guard = if is_gpu_inference() {
-            Some(model_inference_lock().lock().unwrap())
-        } else {
-            None
-        };
+        let _gpu_guard = maybe_gpu_inference_permit();
 
         let token_id_vecs: Vec<Tensor> = tokens
             .iter()

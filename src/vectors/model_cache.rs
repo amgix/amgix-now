@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
@@ -9,6 +9,13 @@ use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
 // ---------------------------------------------------------------------------
 
 static GPU_INFERENCE: OnceLock<bool> = OnceLock::new();
+
+/// Max overlapping GPU forwards (dense + sparse BERT paths) inside this process.
+/// `1` matches the legacy single global mutex; increase only when you accept higher GPU
+/// parallelism (device memory and driver limits). Unused on CPU-only inference.
+pub const GPU_MODEL_INFERENCE_CONCURRENCY_MAX: usize = 1;
+
+const _: () = assert!(GPU_MODEL_INFERENCE_CONCURRENCY_MAX >= 1);
 
 /// Returns true if GPU (CUDA or Metal) is available for model inference.
 /// Detected once on first call; subsequent calls are a single bool read.
@@ -24,12 +31,66 @@ pub fn is_gpu_inference() -> bool {
     })
 }
 
-/// Global mutex serializing GPU model inference across all rayon threads and pools.
-/// Only acquired when [`is_gpu_inference`] returns true.
-static MODEL_INFERENCE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// Counting limiter serializing overlapping GPU forwards across rayon pools.
+/// `[`GpuInferenceLimiter::release`]` must run once per successful `acquire` (use [`GpuInferencePermit`]).
+struct GpuInferenceLimiter {
+    max: usize,
+    available: Mutex<usize>,
+    cvar: Condvar,
+}
 
-pub fn model_inference_lock() -> &'static Mutex<()> {
-    MODEL_INFERENCE_LOCK.get_or_init(|| Mutex::new(()))
+impl GpuInferenceLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            available: Mutex::new(max),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) {
+        let mut n = self.available.lock().unwrap();
+        while *n == 0 {
+            n = self.cvar.wait(n).unwrap();
+        }
+        *n -= 1;
+    }
+
+    fn release(&self) {
+        let mut n = self.available.lock().unwrap();
+        *n = (*n + 1).min(self.max);
+        self.cvar.notify_one();
+    }
+}
+
+/// RAII slot from [`maybe_gpu_inference_permit`].
+pub(crate) struct GpuInferencePermit {
+    limiter: Arc<GpuInferenceLimiter>,
+}
+
+impl Drop for GpuInferencePermit {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+static GPU_INFERENCE_LIMITER: OnceLock<Arc<GpuInferenceLimiter>> = OnceLock::new();
+
+fn gpu_inference_limiter() -> &'static Arc<GpuInferenceLimiter> {
+    GPU_INFERENCE_LIMITER.get_or_init(|| {
+        Arc::new(GpuInferenceLimiter::new(GPU_MODEL_INFERENCE_CONCURRENCY_MAX))
+    })
+}
+
+/// When [`is_gpu_inference`] is false, returns `None` (no limiting). Otherwise blocks until a GPU
+/// forward slot is available and returns a permit whose drop releases the slot.
+pub(crate) fn maybe_gpu_inference_permit() -> Option<GpuInferencePermit> {
+    if !is_gpu_inference() {
+        return None;
+    }
+    let limiter = Arc::clone(gpu_inference_limiter());
+    limiter.acquire();
+    Some(GpuInferencePermit { limiter })
 }
 
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour, mirrors MODEL_CACHE_TTL

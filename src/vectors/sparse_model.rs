@@ -5,7 +5,7 @@ use candle_core::Tensor;
 use tokenizers::Tokenizer;
 
 use crate::models::VectorConfigInternal;
-use crate::vectors::model_cache::{is_gpu_inference, model_inference_lock, trusted_organizations, SparseModelCache};
+use crate::vectors::model_cache::{maybe_gpu_inference_permit, trusted_organizations, SparseModelCache};
 use crate::vectors::vector_base::{preprocess_text, preprocess_text_keep_case, VectorBase};
 
 const SPARSE_MODEL_BATCH_SIZE: usize = 8;
@@ -64,11 +64,7 @@ impl SparseModelVector {
                 .map_err(|e| format!("Tokenization failed for '{model_id}': {e}"))?;
 
             // Serialize GPU model inference across all threads when running on GPU.
-            let _gpu_guard = if is_gpu_inference() {
-                Some(model_inference_lock().lock().unwrap())
-            } else {
-                None
-            };
+            let _gpu_guard = maybe_gpu_inference_permit();
 
             let token_id_tensors: Vec<Tensor> = tokens
                 .iter()
