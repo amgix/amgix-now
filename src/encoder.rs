@@ -1,11 +1,16 @@
 //! Encoder-layer logic — mirrors `src/encoder/encoder.py` (`update_collection_stats`,
-//! `validate_models`, `document_upsert_sync`).
+//! `validate_models`, `document_upsert_sync`). Ingress uses [`UpsertIngress`]: REST bulk hits the
+//! bulk channel (immediate internal); singles use a separate channel drained into micro-batches
+//! with bounded concurrency ([`SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX`] pipelines in flight).
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
+use tokio::task::JoinSet;
 
 use crate::common::{VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT};
 use crate::functions::normalize_document_metadata_inplace;
@@ -305,6 +310,10 @@ pub enum UpsertSyncError {
     NotFound(String),
     Db(DbError),
     Vectorization(String),
+    /// Bounded ingress channel has no buffer space (`try_send`) — clients should retry with backoff.
+    IngressQueueFull(String),
+    /// Reply channel dropped (typically ingress worker exited).
+    IngressWorkerExited(String),
 }
 
 impl std::fmt::Display for UpsertSyncError {
@@ -313,6 +322,8 @@ impl std::fmt::Display for UpsertSyncError {
             UpsertSyncError::NotFound(m) => write!(f, "{m}"),
             UpsertSyncError::Db(e) => write!(f, "{e}"),
             UpsertSyncError::Vectorization(m) => write!(f, "{m}"),
+            UpsertSyncError::IngressQueueFull(m) => write!(f, "{m}"),
+            UpsertSyncError::IngressWorkerExited(m) => write!(f, "{m}"),
         }
     }
 }
@@ -323,29 +334,374 @@ impl From<DbError> for UpsertSyncError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// document_upsert_sync — single-document convenience wrapper around bulk
-// ---------------------------------------------------------------------------
+/// Max REST **bulk** jobs buffered (`try_send` → HTTP 429 when full).
+pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
+/// Max single-doc micro-batches pulled off the singles ingress channel **in flight at once**.
+/// One task still `recv`s and builds batches; this bounds overlapping `document_upsert_bulk_internal`
+/// work (per parallel micro-batch pipeline).
+pub const SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX: usize = 4;
+/// Max **single-document** ingress jobs buffered.
+pub const SINGLE_UPSERT_QUEUE_CAPACITY: usize = 1024;
+/// Max single-doc messages pulled into one micro-batch (including first `recv`).
+pub const SINGLE_UPSERT_MICROBATCH_DRAIN_MAX: usize = 64;
 
-/// Returns `Ok(skipped_ids)` — non-empty when the document was stale.
-pub async fn document_upsert_sync(
-    db: &QdrantDb,
+struct BulkIngressJob {
+    collection_name: String,
+    documents: Vec<Document>,
+    reply: oneshot::Sender<Result<Vec<String>, UpsertSyncError>>,
+}
+
+struct SingleIngressJob {
+    collection_name: String,
+    document: Document,
+    reply: Option<oneshot::Sender<Result<Vec<String>, UpsertSyncError>>>,
+}
+
+fn send_single_ingress_reply(
+    job: &mut SingleIngressJob,
+    msg: Result<Vec<String>, UpsertSyncError>,
+) {
+    if let Some(tx) = job.reply.take() {
+        let _ = tx.send(msg);
+    }
+}
+
+#[derive(Clone)]
+pub struct UpsertIngress {
+    bulk_tx: mpsc::Sender<BulkIngressJob>,
+    singles_tx: mpsc::Sender<SingleIngressJob>,
+}
+
+/// Await [**`shutdown_and_wait`**](Self::shutdown_and_wait) **after** [`axum::serve`] returns so
+/// all clones of [`UpsertIngress`] are dropped, ingress [`mpsc`] channels close, workers drain any
+/// remaining jobs, then exit. Prefer **before** [`StatsBatcherShutdown::shutdown_and_wait`] so
+/// ingestion can enqueue stats updates while drains run.
+pub struct UpsertIngressShutdown {
+    bulk: tokio::task::JoinHandle<()>,
+    singles: tokio::task::JoinHandle<()>,
+}
+
+impl UpsertIngressShutdown {
+    pub async fn shutdown_and_wait(self) {
+        let (bulk, singles) = tokio::join!(self.bulk, self.singles);
+        if let Err(e) = bulk {
+            tracing::warn!("bulk upsert ingress worker join: {e}");
+        }
+        if let Err(e) = singles {
+            tracing::warn!("single upsert ingress worker join: {e}");
+        }
+    }
+}
+
+fn replicate_upsert_sync_err(src: &UpsertSyncError) -> UpsertSyncError {
+    match src {
+        UpsertSyncError::NotFound(s) => UpsertSyncError::NotFound(s.clone()),
+        UpsertSyncError::Db(e) => UpsertSyncError::Db(DbError::Config(e.to_string())),
+        UpsertSyncError::Vectorization(s) => UpsertSyncError::Vectorization(s.clone()),
+        UpsertSyncError::IngressQueueFull(s) => UpsertSyncError::IngressQueueFull(s.clone()),
+        UpsertSyncError::IngressWorkerExited(s) => UpsertSyncError::IngressWorkerExited(s.clone()),
+    }
+}
+
+impl UpsertIngress {
+    pub fn new(
+        db: Arc<QdrantDb>,
+        cache: CollectionConfigCache,
+        stats_batcher: StatsUpdateBatcher,
+        doc_locks: NamedLocks,
+        index_pool: Arc<rayon::ThreadPool>,
+    ) -> (Self, UpsertIngressShutdown) {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel::<BulkIngressJob>(BULK_UPSERT_QUEUE_CAPACITY);
+        let bulk = {
+            let db = Arc::clone(&db);
+            let cache = cache.clone();
+            let stats_batcher = stats_batcher.clone();
+            let doc_locks = doc_locks.clone();
+            let index_pool = Arc::clone(&index_pool);
+            tokio::spawn(async move {
+                while let Some(BulkIngressJob {
+                    collection_name,
+                    documents,
+                    reply,
+                }) = bulk_rx.recv().await
+                {
+                    let out = document_upsert_bulk_internal(
+                        &db,
+                        &cache,
+                        &stats_batcher,
+                        &doc_locks,
+                        &index_pool,
+                        &collection_name,
+                        documents,
+                    )
+                    .await;
+                    let _ = reply.send(out);
+                }
+            })
+        };
+
+        let (singles_tx, mut singles_rx) =
+            mpsc::channel::<SingleIngressJob>(SINGLE_UPSERT_QUEUE_CAPACITY);
+        let singles = {
+            let db = Arc::clone(&db);
+            let cache = cache.clone();
+            let stats_batcher = stats_batcher.clone();
+            let doc_locks = doc_locks.clone();
+            let index_pool = Arc::clone(&index_pool);
+            tokio::spawn(async move {
+                let mut inflight = JoinSet::new();
+                loop {
+                    while inflight.len() >= SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX {
+                        if let Some(res) = inflight.join_next().await {
+                            if let Err(e) = res {
+                                tracing::warn!("single-document micro-batch task panicked: {e}");
+                            }
+                        }
+                    }
+                    let first = match singles_rx.recv().await {
+                        None => break,
+                        Some(f) => f,
+                    };
+                    let mut batch = vec![first];
+                    while batch.len() < SINGLE_UPSERT_MICROBATCH_DRAIN_MAX {
+                        match singles_rx.try_recv() {
+                            Ok(j) => batch.push(j),
+                            Err(_) => break,
+                        }
+                    }
+                    let db = Arc::clone(&db);
+                    let cache = cache.clone();
+                    let stats_batcher = stats_batcher.clone();
+                    let doc_locks = doc_locks.clone();
+                    let index_pool = Arc::clone(&index_pool);
+                    inflight.spawn(async move {
+                        process_single_document_microbatch(
+                            batch,
+                            &db,
+                            &cache,
+                            &stats_batcher,
+                            &doc_locks,
+                            &index_pool,
+                        )
+                        .await;
+                    });
+                }
+                while let Some(res) = inflight.join_next().await {
+                    if let Err(e) = res {
+                        tracing::warn!("single-document micro-batch task panicked: {e}");
+                    }
+                }
+            })
+        };
+
+        (
+            Self {
+                bulk_tx,
+                singles_tx,
+            },
+            UpsertIngressShutdown { bulk, singles },
+        )
+    }
+}
+
+async fn process_single_document_microbatch(
+    jobs: Vec<SingleIngressJob>,
+    db: &Arc<QdrantDb>,
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
     index_pool: &Arc<rayon::ThreadPool>,
+) {
+    let mut by_collection: HashMap<String, Vec<SingleIngressJob>> = HashMap::new();
+    for j in jobs {
+        by_collection
+            .entry(j.collection_name.clone())
+            .or_default()
+            .push(j);
+    }
+
+    for (collection_name, slots) in by_collection {
+        respond_single_microbatch_for_collection(
+            &collection_name,
+            slots,
+            db,
+            cache,
+            stats_batcher,
+            doc_locks,
+            index_pool,
+        )
+        .await;
+    }
+}
+
+async fn respond_single_microbatch_for_collection(
     collection_name: &str,
-    document: Document,
-) -> Result<Vec<String>, UpsertSyncError> {
-    document_upsert_bulk(db, cache, stats_batcher, doc_locks, index_pool, collection_name, vec![document]).await
+    mut slots: Vec<SingleIngressJob>,
+    db: &Arc<QdrantDb>,
+    cache: &CollectionConfigCache,
+    stats_batcher: &StatsUpdateBatcher,
+    doc_locks: &NamedLocks,
+    index_pool: &Arc<rayon::ThreadPool>,
+) {
+    let n = slots.len();
+    let mut answered = vec![false; n];
+    let mut winner_idx_for_id: HashMap<String, usize> = HashMap::new();
+
+    for idx in 0..n {
+        let id = slots[idx].document.id.clone();
+        let ts = slots[idx].document.timestamp;
+        match winner_idx_for_id.entry(id.clone()) {
+            Entry::Vacant(v) => {
+                v.insert(idx);
+            }
+            Entry::Occupied(mut o) => {
+                let bi = *o.get();
+                let bts = slots[bi].document.timestamp;
+                match ts.cmp(&bts) {
+                    Ordering::Greater => {
+                        let doc_id = slots[bi].document.id.clone();
+                        send_single_ingress_reply(&mut slots[bi], Ok(vec![doc_id]));
+                        answered[bi] = true;
+                        *o.get_mut() = idx;
+                    }
+                    Ordering::Less => {
+                        let doc_id = slots[idx].document.id.clone();
+                        send_single_ingress_reply(&mut slots[idx], Ok(vec![doc_id]));
+                        answered[idx] = true;
+                    }
+                    Ordering::Equal => {
+                        let doc_id = slots[idx].document.id.clone();
+                        send_single_ingress_reply(&mut slots[idx], Ok(vec![doc_id]));
+                        answered[idx] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut uniq_winner_idx: HashSet<usize> = HashSet::with_capacity(winner_idx_for_id.len());
+    for &wi in winner_idx_for_id.values() {
+        uniq_winner_idx.insert(wi);
+    }
+    let merged: Vec<Document> = uniq_winner_idx
+        .into_iter()
+        .map(|i| slots[i].document.clone())
+        .collect();
+
+    if merged.is_empty() {
+        return;
+    }
+
+    match document_upsert_bulk_internal(
+        db,
+        cache,
+        stats_batcher,
+        doc_locks,
+        index_pool,
+        collection_name,
+        merged,
+    )
+    .await
+    {
+        Ok(skipped) => {
+            let skipped_set: HashSet<String> = skipped.into_iter().collect();
+            for idx in 0..n {
+                if answered[idx] {
+                    continue;
+                }
+                let doc_id = slots[idx].document.id.clone();
+                let Some(win) = winner_idx_for_id.get(&doc_id).copied() else {
+                    continue;
+                };
+                if win != idx {
+                    continue;
+                }
+                if skipped_set.contains(&doc_id) {
+                    send_single_ingress_reply(&mut slots[idx], Ok(vec![doc_id]));
+                } else {
+                    send_single_ingress_reply(&mut slots[idx], Ok(vec![]));
+                }
+            }
+        }
+        Err(e) => {
+            for idx in 0..n {
+                if answered[idx] {
+                    continue;
+                }
+                send_single_ingress_reply(
+                    &mut slots[idx],
+                    Err(replicate_upsert_sync_err(&e)),
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// document_upsert_bulk — mirrors _document_upsert_bulk_internal (queue-free)
+// document_upsert_sync — single-document path (micro-batch singles queue).
+// ---------------------------------------------------------------------------
+
+/// Returns `Ok(skipped_ids)` — non-empty when the document was stale.
+pub async fn document_upsert_sync(
+    ingress: &UpsertIngress,
+    collection_name: &str,
+    document: Document,
+) -> Result<Vec<String>, UpsertSyncError> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ingress
+        .singles_tx
+        .try_send(SingleIngressJob {
+            collection_name: collection_name.to_string(),
+            document,
+            reply: Some(reply_tx),
+        })
+        .map_err(|_| {
+            UpsertSyncError::IngressQueueFull(format!(
+                "Single-document ingress queue full (capacity {SINGLE_UPSERT_QUEUE_CAPACITY}); retry later.",
+            ))
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| UpsertSyncError::IngressWorkerExited("Single-document ingress worker stopped.".into()))?
+}
+
+// ---------------------------------------------------------------------------
+// document_upsert_bulk — REST bulk path (immediate per message).
 // ---------------------------------------------------------------------------
 
 /// Returns `Ok(skipped_ids)` — IDs of documents that were stale and not indexed.
 pub async fn document_upsert_bulk(
+    ingress: &UpsertIngress,
+    collection_name: &str,
+    documents: Vec<Document>,
+) -> Result<Vec<String>, UpsertSyncError> {
+    if documents.is_empty() {
+        return Ok(vec![]);
+    }
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ingress
+        .bulk_tx
+        .try_send(BulkIngressJob {
+            collection_name: collection_name.to_string(),
+            documents,
+            reply: reply_tx,
+        })
+        .map_err(|_| {
+            UpsertSyncError::IngressQueueFull(format!(
+                "Bulk ingest queue full (capacity {BULK_UPSERT_QUEUE_CAPACITY}); retry later.",
+            ))
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| UpsertSyncError::IngressWorkerExited("Bulk ingest worker stopped.".into()))?
+}
+
+// ---------------------------------------------------------------------------
+// document_upsert_bulk_internal
+// ---------------------------------------------------------------------------
+
+/// Returns `Ok(skipped_ids)` — IDs of documents that were stale and not indexed.
+pub(crate) async fn document_upsert_bulk_internal(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,

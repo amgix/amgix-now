@@ -19,7 +19,7 @@ use axum::{
     },
     http::StatusCode,
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -31,7 +31,8 @@ use common::{
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
-    CollectionConfigCache, NamedLocks, SearchError, StatsUpdateBatcher, UpsertSyncError,
+    UpsertIngress, CollectionConfigCache, NamedLocks, SearchError, StatsUpdateBatcher,
+    UpsertSyncError,
 };
 use encoder::search as encoder_search;
 use models::{
@@ -58,8 +59,8 @@ struct AppState {
     amgix_version_display: String,
     collection_cache: CollectionConfigCache,
     stats_batcher: StatsUpdateBatcher,
+    upsert_ingress: UpsertIngress,
     doc_locks: NamedLocks,
-    index_pool: Arc<ThreadPool>,
     search_pool: Arc<ThreadPool>,
 }
 
@@ -125,6 +126,22 @@ fn validation_error(e: validation::ValidationError) -> (StatusCode, Json<Value>)
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({ "detail": validation_error_detail_list(e.to_string()) })),
     )
+}
+
+/// Full Amgix API compatibility surface that **amgix-now** intentionally omits — same paths as FastAPI (`api/main.py`).
+const AMGIX_NOW_NOT_IMPLEMENTED_MSG: &str = "Not implemented in Amgix Now";
+
+/// `501` stubs for **`GET /v1/metrics/*`** routes present in Python.
+async fn not_implemented_amgix_now_metrics() -> impl IntoResponse {
+    api_error(StatusCode::NOT_IMPLEMENTED, AMGIX_NOW_NOT_IMPLEMENTED_MSG)
+}
+
+/// `501` stubs for **`.../queue/...`** collection routes present in Python; validates `{collection_name}` like other handlers.
+async fn not_implemented_amgix_now_collection_queue(Path(collection_name): Path<String>) -> impl IntoResponse {
+    match validate_collection_name(&collection_name) {
+        Err(e) => validation_error(e).into_response(),
+        Ok(()) => api_error(StatusCode::NOT_IMPLEMENTED, AMGIX_NOW_NOT_IMPLEMENTED_MSG).into_response(),
+    }
 }
 
 /// `GET /v1/health/check` — process is up and serving HTTP (mirrors Python `health_check`).
@@ -440,20 +457,16 @@ async fn upsert_document(
     normalize_document_python(&mut document);
     validate_document(&document).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
-    match document_upsert_sync(
-        &app.db,
-        &app.collection_cache,
-        &app.stats_batcher,
-        &app.doc_locks,
-        &app.index_pool,
-        &real_collection_name,
-        document,
-    )
-    .await
-    {
+    match document_upsert_sync(&app.upsert_ingress, &real_collection_name, document).await {
         Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
+        Err(UpsertSyncError::IngressQueueFull(m)) => {
+            Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
+        }
+        Err(UpsertSyncError::IngressWorkerExited(m)) => {
+            Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
+        }
         Err(UpsertSyncError::Db(e)) => {
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
@@ -470,11 +483,7 @@ async fn upsert_documents_bulk(
     validate_bulk_upload(&mut request).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_upsert_bulk(
-        &app.db,
-        &app.collection_cache,
-        &app.stats_batcher,
-        &app.doc_locks,
-        &app.index_pool,
+        &app.upsert_ingress,
         &real_collection_name,
         request.documents,
     )
@@ -483,6 +492,12 @@ async fn upsert_documents_bulk(
         Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
+        Err(UpsertSyncError::IngressQueueFull(m)) => {
+            Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
+        }
+        Err(UpsertSyncError::IngressWorkerExited(m)) => {
+            Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
+        }
         Err(UpsertSyncError::Db(e)) => {
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
@@ -585,6 +600,12 @@ async fn delete_document(
         Ok(()) => Ok(Json(OkResponse::ok())),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
+        Err(UpsertSyncError::IngressQueueFull(m)) => {
+            Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
+        }
+        Err(UpsertSyncError::IngressWorkerExited(m)) => {
+            Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
+        }
         Err(UpsertSyncError::Db(e)) => {
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
@@ -766,7 +787,7 @@ async fn main() {
     let search_threads = std::env::var("AMGIX_NOW_SEARCH_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| (num_cpus / 2).max(1));
+        .unwrap_or_else(|| (num_cpus).max(2));
 
     let index_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -785,16 +806,26 @@ async fn main() {
     let web_threads = std::env::var("TOKIO_WORKER_THREADS").unwrap_or_default();
     tracing::info!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
 
+    let collection_cache = CollectionConfigCache::new();
+    let doc_locks = NamedLocks::new();
+    let (upsert_ingress, upsert_shutdown) = UpsertIngress::new(
+        Arc::clone(&db),
+        collection_cache.clone(),
+        stats_batcher.clone(),
+        doc_locks.clone(),
+        Arc::clone(&index_pool),
+    );
+
     let state = AppState {
         db,
         qdrant_version,
         amgix_version,
         amgix_variant,
         amgix_version_display,
-        collection_cache: CollectionConfigCache::new(),
+        collection_cache,
         stats_batcher,
-        doc_locks: NamedLocks::new(),
-        index_pool,
+        upsert_ingress,
+        doc_locks,
         search_pool,
     };
 
@@ -803,6 +834,10 @@ async fn main() {
         .route("/v1/system/info", get(system_info))
         .route("/v1/health/check", get(health_check))
         .route("/v1/health/ready", get(health_ready))
+        .route("/v1/metrics/current", get(not_implemented_amgix_now_metrics))
+        .route("/v1/metrics/prometheus", get(not_implemented_amgix_now_metrics))
+        .route("/v1/metrics/trends", get(not_implemented_amgix_now_metrics))
+        .route("/v1/metrics/definitions", get(not_implemented_amgix_now_metrics))
         .route("/v1/collections", get(list_collections))
         .route(
             "/v1/collections/{collection_name}",
@@ -815,6 +850,14 @@ async fn main() {
         .route(
             "/v1/collections/{collection_name}/stats",
             get(get_collection_stats),
+        )
+        .route(
+            "/v1/collections/{collection_name}/queue/info",
+            get(not_implemented_amgix_now_collection_queue),
+        )
+        .route(
+            "/v1/collections/{collection_name}/queue",
+            delete(not_implemented_amgix_now_collection_queue),
         )
         .route(
             "/v1/collections/{collection_name}/empty",
@@ -862,6 +905,8 @@ async fn main() {
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await;
+
+    upsert_shutdown.shutdown_and_wait().await;
 
     stats_shutdown.shutdown_and_wait().await;
 
