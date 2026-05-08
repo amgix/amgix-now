@@ -12,11 +12,14 @@ use std::sync::Arc;
 use rayon::ThreadPool;
 
 use axum::{
+    body::{to_bytes, Body},
     extract::{
         rejection::JsonRejection,
-        Path, State,
+        Path, Request, State,
     },
     http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -609,6 +612,87 @@ async fn search(
     }
 }
 
+/// Read directives for [`tracing_subscriber::EnvFilter`]: `AMGIX_LOG_LEVEL`,
+/// or **`info`** when unset. Single-token values are normalized (`WARNING`→`warn`, …);
+/// strings with `=` are passed through for crate-specific overrides.
+fn log_env_filter_directives() -> String {
+    let raw = std::env::var("AMGIX_LOG_LEVEL").unwrap_or_else(|_| "info".into());
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "info".into();
+    }
+    if trimmed.contains('=') {
+        return trimmed.to_string();
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "warning" => "warn".into(),
+        "critical" => "error".into(),
+        other => other.to_string(),
+    }
+}
+
+fn init_tracing_from_env() {
+    let directives = log_env_filter_directives();
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_new(&directives).unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("info")
+        });
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .init();
+}
+
+/// Central place: log any endpoint that finishes with an HTTP failure status (not 2xx,
+/// excluding 218 used by `/v1/health/ready` partial-ready).
+async fn log_failed_http_responses(request: Request, next: Next) -> Response {
+    const MAX_BODY_CAPTURE: usize = 256 * 1024;
+
+    fn truncate_body_for_log(raw: &str) -> std::borrow::Cow<'_, str> {
+        const MAX_CHARS: usize = 8192;
+        let count = raw.chars().count();
+        if count <= MAX_CHARS {
+            return std::borrow::Cow::Borrowed(raw);
+        }
+        let prefix: String = raw.chars().take(MAX_CHARS).collect();
+        std::borrow::Cow::Owned(format!("{prefix}… (truncated, {count} chars)"))
+    }
+
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    let status = response.status();
+
+    if status.is_success() || status.as_u16() == 218 {
+        return response;
+    }
+
+    let server_err = status.is_server_error();
+
+    let (parts, body) = response.into_parts();
+
+    match to_bytes(body, MAX_BODY_CAPTURE).await {
+        Ok(bytes) => {
+            let decoded = String::from_utf8_lossy(&bytes);
+            let body_for_log = truncate_body_for_log(&decoded);
+            if server_err {
+                tracing::error!(%method, path, %status, body = %body_for_log, "HTTP server error response");
+            } else {
+                tracing::warn!(%method, path, %status, body = %body_for_log, "HTTP client error response");
+            }
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(e) => {
+            if server_err {
+                tracing::error!(%method, path, %status, capture_error = %e, "HTTP server error response (body not captured)");
+            } else {
+                tracing::warn!(%method, path, %status, capture_error = %e, "HTTP client error response (body not captured)");
+            }
+            Response::from_parts(parts, Body::empty())
+        }
+    }
+}
+
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -633,26 +717,28 @@ async fn wait_for_shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    init_tracing_from_env();
+
     let db_url = std::env::var("AMGIX_DATABASE_URL")
         .unwrap_or_else(|_| "qdrant://localhost:6334".to_string());
 
     let db = match QdrantDb::new(&qdrant_client_url(&db_url)) {
         Ok(d) => Arc::new(d),
         Err(e) => {
-            eprintln!("Qdrant client (AMGIX_DATABASE_URL): {e}");
+            tracing::error!("Qdrant client (AMGIX_DATABASE_URL): {e}");
             std::process::exit(1);
         }
     };
 
     if let Err(e) = db.configure().await {
-        eprintln!("Qdrant configure: {e}");
+        tracing::error!("Qdrant configure: {e}");
         std::process::exit(1);
     }
 
     let qdrant_version = match db.probe().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Qdrant probe failed: {e}");
+            tracing::error!("Qdrant probe failed: {e}");
             std::process::exit(1);
         }
     };
@@ -667,8 +753,8 @@ async fn main() {
         format!("{} ({})", amgix_version, amgix_variant)
     };
 
-    println!("Amgix version: {amgix_version_display}");
-    println!("Qdrant version: {qdrant_version}");
+    tracing::info!("Amgix version: {amgix_version_display}");
+    tracing::info!("Qdrant version: {qdrant_version}");
 
     let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), NamedLocks::new());
 
@@ -697,7 +783,7 @@ async fn main() {
             .expect("failed to build search thread pool"),
     );
     let web_threads = std::env::var("TOKIO_WORKER_THREADS").unwrap_or_default();
-    println!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
+    tracing::info!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
 
     let state = AppState {
         db,
@@ -762,14 +848,15 @@ async fn main() {
             "/v1/collections/{collection_name}/search",
             post(search),
         )
+        .layer(middleware::from_fn(log_failed_http_responses))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8235").await.unwrap();
-    println!("Listening  http://0.0.0.0:8235");
+    tracing::info!("Listening  http://0.0.0.0:8235");
 
     let shutdown = async {
         wait_for_shutdown_signal().await;
-        println!("shutdown signal received, finishing in-flight requests");
+        tracing::info!("shutdown signal received, finishing in-flight requests");
     };
 
     let serve_result = axum::serve(listener, app)
@@ -779,7 +866,7 @@ async fn main() {
     stats_shutdown.shutdown_and_wait().await;
 
     if let Err(e) = serve_result {
-        eprintln!("server error: {e}");
+        tracing::error!("server error: {e}");
         std::process::exit(1);
     }
 }
