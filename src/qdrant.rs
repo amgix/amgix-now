@@ -32,6 +32,8 @@ use crate::models::{
     SearchQueryWithVectors, SearchResult, VectorScore,
 };
 
+const QDRANT_GRPC_CHANNEL_POOL_SIZE: usize = 10;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -88,7 +90,9 @@ impl QdrantDb {
     /// `url` is passed to [`Qdrant::from_url`](qdrant_client::Qdrant::from_url): gRPC URI, e.g.
     /// `http://localhost:6334` (not Qdrant REST on 6333).
     pub fn new(url: &str) -> Result<Self, DbError> {
-        let client = Qdrant::from_url(url).build()?;
+        let mut builder = Qdrant::from_url(url);
+        builder.set_pool_size(QDRANT_GRPC_CHANNEL_POOL_SIZE);
+        let client = builder.build()?;
         Ok(QdrantDb {
             client,
             meta_collection: sys_collection_name("meta"),
