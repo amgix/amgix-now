@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use common::{
-    get_real_collection_name, get_user_collection_name, qdrant_client_url, VectorType, DATABASE_KIND,
+    get_real_collection_name, get_user_collection_name, qdrant_client_url,
+    AMGIX_VARIANT, VectorType, DATABASE_KIND,
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
@@ -775,13 +776,8 @@ async fn main() {
 
     let amgix_version = std::env::var("AMGIX_VERSION").unwrap_or_default();
     let amgix_version = amgix_version.trim().to_string();
-    let amgix_variant = std::env::var("AMGIX_VARIANT").unwrap_or_default();
-    let amgix_variant = amgix_variant.trim().to_string();
-    let amgix_version_display = if amgix_variant.is_empty() {
-        amgix_version.clone()
-    } else {
-        format!("{} ({})", amgix_version, amgix_variant)
-    };
+    let amgix_variant = AMGIX_VARIANT.to_string();
+    let amgix_version_display = format!("{} ({})", amgix_version, AMGIX_VARIANT);
 
     tracing::info!("Amgix version: {amgix_version_display}");
     tracing::info!("Qdrant version: {qdrant_version}");

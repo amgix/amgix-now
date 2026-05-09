@@ -8,6 +8,9 @@ use uuid::Uuid;
 pub const APP_NAME: &str = "Amalgam Index";
 pub const APP_PREFIX: &str = "amgix";
 
+/// Product line label for `/v1/version` and `/v1/system/info` (formerly `AMGIX_VARIANT`).
+pub const AMGIX_VARIANT: &str = "Amgix-Now";
+
 /// UUID5 namespace for all document / config IDs.
 /// Computed once at startup: uuid5(NAMESPACE_DNS, APP_NAME).
 /// Must produce `d953b233-6472-5054-8f32-1999b057711c` — verified against Python.
