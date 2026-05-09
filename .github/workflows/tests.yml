@@ -1,0 +1,81 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [main, "release/v*"]
+  pull_request:
+    branches: [main, "release/v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: run-tests-amgix-now-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Fix workspace permissions via Docker
+        run: docker run --rm -v ${{ github.workspace }}:/work alpine chown -R $(id -u):$(id -g) /work || true
+
+      - name: Checkout amgix-now
+        uses: actions/checkout@v6
+
+      - name: Checkout amgix-server
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/amgix-server
+          path: amgix-server
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install amgix-server Python deps + pytest deps
+        working-directory: amgix-server
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r src/api/requirements.txt
+          pip install -r tests/requirements.txt
+
+      - name: Build Docker image (CPU / embedded Qdrant)
+        run: |
+          docker build -f build/Dockerfile.cpu --build-arg AMGIX_VERSION=0.1.0-ci -t amgix-now:ci .
+
+      - name: Run container (8234→8235)
+        run: |
+          docker run --rm -d --name amgix-now-ci -p 8234:8235 \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            amgix-now:ci
+
+      - name: Wait for /v1/health/ready on :8234
+        run: |
+          set +e
+          timeout 300 bash -c 'while true; do >/tmp/ready.json; CODE=$(curl -sS -o /tmp/ready.json -w "%{http_code}" http://127.0.0.1:8234/v1/health/ready || echo 000); [ "$CODE" = "200" ] && break; BODY=$([ "$CODE" = "000" ] && echo "(connection failed)" || cat /tmp/ready.json 2>/dev/null); echo "Waiting... HTTP $CODE $BODY"; sleep 5; done; echo "Ready: $(cat /tmp/ready.json)"'
+          R=$?
+          if [ "$R" -eq 124 ]; then
+            echo "::error::Timed out waiting for http://127.0.0.1:8234/v1/health/ready"
+            docker logs --tail=200 amgix-now-ci 2>/dev/null || true
+          fi
+          exit "$R"
+
+      - name: Pytest (amgix-server) against localhost:8234
+        working-directory: amgix-server
+        run: |
+          . .venv/bin/activate
+          export PYTHONPATH=.
+          pytest
+
+      - name: Stop container
+        if: always()
+        run: |
+          docker stop amgix-now-ci 2>/dev/null || true
