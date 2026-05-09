@@ -91,7 +91,9 @@ impl QdrantDb {
     /// `url` is passed to [`Qdrant::from_url`](qdrant_client::Qdrant::from_url): gRPC URI, e.g.
     /// `http://localhost:6334` (not Qdrant REST on 6333).
     pub fn new(url: &str) -> Result<Self, DbError> {
-        let mut builder = Qdrant::from_url(url);
+        // `qdrant-client`'s default `check_compatibility` runs `health_check` inside `build()` before
+        // we can `wait_connected`, printing to stdout when Qdrant is still starting; we defer checks.
+        let mut builder = Qdrant::from_url(url).skip_compatibility_check();
         builder.set_pool_size(QDRANT_GRPC_CHANNEL_POOL_SIZE);
         let client = builder.build()?;
         Ok(QdrantDb {
