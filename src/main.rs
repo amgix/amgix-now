@@ -758,6 +758,8 @@ async fn main() {
         }
     };
 
+    db.wait_connected().await;
+
     if let Err(e) = db.configure().await {
         tracing::error!("Qdrant configure: {e}");
         std::process::exit(1);

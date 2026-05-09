@@ -25,6 +25,9 @@ pub const DEFAULT_WMTR_TRIGRAM_WEIGHT: f64 = 1.0;
 pub const DEFAULT_LANGUAGE_CONFIDENCE: f64 = 0.9;
 pub const SEARCH_PREFETCH_MULTIPLIER: f64 = 1.5;
 
+/// Max sleep between database connection retries (seconds). Matches `MAX_DATABASE_WAIT_SECONDS` in Python.
+pub const MAX_DATABASE_WAIT_SECONDS: u64 = 30;
+
 // ---------------------------------------------------------------------------
 // Validation limits (mirrors constants.py)
 // ---------------------------------------------------------------------------

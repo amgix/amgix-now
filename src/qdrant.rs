@@ -21,8 +21,9 @@ use qdrant_client::Qdrant;
 
 use crate::common::{
     string_to_uuid, sys_collection_name, DenseDistance,
-    SEARCH_PREFETCH_MULTIPLIER,
+    MAX_DATABASE_WAIT_SECONDS, SEARCH_PREFETCH_MULTIPLIER,
 };
+use tokio::time::{sleep, Duration};
 use crate::functions::{
     doc_to_payload, linear_weighted_score_fuse, qdrant_val_to_json, rrf_fuse, scored_point_id,
     search_result_from_point, split_first_underscore,
@@ -137,6 +138,23 @@ impl QdrantDb {
 
     pub async fn is_connected(&self) -> bool {
         self.client.health_check().await.is_ok()
+    }
+
+    /// Mirrors Python `DatabaseBase.wait_connected()` (`base.py`): retry until reachable,
+    /// sleep starting at 2s, +2 each attempt, capped at [`MAX_DATABASE_WAIT_SECONDS`].
+    pub async fn wait_connected(&self) {
+        let mut wait_secs: u64 = 2;
+        loop {
+            if self.is_connected().await {
+                return;
+            }
+            tracing::warn!(
+                "Database is not available, will retry in {} seconds",
+                wait_secs
+            );
+            sleep(Duration::from_secs(wait_secs)).await;
+            wait_secs = (wait_secs + 2).min(MAX_DATABASE_WAIT_SECONDS);
+        }
     }
 
     pub async fn list_collections(&self) -> Result<Vec<String>, DbError> {

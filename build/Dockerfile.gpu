@@ -83,11 +83,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 COPY --from=builder /app/target/release/amgix-now /app/amgix-now
 
-COPY build/prefix-log-exec.sh build/wait-for-deps.sh build/entrypoint.sh /app/
+COPY build/prefix-log-exec.sh build/entrypoint.sh /app/
 COPY build/supervisord-now.conf /etc/supervisor/conf.d/amgix-now.conf
 COPY build/config.yaml /app/config.yaml
 
-RUN chmod +x /app/amgix-now /app/prefix-log-exec.sh /app/wait-for-deps.sh /app/entrypoint.sh \
+RUN chmod +x /app/amgix-now /app/prefix-log-exec.sh /app/entrypoint.sh \
     && mkdir -p /data/qdrant \
     && chmod 755 /data /data/qdrant
 
