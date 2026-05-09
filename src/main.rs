@@ -9,8 +9,6 @@ mod vectors;
 
 use std::sync::Arc;
 
-use rayon::ThreadPool;
-
 use axum::{
     body::{to_bytes, Body},
     extract::{
@@ -31,10 +29,9 @@ use common::{
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
-    UpsertIngress, CollectionConfigCache, NamedLocks, SearchError, StatsUpdateBatcher,
-    UpsertSyncError,
+    CollectionConfigCache, NamedLocks, SearchError, SearchIngress, StatsUpdateBatcher,
+    UpsertIngress, UpsertSyncError,
 };
-use encoder::search as encoder_search;
 use models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CollectionExistsResponse,
     CollectionStatsResponse, Document, DocumentStatus, DocumentStatusResponse, OkResponse,
@@ -60,8 +57,8 @@ struct AppState {
     collection_cache: CollectionConfigCache,
     stats_batcher: StatsUpdateBatcher,
     upsert_ingress: UpsertIngress,
+    search_ingress: SearchIngress,
     doc_locks: NamedLocks,
-    search_pool: Arc<ThreadPool>,
 }
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -622,11 +619,21 @@ async fn search(
     validate_search_query(&query).map_err(validation_error)?;
     normalize_search_query_python(&mut query);
     let real_collection_name = get_real_collection_name(&collection_name);
-    match encoder_search(&app.db, &app.collection_cache, &app.search_pool, &real_collection_name, query).await {
+    match app
+        .search_ingress
+        .search(real_collection_name.to_string(), query)
+        .await
+    {
         Ok(results) => Ok(Json(results)),
         Err(SearchError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(SearchError::InvalidFilter(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
         Err(SearchError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
+        Err(SearchError::IngressQueueFull(m)) => {
+            Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
+        }
+        Err(SearchError::IngressWorkerExited(m)) => {
+            Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
+        }
         Err(SearchError::Db(e)) => {
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
@@ -815,6 +822,8 @@ async fn main() {
         doc_locks.clone(),
         Arc::clone(&index_pool),
     );
+    let (search_ingress, search_shutdown) =
+        SearchIngress::new(Arc::clone(&db), collection_cache.clone(), Arc::clone(&search_pool));
 
     let state = AppState {
         db,
@@ -825,8 +834,8 @@ async fn main() {
         collection_cache,
         stats_batcher,
         upsert_ingress,
+        search_ingress,
         doc_locks,
-        search_pool,
     };
 
     let app = Router::new()
@@ -907,6 +916,8 @@ async fn main() {
         .await;
 
     upsert_shutdown.shutdown_and_wait().await;
+
+    search_shutdown.shutdown_and_wait().await;
 
     stats_shutdown.shutdown_and_wait().await;
 

@@ -1,0 +1,75 @@
+name: amgix
+
+networks:
+  amgix-net:
+    driver: bridge
+
+services:
+
+  # api-proxy:
+  #   image: nginx:alpine
+  #   container_name: amgix-api-proxy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8234:80"
+  #   volumes:
+  #     - ./nginx-api-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+  #   depends_on:
+  #     - api
+  #   networks:
+  #     - amgix-net
+
+  qdrant:
+    container_name: amgix-qdrant
+    image: qdrant/qdrant:v1.17.1
+    restart: unless-stopped
+
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+    expose:
+      - "6333"
+      - "6334"
+
+    # map a volume to presist storage
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    
+    networks:
+      - amgix-net
+
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+
+  amgix-now:
+    container_name: amgix-now
+    image: amgix-now:test-gpu
+    # pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "8235:8235"
+    expose:
+      - "8235"
+    depends_on:
+      - qdrant
+    networks:
+      - amgix-net
+    environment:
+      - AMGIX_DATABASE_URL=qdrant://qdrant:6334
+
+    volumes:
+      - ./data/amgix/cache:/data/amgix/cache
+
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+

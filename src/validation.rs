@@ -687,10 +687,10 @@ fn validate_language_config(v: &VectorConfig) -> VResult {
 /// Mirrors Pydantic `VectorSearchWeight` / `CustomVector.vector_name`: stored names are trimmed
 /// **after** validation (see validators returning `strip()`).
 pub fn normalize_search_query_python(q: &mut SearchQuery) {
-    for w in &mut q.vector_weights {
+    for w in &mut q.settings.vector_weights {
         w.vector_name = w.vector_name.trim().to_string();
     }
-    if let Some(ref mut cv) = q.custom_vectors {
+    if let Some(ref mut cv) = q.settings.custom_vectors {
         for c in cv.iter_mut() {
             c.vector_name = c.vector_name.trim().to_string();
         }
@@ -708,10 +708,10 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
         )));
     }
     // limit ge=1, le=MAX_SEARCH_LIMIT
-    if q.limit < 1 {
+    if q.settings.limit < 1 {
         return Err(err("ensure this value is greater than or equal to 1"));
     }
-    if q.limit > MAX_SEARCH_LIMIT {
+    if q.settings.limit > MAX_SEARCH_LIMIT {
         return Err(err(format!(
             "ensure this value is less than or equal to {MAX_SEARCH_LIMIT}"
         )));
@@ -720,7 +720,7 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
     // (always a number in Rust's type system; nothing to check)
 
     // @field_validator('document_tags') — validate_document_tag_lengths
-    if let Some(tags) = &q.document_tags {
+    if let Some(tags) = &q.settings.document_tags {
         if tags.len() > MAX_DOCUMENT_TAGS_COUNT {
             return Err(err(format!(
                 "ensure this value has at most {MAX_DOCUMENT_TAGS_COUNT} items"
@@ -744,16 +744,16 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
         }
     }
     // vector_weights: each vector_name validated
-    for w in &q.vector_weights {
+    for w in &q.settings.vector_weights {
         validate_search_vector_name(&w.vector_name)?;
     }
-    if let Some(ref cv) = q.custom_vectors {
+    if let Some(ref cv) = q.settings.custom_vectors {
         for c in cv {
             validate_custom_query_vector_name_stripped(&c.vector_name)?;
             validate_custom_vector_data_value(&c.vector)?;
         }
     }
-    validate_fusion_mode(&q.fusion_mode)?;
+    validate_fusion_mode(&q.settings.fusion_mode)?;
     Ok(())
 }
 

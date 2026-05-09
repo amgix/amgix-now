@@ -8,6 +8,45 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+/// Stable [`Hash`] for [`serde_json::Value`] (object keys sorted so order-independent).
+pub(crate) fn hash_json_value<H: Hasher>(v: &Value, state: &mut H) {
+    match v {
+        Value::Null => {
+            0u8.hash(state);
+        }
+        Value::Bool(b) => {
+            1u8.hash(state);
+            b.hash(state);
+        }
+        Value::Number(n) => {
+            2u8.hash(state);
+            n.to_string().hash(state);
+        }
+        Value::String(s) => {
+            3u8.hash(state);
+            s.hash(state);
+        }
+        Value::Array(arr) => {
+            4u8.hash(state);
+            arr.len().hash(state);
+            for x in arr {
+                hash_json_value(x, state);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(state);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            keys.len().hash(state);
+            for k in keys {
+                k.hash(state);
+                hash_json_value(&map[k], state);
+            }
+        }
+    }
+}
 
 use crate::common::{
     DenseDistance, DocumentField, VectorType, DEFAULT_LANGUAGE_CONFIDENCE, DEFAULT_TOP_K,
@@ -505,46 +544,20 @@ impl From<DocumentWithVectors> for Document {
 }
 
 // ---------------------------------------------------------------------------
-// SearchQueryWithVectors — SearchQuery + pre-computed query vectors.
-// Mirrors vector.py SearchQueryWithVectors exactly.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchQueryWithVectors {
-    // All SearchQuery fields
-    pub query: String,
-    #[serde(default)]
-    pub vector_weights: Vec<VectorSearchWeight>,
-    #[serde(default)]
-    pub custom_vectors: Option<Vec<CustomVector>>,
-    #[serde(default = "default_search_limit")]
-    pub limit: u32,
-    #[serde(default)]
-    pub score_threshold: Option<f64>,
-    #[serde(default)]
-    pub document_tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub document_tags_match_all: bool,
-    #[serde(default)]
-    pub metadata_filter: Option<MetadataFilter>,
-    #[serde(default)]
-    pub raw_scores: bool,
-    #[serde(default = "default_wmtr_trigram_weight")]
-    pub wmtr_trigram_weight: f64,
-    #[serde(default = "default_fusion_mode")]
-    pub fusion_mode: String,
-    // Pre-computed query vectors
-    pub vectors: Vec<VectorData>,
-}
-
-// ---------------------------------------------------------------------------
 // Search — API-facing (mirrors vector.py / document.py)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomVector {
     pub vector_name: String,
     pub vector: Value,
+}
+
+impl Hash for CustomVector {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vector_name.hash(state);
+        hash_json_value(&self.vector, state);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -553,6 +566,24 @@ pub struct VectorSearchWeight {
     #[serde(default = "default_weight")]
     pub weight: f64,
     pub field: DocumentField,
+}
+
+impl PartialEq for VectorSearchWeight {
+    fn eq(&self, other: &Self) -> bool {
+        self.vector_name == other.vector_name
+            && self.field == other.field
+            && self.weight.to_bits() == other.weight.to_bits()
+    }
+}
+
+impl Eq for VectorSearchWeight {}
+
+impl Hash for VectorSearchWeight {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vector_name.hash(state);
+        self.weight.to_bits().hash(state);
+        self.field.hash(state);
+    }
 }
 
 fn default_weight() -> f64 {
@@ -575,6 +606,32 @@ pub struct MetadataFilter {
     pub value: Option<Value>,
 }
 
+impl PartialEq for MetadataFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.and_ == other.and_
+            && self.or_ == other.or_
+            && self.not_ == other.not_
+            && self.key == other.key
+            && self.op == other.op
+            && self.value == other.value
+    }
+}
+
+impl Eq for MetadataFilter {}
+
+impl Hash for MetadataFilter {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.and_.hash(state);
+        self.or_.hash(state);
+        self.not_.hash(state);
+        self.key.hash(state);
+        self.op.hash(state);
+        if let Some(ref v) = self.value {
+            hash_json_value(v, state);
+        }
+    }
+}
+
 fn default_search_limit() -> u32 {
     DEFAULT_SEARCH_LIMIT
 }
@@ -587,9 +644,29 @@ fn default_fusion_mode() -> String {
     "rrf".to_string()
 }
 
+fn opt_f64_eq(a: &Option<f64>, b: &Option<f64>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+        _ => false,
+    }
+}
+
+fn hash_opt_f64<H: Hasher>(x: &Option<f64>, state: &mut H) {
+    match x {
+        None => {
+            0u8.hash(state);
+        }
+        Some(f) => {
+            1u8.hash(state);
+            f.to_bits().hash(state);
+        }
+    }
+}
+
+/// All [`SearchQuery`] fields except `query`, used for ingress batching keys (`Hash`/`Eq`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchQuery {
-    pub query: String,
+pub struct SearchQuerySettings {
     #[serde(default)]
     pub vector_weights: Vec<VectorSearchWeight>,
     #[serde(default)]
@@ -610,6 +687,58 @@ pub struct SearchQuery {
     pub wmtr_trigram_weight: f64,
     #[serde(default = "default_fusion_mode")]
     pub fusion_mode: String,
+}
+
+impl PartialEq for SearchQuerySettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.vector_weights == other.vector_weights
+            && self.custom_vectors == other.custom_vectors
+            && self.limit == other.limit
+            && opt_f64_eq(&self.score_threshold, &other.score_threshold)
+            && self.document_tags == other.document_tags
+            && self.document_tags_match_all == other.document_tags_match_all
+            && self.metadata_filter == other.metadata_filter
+            && self.raw_scores == other.raw_scores
+            && self.wmtr_trigram_weight.to_bits() == other.wmtr_trigram_weight.to_bits()
+            && self.fusion_mode == other.fusion_mode
+    }
+}
+
+impl Eq for SearchQuerySettings {}
+
+impl Hash for SearchQuerySettings {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vector_weights.hash(state);
+        self.custom_vectors.hash(state);
+        self.limit.hash(state);
+        hash_opt_f64(&self.score_threshold, state);
+        self.document_tags.hash(state);
+        self.document_tags_match_all.hash(state);
+        self.metadata_filter.hash(state);
+        self.raw_scores.hash(state);
+        self.wmtr_trigram_weight.to_bits().hash(state);
+        self.fusion_mode.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub query: String,
+    #[serde(flatten)]
+    pub settings: SearchQuerySettings,
+}
+
+// ---------------------------------------------------------------------------
+// SearchQueryWithVectors — SearchQuery + pre-computed query vectors.
+// Mirrors vector.py SearchQueryWithVectors exactly (flat JSON via [`serde(flatten)`]).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchQueryWithVectors {
+    pub query: String,
+    #[serde(flatten)]
+    pub settings: SearchQuerySettings,
+    pub vectors: Vec<VectorData>,
 }
 
 // ---------------------------------------------------------------------------

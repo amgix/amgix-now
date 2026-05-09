@@ -2,6 +2,8 @@
 //! `validate_models`, `document_upsert_sync`). Ingress uses [`UpsertIngress`]: REST bulk hits the
 //! bulk channel (immediate internal); singles use a separate channel drained into micro-batches
 //! with bounded concurrency ([`SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX`] pipelines in flight).
+//! Search uses [`SearchIngress`]: a separate bounded queue and the same micro-batch / concurrent
+//! pipeline pattern ([`SEARCH_INGRESS_*`] constants).
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -16,11 +18,39 @@ use crate::common::{VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGH
 use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
     CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
-    ModelValidationResult, SearchQuery, SearchQueryWithVectors, VectorConfigInternal,
-    VectorSearchWeight,
+    ModelValidationResult, SearchQuery, SearchQuerySettings, SearchResult, VectorConfigInternal, VectorSearchWeight,
 };
 use crate::qdrant::{CollectionStats, DbError, QdrantDb};
 use crate::vectors::vectorizer::Vectorizer;
+
+// ---------------------------------------------------------------------------
+// Constants — cache, stats batching, upsert ingress, search ingress
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_SECS: u64 = 60;
+const CACHE_MAX_ENTRIES: usize = 1000;
+
+const STATS_BATCH_MAX_JOBS: usize = 10;
+const STATS_BATCH_WAIT: Duration = Duration::from_millis(200);
+const STATS_BATCH_CHANNEL: usize = 1024;
+
+/// Max REST **bulk** jobs buffered (`try_send` → HTTP 429 when full).
+pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
+/// Max single-doc micro-batches pulled off the singles ingress channel **in flight at once**.
+/// One task still `recv`s and builds batches; this bounds overlapping `document_upsert_bulk_internal`
+/// work (per parallel micro-batch pipeline).
+pub const SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX: usize = 4;
+/// Max **single-document** ingress jobs buffered.
+pub const SINGLE_UPSERT_QUEUE_CAPACITY: usize = 10240;
+/// Max single-doc messages pulled into one micro-batch (including first `recv`).
+pub const SINGLE_UPSERT_MICROBATCH_DRAIN_MAX: usize = 32;
+
+/// Max search requests buffered (`try_send` → HTTP 429 when full).
+pub const SEARCH_INGRESS_QUEUE_CAPACITY: usize = 10240;
+/// Max search micro-batch pipelines in flight at once.
+pub const SEARCH_INGRESS_CONCURRENT_MICROBATCH_MAX: usize = 8; // WMTR 32
+/// Max search jobs coalesced into one micro-batch (including the first `recv`).
+pub const SEARCH_INGRESS_MICROBATCH_DRAIN_MAX: usize = 64; // WMTR 8
 
 // ---------------------------------------------------------------------------
 // TokenLengthUpdate — per-field bundle mirroring encoder.py's updates dict shape
@@ -69,12 +99,9 @@ impl NamedLocks {
 // CollectionConfigCache — TTL cache for collection configs.
 //
 // Mirrors EncoderBase._collection_info_cache: AMGIXCache(ttl=60, maxsize=1000).
-// Keyed by collection_name. Entries expire after TTL_SECS seconds.
-// On overflow (> MAX_ENTRIES), the oldest entry is evicted.
+// Keyed by collection_name. Entries expire after [`CACHE_TTL_SECS`] seconds.
+// On overflow (> [`CACHE_MAX_ENTRIES`]), the oldest entry is evicted.
 // ---------------------------------------------------------------------------
-
-const CACHE_TTL_SECS: u64 = 60;
-const CACHE_MAX_ENTRIES: usize = 1000;
 
 struct CacheEntry {
     config: CollectionConfigInternal,
@@ -180,10 +207,6 @@ async fn persist_stats_maps_for_collection(
     }
     db.set_collection_stats(collection_name, &stats).await
 }
-
-const STATS_BATCH_MAX_JOBS: usize = 10;
-const STATS_BATCH_WAIT: Duration = Duration::from_millis(200);
-const STATS_BATCH_CHANNEL: usize = 1024;
 
 struct StatsJob {
     collection_name: String,
@@ -333,17 +356,6 @@ impl From<DbError> for UpsertSyncError {
         UpsertSyncError::Db(e)
     }
 }
-
-/// Max REST **bulk** jobs buffered (`try_send` → HTTP 429 when full).
-pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
-/// Max single-doc micro-batches pulled off the singles ingress channel **in flight at once**.
-/// One task still `recv`s and builds batches; this bounds overlapping `document_upsert_bulk_internal`
-/// work (per parallel micro-batch pipeline).
-pub const SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX: usize = 4;
-/// Max **single-document** ingress jobs buffered.
-pub const SINGLE_UPSERT_QUEUE_CAPACITY: usize = 1024;
-/// Max single-doc messages pulled into one micro-batch (including first `recv`).
-pub const SINGLE_UPSERT_MICROBATCH_DRAIN_MAX: usize = 64;
 
 struct BulkIngressJob {
     collection_name: String,
@@ -501,6 +513,248 @@ impl UpsertIngress {
             },
             UpsertIngressShutdown { bulk, singles },
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SearchIngress — bounded queue, micro-batch drain, concurrent pipelines (like singles upsert)
+// ---------------------------------------------------------------------------
+
+struct SearchIngressJob {
+    collection_name: String,
+    query: SearchQuery,
+    reply: oneshot::Sender<Result<Vec<SearchResult>, SearchError>>,
+}
+
+#[derive(Clone)]
+pub struct SearchIngress {
+    tx: mpsc::Sender<SearchIngressJob>,
+}
+
+pub struct SearchIngressShutdown {
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl SearchIngressShutdown {
+    pub async fn shutdown_and_wait(self) {
+        if let Err(e) = self.worker.await {
+            tracing::warn!("search ingress worker join: {e}");
+        }
+    }
+}
+
+impl SearchIngress {
+    pub fn new(
+        db: Arc<QdrantDb>,
+        cache: CollectionConfigCache,
+        search_pool: Arc<rayon::ThreadPool>,
+    ) -> (Self, SearchIngressShutdown) {
+        let (tx, mut rx) = mpsc::channel::<SearchIngressJob>(SEARCH_INGRESS_QUEUE_CAPACITY);
+        let worker = tokio::spawn(async move {
+            let mut inflight = JoinSet::new();
+            loop {
+                while inflight.len() >= SEARCH_INGRESS_CONCURRENT_MICROBATCH_MAX {
+                    if let Some(res) = inflight.join_next().await {
+                        if let Err(e) = res {
+                            tracing::warn!("search micro-batch task panicked: {e}");
+                        }
+                    }
+                }
+                let first = match rx.recv().await {
+                    None => break,
+                    Some(j) => j,
+                };
+                let mut batch = vec![first];
+                while batch.len() < SEARCH_INGRESS_MICROBATCH_DRAIN_MAX {
+                    match rx.try_recv() {
+                        Ok(j) => batch.push(j),
+                        Err(_) => break,
+                    }
+                }
+                let db = Arc::clone(&db);
+                let cache = cache.clone();
+                let search_pool = Arc::clone(&search_pool);
+                inflight.spawn(async move {
+                    process_search_microbatch(batch, db, cache, search_pool).await;
+                });
+            }
+            while let Some(res) = inflight.join_next().await {
+                if let Err(e) = res {
+                    tracing::warn!("search micro-batch task panicked: {e}");
+                }
+            }
+        });
+
+        (Self { tx }, SearchIngressShutdown { worker })
+    }
+
+    pub async fn search(
+        &self,
+        collection_name: String,
+        query: SearchQuery,
+    ) -> Result<Vec<SearchResult>, SearchError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .try_send(SearchIngressJob {
+                collection_name,
+                query,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                SearchError::IngressQueueFull(format!(
+                    "Search ingress queue full (capacity {SEARCH_INGRESS_QUEUE_CAPACITY}); retry later."
+                ))
+            })?;
+        reply_rx.await.map_err(|_| {
+            SearchError::IngressWorkerExited("Search ingress worker stopped.".into())
+        })?
+    }
+}
+
+async fn process_search_microbatch(
+    jobs: Vec<SearchIngressJob>,
+    db: Arc<QdrantDb>,
+    cache: CollectionConfigCache,
+    search_pool: Arc<rayon::ThreadPool>,
+) {
+    let mut by_key: HashMap<(String, SearchQuerySettings), Vec<SearchIngressJob>> = HashMap::new();
+    for j in jobs {
+        let key = (j.collection_name.clone(), j.query.settings.clone());
+        by_key.entry(key).or_default().push(j);
+    }
+
+    for ((collection_name, _settings_key), bucket_jobs) in by_key {
+        run_search_bucket(
+            &collection_name,
+            bucket_jobs,
+            &db,
+            &cache,
+            &search_pool,
+        )
+        .await;
+    }
+}
+
+async fn run_search_bucket(
+    collection_name: &str,
+    bucket_jobs: Vec<SearchIngressJob>,
+    db: &Arc<QdrantDb>,
+    cache: &CollectionConfigCache,
+    search_pool: &Arc<rayon::ThreadPool>,
+) {
+    let (mut collection_config, from_cache) =
+        match get_collection_info_cached(db, cache, collection_name).await {
+            Ok(x) => x,
+            Err(e) => {
+                let err = match e {
+                    DbError::NotFound(_) => SearchError::NotFound(
+                        "Collection configuration not found".to_string(),
+                    ),
+                    e => SearchError::Db(e),
+                };
+                for j in bucket_jobs {
+                    let _ = j.reply.send(Err(err.clone()));
+                }
+                return;
+            }
+        };
+
+    let metadata_filter = bucket_jobs
+        .first()
+        .and_then(|j| j.query.settings.metadata_filter.as_ref());
+    if let Some(filter) = metadata_filter {
+        if let Err(e) = validate_metadata_filter(&collection_config, filter) {
+            let msg = e.0.clone();
+            for j in bucket_jobs {
+                let _ = j.reply.send(Err(SearchError::InvalidFilter(msg.clone())));
+            }
+            return;
+        }
+    }
+
+    let query_texts: Vec<String> =
+        bucket_jobs.iter().map(|j| j.query.query.clone()).collect();
+    let settings0 = bucket_jobs[0].query.settings.clone();
+
+    let spawn_vectorize = |cfg: CollectionConfigInternal,
+                           qt: Vec<String>,
+                           sett: SearchQuerySettings,
+                           pool: Arc<rayon::ThreadPool>| {
+        let vecs = cfg.vectors.clone();
+        let (tx, rx) = oneshot::channel();
+        pool.spawn(move || {
+            let mut settings = sett;
+            let r = Vectorizer::vectorize_search_queries(&qt, &mut settings, &vecs, false);
+            let _ = tx.send(r);
+        });
+        rx
+    };
+
+    let pool = Arc::clone(search_pool);
+    let rx = spawn_vectorize(
+        collection_config.clone(),
+        query_texts.clone(),
+        settings0.clone(),
+        Arc::clone(&pool),
+    );
+    let mut first = match rx.await {
+        Ok(r) => r,
+        Err(e) => {
+            let err = SearchError::Vectorization(format!("Search pool channel dropped: {e}"));
+            for j in bucket_jobs {
+                let _ = j.reply.send(Err(err.clone()));
+            }
+            return;
+        }
+    };
+
+    if first.is_err() && from_cache {
+        cache.invalidate(collection_name).await;
+        if let Ok((fresh, _)) = get_collection_info_cached(db, cache, collection_name).await {
+            collection_config = fresh;
+            let rx = spawn_vectorize(
+                collection_config.clone(),
+                query_texts,
+                settings0,
+                pool,
+            );
+            first = match rx.await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = SearchError::Vectorization(format!("Search pool channel dropped: {e}"));
+                    for j in bucket_jobs {
+                        let _ = j.reply.send(Err(err.clone()));
+                    }
+                    return;
+                }
+            };
+        }
+    }
+
+    let vectorized = match first {
+        Ok(v) => v,
+        Err(msg) => {
+            for j in bucket_jobs {
+                let _ = j.reply.send(Err(SearchError::Vectorization(msg.clone())));
+            }
+            return;
+        }
+    };
+
+    if vectorized.len() != bucket_jobs.len() {
+        let msg = "internal: vectorized batch length mismatch".to_string();
+        for j in bucket_jobs {
+            let _ = j.reply.send(Err(SearchError::Vectorization(msg.clone())));
+        }
+        return;
+    }
+
+    for (j, qv) in bucket_jobs.into_iter().zip(vectorized.into_iter()) {
+        let res = db
+            .search(collection_name, &qv, &collection_config)
+            .await
+            .map_err(SearchError::Db);
+        let _ = j.reply.send(res);
     }
 }
 
@@ -934,16 +1188,18 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
 
     let dummy_query = SearchQuery {
         query: "x".to_string(),
-        vector_weights,
-        custom_vectors: None,
-        limit: DEFAULT_SEARCH_LIMIT,
-        score_threshold: None,
-        document_tags: None,
-        document_tags_match_all: false,
-        metadata_filter: None,
-        raw_scores: false,
-        wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
-        fusion_mode: "rrf".to_string(),
+        settings: SearchQuerySettings {
+            vector_weights,
+            custom_vectors: None,
+            limit: DEFAULT_SEARCH_LIMIT,
+            score_threshold: None,
+            document_tags: None,
+            document_tags_match_all: false,
+            metadata_filter: None,
+            raw_scores: false,
+            wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
+            fusion_mode: "rrf".to_string(),
+        },
     };
 
     match Vectorizer::vectorize_search_query(dummy_query, vector_configs, true) {
@@ -1182,7 +1438,7 @@ pub fn validate_metadata_filter(
 }
 
 // ---------------------------------------------------------------------------
-// search — mirrors encoder.py RpcService.search (cache + vectorize + db.search)
+// SearchError — returned by [`SearchIngress::search`]
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1191,6 +1447,21 @@ pub enum SearchError {
     InvalidFilter(String),
     Vectorization(String),
     Db(DbError),
+    IngressQueueFull(String),
+    IngressWorkerExited(String),
+}
+
+impl Clone for SearchError {
+    fn clone(&self) -> Self {
+        match self {
+            SearchError::NotFound(m) => SearchError::NotFound(m.clone()),
+            SearchError::InvalidFilter(m) => SearchError::InvalidFilter(m.clone()),
+            SearchError::Vectorization(m) => SearchError::Vectorization(m.clone()),
+            SearchError::Db(e) => SearchError::Db(DbError::Config(e.to_string())),
+            SearchError::IngressQueueFull(m) => SearchError::IngressQueueFull(m.clone()),
+            SearchError::IngressWorkerExited(m) => SearchError::IngressWorkerExited(m.clone()),
+        }
+    }
 }
 
 impl std::fmt::Display for SearchError {
@@ -1200,6 +1471,8 @@ impl std::fmt::Display for SearchError {
             SearchError::InvalidFilter(m) => write!(f, "{m}"),
             SearchError::Vectorization(m) => write!(f, "{m}"),
             SearchError::Db(e) => write!(f, "{e}"),
+            SearchError::IngressQueueFull(m) => write!(f, "{m}"),
+            SearchError::IngressWorkerExited(m) => write!(f, "{m}"),
         }
     }
 }
@@ -1208,73 +1481,4 @@ impl From<DbError> for SearchError {
     fn from(e: DbError) -> Self {
         SearchError::Db(e)
     }
-}
-
-async fn vectorize_search_query_blocking(
-    collection_config: CollectionConfigInternal,
-    query: SearchQuery,
-    search_pool: Arc<rayon::ThreadPool>,
-) -> Result<SearchQueryWithVectors, SearchError> {
-    if let Some(ref filter) = query.metadata_filter {
-        validate_metadata_filter(&collection_config, filter)
-            .map_err(|e| SearchError::InvalidFilter(e.0))?;
-    }
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    
-    search_pool.spawn(move || {
-        let result = Vectorizer::vectorize_search_query(query, &collection_config.vectors, false)
-            .map_err(SearchError::Vectorization);
-        let _ = tx.send(result);
-    });
-
-    rx.await
-        .map_err(|e| SearchError::Vectorization(format!("Rayon channel dropped: {e}")))?
-}
-
-pub async fn search(
-    db: &QdrantDb,
-    cache: &CollectionConfigCache,
-    search_pool: &Arc<rayon::ThreadPool>,
-    collection_name: &str,
-    query: crate::models::SearchQuery,
-) -> Result<Vec<crate::models::SearchResult>, SearchError> {
-    let (collection_config, from_cache) =
-        get_collection_info_cached(db, cache, collection_name).await.map_err(|e| {
-            if matches!(e, DbError::NotFound(_)) {
-                SearchError::NotFound("Collection configuration not found".to_string())
-            } else {
-                SearchError::Db(e)
-            }
-        })?;
-
-    let query_with_vectors = match vectorize_search_query_blocking(
-        collection_config.clone(),
-        query.clone(),
-        Arc::clone(search_pool),
-    )
-    .await
-    {
-        Ok(q) => q,
-        Err(e) if from_cache => {
-            // Retry once with fresh config — mirrors Python cache-invalidate-retry.
-            cache.invalidate(collection_name).await;
-            let (fresh_config, _) =
-                get_collection_info_cached(db, cache, collection_name).await.map_err(|e| {
-                    if matches!(e, DbError::NotFound(_)) {
-                        SearchError::NotFound("Collection configuration not found".to_string())
-                    } else {
-                        SearchError::Db(e)
-                    }
-                })?;
-            vectorize_search_query_blocking(fresh_config, query, Arc::clone(search_pool))
-                .await
-                .map_err(|_| e)?
-        }
-        Err(e) => return Err(e),
-    };
-
-    db.search(collection_name, &query_with_vectors, &collection_config)
-        .await
-        .map_err(SearchError::Db)
 }

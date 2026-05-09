@@ -32,7 +32,7 @@ use crate::models::{
     SearchQueryWithVectors, SearchResult, VectorScore,
 };
 
-const QDRANT_GRPC_CHANNEL_POOL_SIZE: usize = 10;
+const QDRANT_GRPC_CHANNEL_POOL_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -446,7 +446,7 @@ impl QdrantDb {
 
         self.client
             .upsert_points(
-                UpsertPointsBuilder::new(collection_name, points).wait(true),
+                UpsertPointsBuilder::new(collection_name, points).wait(false),
             )
             .await?;
 
@@ -556,7 +556,7 @@ impl QdrantDb {
             .delete_points(
                 DeletePointsBuilder::new(collection_name)
                     .points(vec![point_id])
-                    .wait(true),
+                    .wait(false),
             )
             .await?;
 
@@ -582,12 +582,13 @@ impl QdrantDb {
 
         // weight_lookup: (vector_name, field) → weight — mirrors Python lines 585-586.
         let weight_lookup: HashMap<(String, String), f64> = query
+            .settings
             .vector_weights
             .iter()
             .map(|w| ((w.vector_name.clone(), w.field.to_string()), w.weight))
             .collect();
 
-        let prefetch_limit = (query.limit as f64 * SEARCH_PREFETCH_MULTIPLIER) as u64;
+        let prefetch_limit = (query.settings.limit as f64 * SEARCH_PREFETCH_MULTIPLIER) as u64;
 
         let mut batch_requests: Vec<qdrant_client::qdrant::QueryPoints> = Vec::new();
         let mut batch_vector_names: Vec<String> = Vec::new();
@@ -690,7 +691,7 @@ impl QdrantDb {
                 scored_arm.push((point_id.clone(), point.score as f64));
                 point_lookup.entry(point_id.clone()).or_insert_with(|| point.clone());
 
-                if query.raw_scores {
+                if query.settings.raw_scores {
                     let (field_part, vector_part) = split_first_underscore(field_vector_name);
                     raw_scores_map
                         .entry(point_id.clone())
@@ -709,22 +710,28 @@ impl QdrantDb {
         }
 
         // Fuse — mirrors Python lines 691-705.
-        let fused = if query.fusion_mode == "linear" {
+        let fused = if query.settings.fusion_mode == "linear" {
             linear_weighted_score_fuse(
                 &scored_lists,
                 &arm_weights,
-                query.limit as usize,
-                query.score_threshold,
+                query.settings.limit as usize,
+                query.settings.score_threshold,
             )
         } else {
-            rrf_fuse(&id_lists, &arm_weights, query.limit as usize, query.score_threshold, 2)
+            rrf_fuse(
+                &id_lists,
+                &arm_weights,
+                query.settings.limit as usize,
+                query.settings.score_threshold,
+                2,
+            )
         };
 
         // Convert fused results to SearchResult — mirrors Python lines 711-719.
         let mut results: Vec<SearchResult> = Vec::with_capacity(fused.len());
         for (item_id, fused_score) in fused {
             if let Some(point) = point_lookup.get(&item_id) {
-                let vector_scores = if query.raw_scores {
+                let vector_scores = if query.settings.raw_scores {
                     raw_scores_map.get(&item_id).cloned().unwrap_or_default()
                 } else {
                     vec![]
@@ -779,9 +786,9 @@ fn build_search_filter(
 ) -> Option<Filter> {
     let mut search_conditions: Vec<Condition> = Vec::new();
 
-    if let Some(tags) = &query.document_tags {
+    if let Some(tags) = &query.settings.document_tags {
         if !tags.is_empty() {
-            if query.document_tags_match_all {
+            if query.settings.document_tags_match_all {
                 for tag in tags {
                     search_conditions.push(
                         FieldCondition {
@@ -824,6 +831,7 @@ fn build_search_filter(
     };
 
     let metadata_filter = query
+        .settings
         .metadata_filter
         .as_ref()
         .and_then(|mf| convert_metadata_filter(mf, collection_config));

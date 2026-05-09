@@ -10,8 +10,8 @@ use crate::common::{
     DocumentField, VectorType, DEFAULT_WMTR_TRIGRAM_WEIGHT,
 };
 use crate::models::{
-    Document, DocumentWithVectors, SearchQuery, SearchQueryWithVectors, VectorConfigInternal,
-    VectorData, VectorSearchWeight,
+    Document, DocumentWithVectors, SearchQuery, SearchQuerySettings, SearchQueryWithVectors,
+    VectorConfigInternal, VectorData, VectorSearchWeight,
 };
 use crate::vectors::dense_custom::CustomDenseVector;
 use crate::vectors::dense_model::DenseModelVector;
@@ -345,15 +345,33 @@ impl Vectorizer {
         Ok(out)
     }
 
-    /// Mirrors `Vectorizer.vectorize_search_query` (sequential encoding per vector group —
-    /// same outcome as asyncio gather for deterministic CPU-heavy embedders).
+    /// Single-query wrapper around [`Self::vectorize_search_queries`].
     pub fn vectorize_search_query(
         mut query: SearchQuery,
         vector_configs: &[VectorConfigInternal],
         validation_mode: bool,
     ) -> Result<SearchQueryWithVectors, String> {
-        if query.query.trim().is_empty() {
-            return Err("Search query cannot be empty".to_string());
+        let q = query.query.clone();
+        let mut batch =
+            Self::vectorize_search_queries(std::slice::from_ref(&q), &mut query.settings, vector_configs, validation_mode)?;
+        batch.pop().ok_or_else(|| "internal: empty search batch".to_string())
+    }
+
+    /// Shared settings and multiple query strings: one embedding batch per vector group, then one
+    /// [`SearchQueryWithVectors`] per query string (same layout as repeated single calls).
+    pub fn vectorize_search_queries(
+        query_texts: &[String],
+        settings: &mut SearchQuerySettings,
+        vector_configs: &[VectorConfigInternal],
+        validation_mode: bool,
+    ) -> Result<Vec<SearchQueryWithVectors>, String> {
+        if query_texts.is_empty() {
+            return Err("Search query batch cannot be empty".to_string());
+        }
+        for t in query_texts {
+            if t.trim().is_empty() {
+                return Err("Search query cannot be empty".to_string());
+            }
         }
 
         if validation_mode {
@@ -364,15 +382,13 @@ impl Vectorizer {
                         config.name
                     ));
                 }
-                // Python also checks `sparse_custom` + `top_k is None`; Rust `VectorConfigInternal.top_k`
-                // is always present after deserialization (default), so that branch is not represented.
             }
         }
 
         let mut vectors_to_generate: HashSet<(String, DocumentField)> = HashSet::new();
 
-        if !query.vector_weights.is_empty() {
-            for weight in &query.vector_weights {
+        if !settings.vector_weights.is_empty() {
+            for weight in &settings.vector_weights {
                 if weight.weight != 0.0 {
                     vectors_to_generate
                         .insert((weight.vector_name.clone(), weight.field));
@@ -387,7 +403,7 @@ impl Vectorizer {
             if !vectors_to_generate.is_empty() {
                 let equal_weight =
                     1.0_f64 / (vectors_to_generate.len() as f64);
-                query.vector_weights = vectors_to_generate
+                settings.vector_weights = vectors_to_generate
                     .iter()
                     .map(|(name, field)| VectorSearchWeight {
                         vector_name: name.clone(),
@@ -410,7 +426,6 @@ impl Vectorizer {
 
         let groups: Vec<(String, Vec<DocumentField>)> = vector_groups.into_iter().collect();
 
-        // Validate all groups before doing any embedding work.
         for (vector_name, fields) in &groups {
             let config = config_map.get(vector_name).ok_or_else(|| {
                 format!(
@@ -428,53 +443,64 @@ impl Vectorizer {
             }
         }
 
-        let vectors: Vec<VectorData> = if groups.len() > 1 {
+        let n = query_texts.len();
+        let group_results: Vec<Vec<Vec<VectorData>>> = if groups.len() > 1 {
             groups
                 .par_iter()
                 .map(|(vector_name, fields)| {
                     let config = *config_map.get(vector_name).expect("validated above");
-                    Self::generate_vector_for_query(config, &query, fields, validation_mode)
-                        .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))
+                    Self::generate_vectors_for_query_batch(
+                        config,
+                        query_texts,
+                        fields,
+                        settings,
+                        validation_mode,
+                    )
+                    .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect()
         } else {
             let mut out = Vec::new();
             for (vector_name, fields) in &groups {
                 let config = *config_map.get(vector_name).expect("validated above");
-                let batch =
-                    Self::generate_vector_for_query(config, &query, fields, validation_mode)
-                        .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))?;
-                out.extend(batch);
+                let batch = Self::generate_vectors_for_query_batch(
+                    config,
+                    query_texts,
+                    fields,
+                    settings,
+                    validation_mode,
+                )
+                .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))?;
+                out.push(batch);
             }
             out
         };
 
-        Ok(SearchQueryWithVectors {
-            query: query.query,
-            vector_weights: query.vector_weights,
-            custom_vectors: query.custom_vectors,
-            limit: query.limit,
-            score_threshold: query.score_threshold,
-            document_tags: query.document_tags,
-            document_tags_match_all: query.document_tags_match_all,
-            metadata_filter: query.metadata_filter,
-            raw_scores: query.raw_scores,
-            wmtr_trigram_weight: query.wmtr_trigram_weight,
-            fusion_mode: query.fusion_mode,
-            vectors,
-        })
+        let settings_out = settings.clone();
+        let mut results = Vec::with_capacity(n);
+        for qi in 0..n {
+            let mut vectors = Vec::new();
+            for gr in &group_results {
+                vectors.extend(gr[qi].iter().cloned());
+            }
+            results.push(SearchQueryWithVectors {
+                query: query_texts[qi].clone(),
+                settings: settings_out.clone(),
+                vectors,
+            });
+        }
+        Ok(results)
     }
 
-    fn generate_vector_for_query(
+    fn generate_vectors_for_query_batch(
         config: &VectorConfigInternal,
-        query: &SearchQuery,
+        query_texts: &[String],
         fields: &[DocumentField],
+        settings: &SearchQuerySettings,
         validation_mode: bool,
-    ) -> Result<Vec<VectorData>, String> {
-        let mut vector_data_list = Vec::new();
+    ) -> Result<Vec<Vec<VectorData>>, String> {
+        let n = query_texts.len();
+        let mut per_query: Vec<Vec<VectorData>> = vec![Vec::new(); n];
 
         match config.vector_type {
             VectorType::DenseModel => {
@@ -482,82 +508,90 @@ impl Vectorizer {
 
                 let RoutedEmbed::Dense(dense_batch) = route_embed_dispatch(
                     &effective_config,
-                    &[query.query.clone()],
+                    query_texts,
                     None,
                     DEFAULT_WMTR_TRIGRAM_WEIGHT,
                 )?
                 else {
                     return Err("dense routing returned sparse".to_string());
                 };
-                let dense_vector = dense_batch
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| "empty dense batch for query".to_string())?;
-
-                if let Some(dim) = config.dimensions {
-                    if dense_vector.len() != dim as usize {
-                        return Err(format!(
-                            "Specified dimensions {} don't match generated dimensions {} for vector '{}'",
-                            dim,
-                            dense_vector.len(),
-                            config.name
-                        ));
-                    }
+                if dense_batch.len() != n {
+                    return Err(format!(
+                        "dense batch length {} != query count {}",
+                        dense_batch.len(),
+                        n
+                    ));
                 }
 
-                for field in fields {
-                    vector_data_list.push(VectorData {
-                        vector_name: config.name.clone(),
-                        field: *field,
-                        vector_type: config.vector_type.clone(),
-                        dense_vector: Some(dense_vector.clone()),
-                        sparse_indices: None,
-                        sparse_values: None,
-                    });
+                for (qi, dense_vector) in dense_batch.into_iter().enumerate() {
+                    if let Some(dim) = config.dimensions {
+                        if dense_vector.len() != dim as usize {
+                            return Err(format!(
+                                "Specified dimensions {} don't match generated dimensions {} for vector '{}'",
+                                dim,
+                                dense_vector.len(),
+                                config.name
+                            ));
+                        }
+                    }
+                    for field in fields {
+                        per_query[qi].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: Some(dense_vector.clone()),
+                            sparse_indices: None,
+                            sparse_values: None,
+                        });
+                    }
                 }
             }
             VectorType::DenseCustom => {
                 if validation_mode {
-                    return Ok(vector_data_list);
+                    return Ok(per_query);
                 }
-                let custom = query.custom_vectors.as_deref().ok_or_else(|| {
+                let custom = settings.custom_vectors.as_deref().ok_or_else(|| {
                     format!(
                         "Custom dense vector '{}' requires custom vectors but query has none",
                         config.name
                     )
                 })?;
                 let vec = CustomDenseVector::extract_for_query(config, custom)?;
-                for field in fields {
-                    vector_data_list.push(VectorData {
-                        vector_name: config.name.clone(),
-                        field: *field,
-                        vector_type: config.vector_type.clone(),
-                        dense_vector: Some(vec.clone()),
-                        sparse_indices: None,
-                        sparse_values: None,
-                    });
+                for qi in 0..n {
+                    for field in fields {
+                        per_query[qi].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: Some(vec.clone()),
+                            sparse_indices: None,
+                            sparse_values: None,
+                        });
+                    }
                 }
             }
             VectorType::SparseCustom => {
                 if validation_mode {
-                    return Ok(vector_data_list);
+                    return Ok(per_query);
                 }
-                let custom = query.custom_vectors.as_deref().ok_or_else(|| {
+                let custom = settings.custom_vectors.as_deref().ok_or_else(|| {
                     format!(
                         "Custom sparse vector '{}' requires custom vectors but query has none",
                         config.name
                     )
                 })?;
                 let (indices, values) = CustomSparseVector::extract_for_query(config, custom)?;
-                for field in fields {
-                    vector_data_list.push(VectorData {
-                        vector_name: config.name.clone(),
-                        field: *field,
-                        vector_type: config.vector_type.clone(),
-                        dense_vector: None,
-                        sparse_indices: Some(indices.clone()),
-                        sparse_values: Some(values.clone()),
-                    });
+                for qi in 0..n {
+                    for field in fields {
+                        per_query[qi].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: None,
+                            sparse_indices: Some(indices.clone()),
+                            sparse_values: Some(values.clone()),
+                        });
+                    }
                 }
             }
             VectorType::SparseModel
@@ -569,44 +603,49 @@ impl Vectorizer {
                 let effective_config =
                     sparse_model_config_query_embedding(config.clone());
 
+                let avgdls_5 = vec![5.0_f64; n];
                 let routed = if config.vector_type.is_custom_tokenization() {
                     route_embed_dispatch(
                         &effective_config,
-                        &[query.query.clone()],
-                        Some(&[5.0_f64]),
-                        query.wmtr_trigram_weight,
+                        query_texts,
+                        Some(avgdls_5.as_slice()),
+                        settings.wmtr_trigram_weight,
                     )
                 } else {
                     route_embed_dispatch(
                         &effective_config,
-                        &[query.query.clone()],
+                        query_texts,
                         None,
-                        query.wmtr_trigram_weight,
+                        settings.wmtr_trigram_weight,
                     )
                 }?;
 
                 let RoutedEmbed::Sparse(sparse_batch) = routed else {
                     return Err("sparse routing returned dense".to_string());
                 };
+                if sparse_batch.len() != n {
+                    return Err(format!(
+                        "sparse batch length {} != query count {}",
+                        sparse_batch.len(),
+                        n
+                    ));
+                }
 
-                let (indices, values) = sparse_batch
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| "empty sparse batch for query".to_string())?;
-
-                for field in fields {
-                    vector_data_list.push(VectorData {
-                        vector_name: config.name.clone(),
-                        field: *field,
-                        vector_type: config.vector_type.clone(),
-                        dense_vector: None,
-                        sparse_indices: Some(indices.clone()),
-                        sparse_values: Some(values.clone()),
-                    });
+                for (qi, (indices, values)) in sparse_batch.into_iter().enumerate() {
+                    for field in fields {
+                        per_query[qi].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: None,
+                            sparse_indices: Some(indices.clone()),
+                            sparse_values: Some(values.clone()),
+                        });
+                    }
                 }
             }
         }
 
-        Ok(vector_data_list)
+        Ok(per_query)
     }
 }
