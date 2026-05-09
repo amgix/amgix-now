@@ -6,7 +6,11 @@
 # Uses cargo-chef so dependency compilation is cached when only src/ changes.
 
 # -----------------------------------------------------------------------------
-FROM rust:1-bookworm AS chef
+# `rust:bookworm` tracks latest Rust stable on Debian Bookworm (not pinned to Rust 1.x).
+FROM rust:bookworm AS chef
+RUN rustup self update \
+    && rustup update stable \
+    && rustc --version
 RUN cargo install cargo-chef --locked
 
 # -----------------------------------------------------------------------------

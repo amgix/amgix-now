@@ -47,7 +47,7 @@ jobs:
           pip install -r src/api/requirements.txt
           pip install -r tests/requirements.txt
 
-      - name: Build Docker image (CPU / embedded Qdrant)
+      - name: Build Docker image (CPU)
         run: |
           docker build -f build/Dockerfile.cpu --build-arg AMGIX_VERSION=0.1.0-ci -t amgix-now:ci .
 

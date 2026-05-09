@@ -36,6 +36,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+RUN rustup self update \
+    && rustup update stable \
+    && rustc --version
+
 RUN cargo install cargo-chef --locked
 
 WORKDIR /app
