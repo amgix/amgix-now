@@ -744,6 +744,16 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// `AMGIX_NOW_SYNC_DB_WRITES`: `true` / `1` / `yes` (case-insensitive) → Qdrant `wait=true` on document upserts and deletes.
+fn amgix_now_sync_db_writes_from_env() -> bool {
+    std::env::var("AMGIX_NOW_SYNC_DB_WRITES").map_or(false, |s| {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() {
     init_tracing_from_env();
@@ -751,7 +761,9 @@ async fn main() {
     let db_url = std::env::var("AMGIX_DATABASE_URL")
         .unwrap_or_else(|_| "qdrant://localhost:6334".to_string());
 
-    let db = match QdrantDb::new(&qdrant_client_url(&db_url)) {
+    let sync_db_writes = amgix_now_sync_db_writes_from_env();
+
+    let db = match QdrantDb::new(&qdrant_client_url(&db_url), sync_db_writes) {
         Ok(d) => Arc::new(d),
         Err(e) => {
             tracing::error!("Qdrant client (AMGIX_DATABASE_URL): {e}");
@@ -781,6 +793,7 @@ async fn main() {
 
     tracing::info!("Amgix version: {amgix_version_display}");
     tracing::info!("Qdrant version: {qdrant_version}");
+    tracing::info!("Synchronous Database Writes: {sync_db_writes}");
 
     let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), NamedLocks::new());
 

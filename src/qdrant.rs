@@ -85,12 +85,16 @@ impl Default for CollectionStats {
 pub struct QdrantDb {
     pub client: Qdrant,
     pub meta_collection: String,
+    /// When true, upserts/deletes pass Qdrant `wait=true` so the API returns after data is visible.
+    sync_db_writes: bool,
 }
 
 impl QdrantDb {
     /// `url` is passed to [`Qdrant::from_url`](qdrant_client::Qdrant::from_url): gRPC URI, e.g.
     /// `http://localhost:6334` (not Qdrant REST on 6333).
-    pub fn new(url: &str) -> Result<Self, DbError> {
+    /// `sync_db_writes`: maps to Qdrant [`UpsertPoints`](qdrant_client::Qdrant::upsert_points) /
+    /// [`delete_points`](qdrant_client::Qdrant::delete_points) `wait` (`AMGIX_NOW_SYNC_DB_WRITES`).
+    pub fn new(url: &str, sync_db_writes: bool) -> Result<Self, DbError> {
         // `qdrant-client`'s default `check_compatibility` runs `health_check` inside `build()` before
         // we can `wait_connected`, printing to stdout when Qdrant is still starting; we defer checks.
         let mut builder = Qdrant::from_url(url).skip_compatibility_check();
@@ -99,6 +103,7 @@ impl QdrantDb {
         Ok(QdrantDb {
             client,
             meta_collection: sys_collection_name("meta"),
+            sync_db_writes,
         })
     }
 
@@ -466,7 +471,7 @@ impl QdrantDb {
 
         self.client
             .upsert_points(
-                UpsertPointsBuilder::new(collection_name, points).wait(false),
+                UpsertPointsBuilder::new(collection_name, points).wait(self.sync_db_writes),
             )
             .await?;
 
@@ -576,7 +581,7 @@ impl QdrantDb {
             .delete_points(
                 DeletePointsBuilder::new(collection_name)
                     .points(vec![point_id])
-                    .wait(false),
+                    .wait(self.sync_db_writes),
             )
             .await?;
 
