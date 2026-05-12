@@ -8,6 +8,7 @@
 //! No business logic — no stats accumulation, no fusion algorithms.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DatetimeRange,
@@ -23,7 +24,7 @@ use crate::common::{
     string_to_uuid, sys_collection_name, DenseDistance,
     MAX_DATABASE_WAIT_SECONDS, SEARCH_PREFETCH_MULTIPLIER,
 };
-use tokio::time::{sleep, Duration};
+use tokio::time::sleep;
 use crate::functions::{
     doc_to_payload, linear_weighted_score_fuse, qdrant_val_to_json, rrf_fuse, scored_point_id,
     search_result_from_point, split_first_underscore,
@@ -34,6 +35,8 @@ use crate::models::{
 };
 
 const QDRANT_GRPC_CHANNEL_POOL_SIZE: usize = 20;
+/// Tonic request deadline for all Qdrant gRPC calls on this client (replaces `qdrant-client`'s 5s default).
+const QDRANT_GRPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -97,7 +100,9 @@ impl QdrantDb {
     pub fn new(url: &str, sync_db_writes: bool) -> Result<Self, DbError> {
         // `qdrant-client`'s default `check_compatibility` runs `health_check` inside `build()` before
         // we can `wait_connected`, printing to stdout when Qdrant is still starting; we defer checks.
-        let mut builder = Qdrant::from_url(url).skip_compatibility_check();
+        let mut builder = Qdrant::from_url(url)
+            .skip_compatibility_check()
+            .timeout(QDRANT_GRPC_TIMEOUT);
         builder.set_pool_size(QDRANT_GRPC_CHANNEL_POOL_SIZE);
         let client = builder.build()?;
         Ok(QdrantDb {

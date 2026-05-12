@@ -33,6 +33,10 @@ const CACHE_MAX_ENTRIES: usize = 1000;
 const STATS_BATCH_MAX_JOBS: usize = 10;
 const STATS_BATCH_WAIT: Duration = Duration::from_millis(200);
 const STATS_BATCH_CHANNEL: usize = 1024;
+const STATS_SET_STATS_MAX_ATTEMPTS: usize = 3;
+const STATS_SET_STATS_RETRY_DELAY: Duration = Duration::from_millis(50);
+const ADD_DOCUMENTS_MAX_ATTEMPTS: usize = 3;
+const ADD_DOCUMENTS_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// Max REST **bulk** jobs buffered (`try_send` → HTTP 429 when full).
 pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
@@ -205,7 +209,22 @@ async fn persist_stats_maps_for_collection(
     for u in maps_in_order {
         apply_token_length_updates_to_stats(&mut stats, u);
     }
-    db.set_collection_stats(collection_name, &stats).await
+    for attempt in 1..=STATS_SET_STATS_MAX_ATTEMPTS {
+        match db.set_collection_stats(collection_name, &stats).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < STATS_SET_STATS_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = STATS_SET_STATS_MAX_ATTEMPTS,
+                    error = %e,
+                    "set_collection_stats failed; retrying"
+                );
+                tokio::time::sleep(STATS_SET_STATS_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 struct StatsJob {
@@ -232,7 +251,7 @@ impl StatsBatcherShutdown {
     pub async fn shutdown_and_wait(mut self) {
         drop(self.keepalive.take());
         if let Err(e) = self.join.await {
-            eprintln!("stats batcher task ended with error: {e}");
+            tracing::error!(error = %e, "stats batcher task ended with error");
         }
     }
 }
@@ -317,8 +336,10 @@ async fn flush_stats_job_batch(
         )
         .await
         {
-            eprintln!(
-                "stats batch persist failed for collection {collection_name}: {e}"
+            tracing::error!(
+                collection = %collection_name,
+                error = %e,
+                "stats batch persist failed after retries"
             );
         }
     }
@@ -1059,8 +1080,24 @@ pub(crate) async fn document_upsert_bulk_internal(
         .map_err(|e| UpsertSyncError::Vectorization(format!("Rayon channel dropped: {e}")))?
         .map_err(UpsertSyncError::Vectorization)?;
 
-    db.add_documents(collection_name, &docs_with_vectors, collection_config.store_content)
-        .await?;
+    for attempt in 1..=ADD_DOCUMENTS_MAX_ATTEMPTS {
+        match db
+            .add_documents(collection_name, &docs_with_vectors, collection_config.store_content)
+            .await
+        {
+            Ok(()) => break,
+            Err(e) if attempt < ADD_DOCUMENTS_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = ADD_DOCUMENTS_MAX_ATTEMPTS,
+                    error = %e,
+                    "add_documents failed; retrying"
+                );
+                tokio::time::sleep(ADD_DOCUMENTS_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(UpsertSyncError::Db(e)),
+        }
+    }
 
     // Build stats updates across the whole batch.
     let new_doc_count_batch = is_new_flags.iter().filter(|&&n| n).count() as i64;

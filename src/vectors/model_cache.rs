@@ -141,11 +141,19 @@ pub fn load_trusted_organizations() -> Option<HashSet<String>> {
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .map(|l| l.to_string())
                 .collect();
-            eprintln!("Loaded {} trusted organizations from {file_path}", orgs.len());
+            tracing::info!(
+                count = orgs.len(),
+                path = %file_path,
+                "loaded trusted organizations"
+            );
             Some(orgs)
         }
         Err(e) => {
-            eprintln!("Failed to load trusted organizations from {file_path}: {e}. Using empty set.");
+            tracing::warn!(
+                path = %file_path,
+                error = %e,
+                "failed to load trusted organizations; using empty set"
+            );
             Some(HashSet::new())
         }
     }
