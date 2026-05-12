@@ -791,6 +791,16 @@ async fn main() {
     let amgix_variant = AMGIX_VARIANT.to_string();
     let amgix_version_display = format!("{} ({})", amgix_version, AMGIX_VARIANT);
 
+    println!(r#"                              _         _   _                 
+     /\                      (_)       | \ | |                
+    /  \    _ __ ___    __ _  _ __  __ |  \| |  ___ __      __
+   / /\ \  | '_ ` _ \  / _` || |\ \/ / | . ` | / _ \\ \ /\ / /
+  / ____ \ | | | | | || (_| || | >  <  | |\  || (_) |\ V  V / 
+ /_/    \_\|_| |_| |_| \__, ||_|/_/\_\ |_| \_| \___/  \_/\_/  
+                        __/ |                                 
+                       |___/                                  
+    "#);
+
     tracing::info!("Amgix version: {amgix_version_display}");
     tracing::info!("Qdrant version: {qdrant_version}");
     tracing::info!("Synchronous Database Writes: {sync_db_writes}");
