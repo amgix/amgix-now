@@ -1,6 +1,6 @@
 # **Amgix Now** - Hybrid Search Engine
 
-**Amgix Now** is a single-binary hybrid search engine. Send it text, get back ranked results.
+**Amgix Now** is a high-performance hybrid search engine from the Amgix family. Send it text, get back ranked results.
 
 Part of the [Amgix](https://amgix.io) family.
 
