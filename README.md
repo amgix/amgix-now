@@ -14,12 +14,16 @@ docker run -d -p 8235:8235 -v <path/on/host>:/data amgixio/amgix-now:1
 
 | | Amgix Now | Amgix One | Amgix |
 |---|:---:|:---:|:---:|
-| Single container | ✓ | ✓ | |
 | Hybrid search | ✓ | ✓ | ✓ |
-| Async ingestion | | ✓ | ✓ |
+| Single container | ✓ | ✓ | |
+| Async ingestion pipeline | | ✓ | ✓ |
 | Dashboard & metrics | | ✓ | ✓ |
+| PostgreSQL/MariaDB | | ✓ | ✓ |
 | Modular scaling | | | ✓ |
 | Model self-orchestration | | | ✓ |
+| **Throughput** | high | medium | scales with cluster |
+| **Latency** | lowest | medium | medium |
+| **Operational complexity** | lowest | medium | highest |
 
 Same REST API and storage format across all three.
 
