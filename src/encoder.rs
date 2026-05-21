@@ -38,6 +38,8 @@ const STATS_SET_STATS_MAX_ATTEMPTS: usize = 3;
 const STATS_SET_STATS_RETRY_DELAY: Duration = Duration::from_millis(50);
 const ADD_DOCUMENTS_MAX_ATTEMPTS: usize = 3;
 const ADD_DOCUMENTS_RETRY_DELAY: Duration = Duration::from_millis(50);
+const NAMED_LOCKS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const STATS_LOCKS_CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Max REST **bulk** jobs buffered (`try_send` → HTTP 429 when full).
 pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
@@ -97,6 +99,30 @@ impl NamedLocks {
                 .clone()
         };
         Mutex::lock_owned(entry).await
+    }
+
+    /// Spawns a background task that periodically removes idle lock entries (those with no
+    /// waiters or holders). The task runs until aborted or the process exits — no graceful
+    /// shutdown is needed since there is nothing to drain.
+    pub fn start_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
+        self.start_cleanup_task_with_interval(NAMED_LOCKS_CLEANUP_INTERVAL)
+    }
+
+    /// Like [`start_cleanup_task`] but uses the longer interval suitable for stats locks,
+    /// which are keyed by collection name and therefore much fewer than doc locks.
+    pub fn start_stats_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
+        self.start_cleanup_task_with_interval(STATS_LOCKS_CLEANUP_INTERVAL)
+    }
+
+    fn start_cleanup_task_with_interval(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let mut map = inner.lock().await;
+                map.retain(|_, entry| Arc::strong_count(entry) > 1);
+            }
+        })
     }
 }
 

@@ -838,7 +838,9 @@ async fn main() {
     tracing::info!("Qdrant version: {qdrant_version}");
     tracing::info!("Synchronous Database Writes: {sync_db_writes}");
 
-    let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), NamedLocks::new());
+    let stats_locks = NamedLocks::new();
+    stats_locks.start_stats_cleanup_task();
+    let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), stats_locks);
 
     let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let index_threads = std::env::var("AMGIX_NOW_INDEX_THREADS")
@@ -869,6 +871,7 @@ async fn main() {
 
     let collection_cache = CollectionConfigCache::new();
     let doc_locks = NamedLocks::new();
+    doc_locks.start_cleanup_task();
     let (upsert_ingress, upsert_shutdown) = UpsertIngress::new(
         Arc::clone(&db),
         collection_cache.clone(),
