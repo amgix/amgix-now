@@ -13,7 +13,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::{
         rejection::JsonRejection,
-        Path, Request, State,
+        Path, Query, Request, State,
     },
     http::StatusCode,
     middleware::{self, Next},
@@ -21,6 +21,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -34,10 +35,10 @@ use encoder::{
     UpsertIngress, UpsertSyncError,
 };
 use models::{
-    BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CollectionExistsResponse,
-    CollectionStatsResponse, Document, DocumentStatus, DocumentStatusResponse, OkResponse,
-    QueueInfo, QueuedDocumentStatus, ReadyResponse, SearchQuery, SearchResult,
-    SystemInfoResponse, VectorConfigInternal, VersionResponse,
+    parse_document_timestamp_for_api, BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
+    CollectionExistsResponse, CollectionStatsResponse, Document, DocumentStatus,
+    DocumentStatusResponse, OkResponse, QueueInfo, QueuedDocumentStatus, ReadyResponse, SearchQuery,
+    SearchResult, SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
 use validation::{
@@ -124,6 +125,27 @@ fn validation_error(e: validation::ValidationError) -> (StatusCode, Json<Value>)
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({ "detail": validation_error_detail_list(e.to_string()) })),
     )
+}
+
+fn query_validation_error(field: &str, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "detail": [
+                {
+                    "type": "validation_error",
+                    "loc": ["query", field],
+                    "msg": msg.into(),
+                    "input": Value::Null
+                }
+            ]
+        })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteDocumentQuery {
+    request_timestamp: String,
 }
 
 /// Full Amgix API compatibility surface that **amgix-now** intentionally omits — same paths as FastAPI (`api/main.py`).
@@ -583,8 +605,18 @@ async fn get_document_status(
 async fn delete_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
+    Query(query): Query<DeleteDocumentQuery>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
     validate_collection_name(&collection_name).map_err(validation_error)?;
+    let request_timestamp = parse_document_timestamp_for_api(&query.request_timestamp).map_err(|_| {
+        query_validation_error(
+            "request_timestamp",
+            format!(
+                "'request_timestamp' must include a UTC timezone (e.g. 2024-01-01T00:00:00Z). Got {}",
+                query.request_timestamp
+            ),
+        )
+    })?;
     let real_collection_name = get_real_collection_name(&collection_name);
     match document_delete_sync(
         &app.db,
@@ -592,10 +624,11 @@ async fn delete_document(
         &app.doc_locks,
         &real_collection_name,
         &document_id,
+        request_timestamp,
     )
     .await
     {
-        Ok(()) => Ok(Json(OkResponse::ok())),
+        Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
         Err(UpsertSyncError::IngressQueueFull(m)) => {

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
@@ -1140,14 +1141,16 @@ pub(crate) async fn document_upsert_bulk_internal(
 // ---------------------------------------------------------------------------
 
 /// Deletes a document and updates collection stats with negative token lengths.
-/// Returns `Ok(())` silently if the document does not exist (already deleted).
+/// Returns `Ok(skipped_ids)` — non-empty when the delete was stale and not applied.
+/// Missing documents return `Ok(vec![])` (idempotent success).
 pub async fn document_delete_sync(
     db: &QdrantDb,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &NamedLocks,
     collection_name: &str,
     document_id: &str,
-) -> Result<(), UpsertSyncError> {
+    request_timestamp: DateTime<Utc>,
+) -> Result<Vec<String>, UpsertSyncError> {
     let doc_lock_key = format!("{collection_name}-{document_id}");
     let _doc_guard = doc_locks.lock(&doc_lock_key).await;
 
@@ -1160,12 +1163,16 @@ pub async fn document_delete_sync(
 
     let doc_with_vectors = match existing {
         Some(d) => d,
-        None => return Ok(()),
+        None => return Ok(vec![]),
     };
+
+    if request_timestamp <= doc_with_vectors.timestamp {
+        return Ok(vec![document_id.to_string()]);
+    }
 
     match db.delete_document(collection_name, document_id).await {
         Ok(()) => {}
-        Err(DbError::NotFound(_)) => return Ok(()),
+        Err(DbError::NotFound(_)) => return Ok(vec![]),
         Err(e) => return Err(UpsertSyncError::Db(e)),
     }
 
@@ -1184,7 +1191,7 @@ pub async fn document_delete_sync(
         stats_batcher.enqueue(collection_name, updates).await?;
     }
 
-    Ok(())
+    Ok(vec![])
 }
 
 // ---------------------------------------------------------------------------
