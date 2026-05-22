@@ -4,6 +4,14 @@
 
 Part of the [Amgix](https://amgix.io) family.
 
+## Benchmarks
+
+<img src="https://amgix.io/images/amgix-now/amgix-now-bench-mix.png" align="right" width="350" hspace="10"/>
+
+Visit our detailed [Amgix Now Benchmarks Series](https://amgix.io/blog/2026/05/21/amgix-now-bench-series/) (in context of Typesense, Meilisearch, and Elasticsearch).
+
+<br clear="both"/>
+
 ## Get Started
 
 ```bash
