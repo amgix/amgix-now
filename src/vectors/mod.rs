@@ -1,5 +1,6 @@
 pub mod dense_custom;
 pub mod dense_model;
+pub mod st_pooling;
 pub mod full_text;
 pub mod model_cache;
 pub mod sparse_custom;

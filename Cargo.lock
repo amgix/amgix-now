@@ -99,6 +99,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "embed_anything",
+ "hf-hub",
  "murmurhash3",
  "once_cell",
  "qdrant-client",

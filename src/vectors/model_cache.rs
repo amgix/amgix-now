@@ -1,8 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use serde_json::Value;
+
+use crate::vectors::st_pooling::StPoolingConfig;
 
 // ---------------------------------------------------------------------------
 // GPU inference serialization
@@ -181,7 +186,40 @@ pub fn set_hf_home() {
 // Dense model cache
 // ---------------------------------------------------------------------------
 
-type DenseModelEntry = (Arc<BertEmbedder>, Instant);
+const ST_POOLING_CONFIG_PATH: &str = "1_Pooling/config.json";
+
+/// Dense model plus Sentence-Transformers pooling config loaded once at model load time.
+pub struct DenseModelHandle {
+    pub embedder: BertEmbedder,
+    pub pooling: StPoolingConfig,
+}
+
+fn load_st_pooling_config(model_id: &str, revision: Option<&str>) -> StPoolingConfig {
+    set_hf_home();
+    let Ok(api) = ApiBuilder::new().with_progress(false).build() else {
+        return StPoolingConfig::mean_only();
+    };
+    let repo = match revision {
+        Some(rev) => Repo::with_revision(model_id.to_string(), RepoType::Model, rev.to_string()),
+        None => Repo::new(model_id.to_string(), RepoType::Model),
+    };
+    let Ok(path) = api.repo(repo).get(ST_POOLING_CONFIG_PATH) else {
+        return StPoolingConfig::mean_only();
+    };
+    load_st_pooling_config_from_path(&path)
+}
+
+fn load_st_pooling_config_from_path(path: &Path) -> StPoolingConfig {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return StPoolingConfig::mean_only();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return StPoolingConfig::mean_only();
+    };
+    StPoolingConfig::from_json_value(&value)
+}
+
+type DenseModelEntry = (Arc<DenseModelHandle>, Instant);
 
 pub struct DenseModelCache {
     inner: RwLock<HashMap<(String, Option<String>), DenseModelEntry>>,
@@ -201,7 +239,7 @@ impl DenseModelCache {
         model_id: &str,
         revision: Option<&str>,
         trusted_organizations: Option<&HashSet<String>>,
-    ) -> Result<Arc<BertEmbedder>, String> {
+    ) -> Result<Arc<DenseModelHandle>, String> {
         let key = (model_id.to_string(), revision.map(|s| s.to_string()));
 
         // Fast path: read lock — check cache
@@ -237,6 +275,7 @@ impl DenseModelCache {
         }
 
         set_hf_home();
+        let pooling = load_st_pooling_config(model_id, revision);
         let embedder = BertEmbedder::new(
             model_id.to_string(),
             revision.map(|s| s.to_string()),
@@ -247,9 +286,9 @@ impl DenseModelCache {
         // Evict expired and oldest entries if at capacity
         Self::evict_if_needed(&mut cache, self.max_size);
 
-        let arc = Arc::new(embedder);
-        cache.insert(key, (Arc::clone(&arc), Instant::now()));
-        Ok(arc)
+        let handle = Arc::new(DenseModelHandle { embedder, pooling });
+        cache.insert(key, (Arc::clone(&handle), Instant::now()));
+        Ok(handle)
     }
 
     fn evict_if_needed(

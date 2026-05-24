@@ -29,3 +29,4 @@ embed_anything = { version = "0.6.7", default-features = false, features = ["rus
 candle-core = "=0.9.1"
 candle-transformers = "=0.9.1"
 tokenizers = { version = "=0.22.2", default-features = false }
+hf-hub = { version = "=0.4.3", default-features = false, features = ["ureq"] }
