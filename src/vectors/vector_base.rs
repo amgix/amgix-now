@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use isolang::Language;
+use whatlang::Lang;
+
 use crate::models::VectorConfigInternal;
 
 // TOKEN_HASH_RANGE mirrors VectorBase.TOKEN_HASH_RANGE = 2^31 - 1 (Mersenne prime)
@@ -125,11 +128,21 @@ pub fn get_language_code(config: &VectorConfigInternal, text: &str) -> Result<St
     ))
 }
 
-/// Language detection — not yet implemented; always returns None so callers
-/// fall back to language_default_code, matching Python behaviour when confidence
-/// is below the threshold. Will be wired to whatlang once the dependency is added.
-fn detect_language(_text: &str) -> Option<(String, f32)> {
-    None
+/// Convert whatlang's ISO 639-3 code to a two-letter ISO 639-1 code for Amgix APIs.
+fn lang_to_iso639_1(lang: Lang) -> Option<String> {
+    let code3 = lang.code();
+    Language::from_639_3(code3).and_then(|l| l.to_639_1().map(str::to_string))
+}
+
+/// Language detection via whatlang::detect (lang + confidence; script is ignored).
+fn detect_language(text: &str) -> Option<(String, f32)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let info = whatlang::detect(trimmed)?;
+    let lang_code = lang_to_iso639_1(info.lang())?;
+    Some((lang_code, info.confidence() as f32))
 }
 
 // ---------------------------------------------------------------------------

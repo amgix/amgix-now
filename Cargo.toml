@@ -30,3 +30,5 @@ candle-core = "=0.9.1"
 candle-transformers = "=0.9.1"
 tokenizers = { version = "=0.22.2", default-features = false }
 hf-hub = { version = "=0.4.3", default-features = false, features = ["ureq"] }
+whatlang = "0.18.0"
+isolang = "2.4.0"
