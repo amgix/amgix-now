@@ -15,7 +15,10 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
-use crate::common::{VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT};
+use crate::common::{
+    VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT,
+    MAX_INDEXED_METADATA_VALUE_LENGTH,
+};
 use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
     CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
@@ -1356,10 +1359,28 @@ pub fn validate_metadata_types(
                     idx.key, actual_type, idx.value_type
                 )));
             }
+            if idx.value_type == "string" {
+                let len = metadata_string_value_len(value);
+                if len > MAX_INDEXED_METADATA_VALUE_LENGTH {
+                    return Err(MetadataTypeError(format!(
+                        "String metadata value for key '{}' exceeds {} character limit",
+                        idx.key, MAX_INDEXED_METADATA_VALUE_LENGTH
+                    )));
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn metadata_string_value_len(value: &serde_json::Value) -> usize {
+    if let Some(map) = value.as_object() {
+        if let Some(v) = map.get("value").and_then(|v| v.as_str()) {
+            return v.len();
+        }
+    }
+    value.as_str().map(|s| s.len()).unwrap_or(0)
 }
 
 fn infer_metadata_value_type(value: &serde_json::Value) -> String {
