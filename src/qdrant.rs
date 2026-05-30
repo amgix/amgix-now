@@ -11,12 +11,16 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use qdrant_client::qdrant::{
+    points_selector::PointsSelectorOneOf,
+    points_update_operation::{Operation, OverwritePayload},
     Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DatetimeRange,
     DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, GetPointsBuilder,
-    Match, PointId, PointStruct, QueryBatchPointsBuilder, QueryPointsBuilder, Range,
+    Match, PointId, PointStruct, PointsIdsList, PointsSelector, PointsUpdateOperation,
+    QueryBatchPointsBuilder, QueryPointsBuilder, Range,
     RepeatedStrings, SparseIndexConfig, SparseVector, SparseVectorConfig,
-    SparseVectorParams, Timestamp, UpsertPointsBuilder, VectorInput, VectorParams,
-    VectorParamsMap, VectorsConfig, Modifier, Query, PayloadIncludeSelector,
+    SparseVectorParams, Timestamp, UpdateBatchPointsBuilder, UpsertPointsBuilder,
+    VectorInput, VectorParams, VectorParamsMap, VectorsConfig, Modifier, Query,
+    PayloadIncludeSelector,
 };
 use qdrant_client::Qdrant;
 
@@ -26,11 +30,11 @@ use crate::common::{
 };
 use tokio::time::sleep;
 use crate::functions::{
-    doc_to_payload, linear_weighted_score_fuse, qdrant_val_to_json, rrf_fuse, scored_point_id,
-    search_result_from_point, split_first_underscore,
+    doc_payload_only, doc_to_payload, linear_weighted_score_fuse, qdrant_val_to_json,
+    rrf_fuse, scored_point_id, search_result_from_point, split_first_underscore,
 };
 use crate::models::{
-    CollectionConfigInternal, DocumentWithVectors, MetadataFilter, MetadataIndex,
+    CollectionConfigInternal, Document, DocumentWithVectors, MetadataFilter, MetadataIndex,
     SearchQueryWithVectors, SearchResult, VectorScore,
 };
 
@@ -480,6 +484,47 @@ impl QdrantDb {
             )
             .await?;
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_documents — update payload only, vectors unchanged.
+    // Mirrors QdrantDatabase.patch_documents (Python).
+    // -----------------------------------------------------------------------
+
+    pub async fn patch_documents(
+        &self,
+        collection_name: &str,
+        documents: &[Document],
+        store_content: bool,
+    ) -> Result<(), DbError> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let mut operations: Vec<PointsUpdateOperation> = Vec::with_capacity(documents.len());
+        for doc in documents {
+            let payload_map = doc_payload_only(doc, store_content)?;
+            let payload: HashMap<String, qdrant_client::qdrant::Value> =
+                qdrant_client::Payload::from(payload_map).into();
+            let uuid = string_to_uuid(&doc.id).to_string();
+            operations.push(PointsUpdateOperation {
+                operation: Some(Operation::OverwritePayload(OverwritePayload {
+                    points_selector: Some(PointsSelector {
+                        points_selector_one_of: Some(PointsSelectorOneOf::Points(
+                            PointsIdsList { ids: vec![uuid.into()] },
+                        )),
+                    }),
+                    payload,
+                    ..Default::default()
+                })),
+            });
+        }
+        self.client
+            .update_points_batch(
+                UpdateBatchPointsBuilder::new(collection_name, operations)
+                    .wait(self.sync_db_writes),
+            )
+            .await?;
         Ok(())
     }
 

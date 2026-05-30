@@ -16,14 +16,50 @@ use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
 use crate::common::{
-    VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT,
+    DocumentField, VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT,
     MAX_INDEXED_METADATA_VALUE_LENGTH,
 };
 use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
     CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
-    ModelValidationResult, SearchQuery, SearchQuerySettings, SearchResult, VectorConfigInternal, VectorSearchWeight,
+    ModelValidationResult, SearchQuery, SearchQuerySettings, SearchResult, VectorConfigInternal,
+    VectorSearchWeight,
 };
+
+fn needs_revectorization(
+    incoming: &Document,
+    existing: &DocumentWithVectors,
+    collection_config: &CollectionConfigInternal,
+) -> bool {
+    if incoming.custom_vectors.is_some() {
+        return true;
+    }
+    let content_indexed = collection_config
+        .vectors
+        .iter()
+        .any(|v| v.index_fields.contains(&DocumentField::Content));
+    if content_indexed && !collection_config.store_content {
+        return true;
+    }
+    for v in &collection_config.vectors {
+        for field in &v.index_fields {
+            let incoming_val: Option<&str> = match field {
+                DocumentField::Name => incoming.name.as_deref(),
+                DocumentField::Description => incoming.description.as_deref(),
+                DocumentField::Content => incoming.content.as_deref(),
+            };
+            let existing_val: Option<&str> = match field {
+                DocumentField::Name => existing.name.as_deref(),
+                DocumentField::Description => existing.description.as_deref(),
+                DocumentField::Content => existing.content.as_deref(),
+            };
+            if incoming_val != existing_val {
+                return true;
+            }
+        }
+    }
+    false
+}
 use crate::qdrant::{CollectionStats, DbError, QdrantDb};
 use crate::vectors::vectorizer::Vectorizer;
 
@@ -1053,9 +1089,10 @@ pub(crate) async fn document_upsert_bulk_internal(
         .filter_map(|(id, opt)| opt.as_ref().map(|doc| (*id, doc)))
         .collect();
 
-    // Partition into stale (skip) and to-process.
+    // Partition into stale (skip), patch-only, and to-vectorize.
     let mut skipped: Vec<String> = vec![];
-    let mut to_process: Vec<&Document> = vec![];
+    let mut to_vectorize: Vec<&Document> = vec![];
+    let mut to_patch: Vec<&Document> = vec![];
     let mut is_new_flags: Vec<bool> = vec![];
 
     for doc in &documents {
@@ -1063,18 +1100,29 @@ pub(crate) async fn document_upsert_bulk_internal(
             Some(existing) if doc.timestamp <= existing.timestamp => {
                 skipped.push(doc.id.clone());
             }
-            Some(_) => {
-                to_process.push(doc);
-                is_new_flags.push(false);
+            Some(existing) => {
+                if needs_revectorization(doc, existing, &collection_config) {
+                    to_vectorize.push(doc);
+                    is_new_flags.push(false);
+                } else {
+                    to_patch.push(doc);
+                }
             }
             None => {
-                to_process.push(doc);
+                to_vectorize.push(doc);
                 is_new_flags.push(true);
             }
         }
     }
 
-    if to_process.is_empty() {
+    if !to_patch.is_empty() {
+        let patch_docs: Vec<Document> = to_patch.iter().map(|d| (*d).clone()).collect();
+        db.patch_documents(collection_name, &patch_docs, collection_config.store_content)
+            .await
+            .map_err(UpsertSyncError::Db)?;
+    }
+
+    if to_vectorize.is_empty() {
         return Ok(skipped);
     }
 
@@ -1090,16 +1138,16 @@ pub(crate) async fn document_upsert_bulk_internal(
     }
     let avgdl_dict: HashMap<String, f64> = stats.avgdls.clone();
 
-    let mut docs_owned: Vec<Document> = to_process.iter().map(|d| (*d).clone()).collect();
+    let mut docs_owned: Vec<Document> = to_vectorize.iter().map(|d| (*d).clone()).collect();
     for doc in &mut docs_owned {
         normalize_document_metadata_inplace(doc)
             .map_err(UpsertSyncError::Vectorization)?;
     }
     let vectors_cfg = collection_config.vectors.clone();
     let pool = Arc::clone(index_pool);
-    
+
     let (tx, rx) = tokio::sync::oneshot::channel();
-    
+
     pool.spawn(move || {
         let result = Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict));
         let _ = tx.send(result);
@@ -1129,14 +1177,14 @@ pub(crate) async fn document_upsert_bulk_internal(
         }
     }
 
-    // Build stats updates across the whole batch.
+    // Build stats updates for vectorized docs only.
     let new_doc_count_batch = is_new_flags.iter().filter(|&&n| n).count() as i64;
     let update_doc_count_batch = is_new_flags.iter().filter(|&&n| !n).count() as i64;
 
     let mut updates: HashMap<String, TokenLengthUpdate> = HashMap::new();
     for (doc_idx, doc_with_vectors) in docs_with_vectors.iter().enumerate() {
         let is_new = is_new_flags[doc_idx];
-        let existing = existing_map.get(to_process[doc_idx].id.as_str());
+        let existing = existing_map.get(to_vectorize[doc_idx].id.as_str());
         for (field_vector_name, &token_length) in &doc_with_vectors.token_lengths {
             let entry = updates.entry(field_vector_name.clone()).or_insert(TokenLengthUpdate {
                 new_doc_count: new_doc_count_batch,

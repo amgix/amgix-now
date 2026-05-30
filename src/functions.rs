@@ -259,6 +259,24 @@ pub fn doc_to_payload(
     }
 }
 
+pub fn doc_payload_only(
+    doc: &crate::models::Document,
+    store_content: bool,
+) -> Result<serde_json::Map<String, serde_json::Value>, DbError> {
+    let mut val = serde_json::to_value(doc)
+        .map_err(|e| DbError::Config(format!("Serialization error: {e}")))?;
+    if let serde_json::Value::Object(ref mut map) = val {
+        map.remove("custom_vectors");
+        if !store_content {
+            map.remove("content");
+        }
+    }
+    match val {
+        serde_json::Value::Object(m) => Ok(m),
+        _ => Err(DbError::Config("Expected object when serializing document".into())),
+    }
+}
+
 pub fn search_result_from_point(
     point: &qdrant_client::qdrant::ScoredPoint,
     score: f64,
