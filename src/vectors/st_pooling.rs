@@ -312,6 +312,8 @@ fn gather_rows(
     hidden_dim: usize,
 ) -> Result<Tensor, String> {
     let idx_vec = indices
+        .to_dtype(candle_core::DType::I64)
+        .map_err(|e| format!("gather indices dtype: {e}"))?
         .to_vec1::<i64>()
         .map_err(|e| format!("gather indices vec: {e}"))?;
 
