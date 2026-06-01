@@ -13,7 +13,7 @@ use crate::common::{
     DenseDistance, VectorType, MAX_BULK_UPLOAD, MAX_COLLECTION_NAME_LENGTH,
     MAX_DOCUMENT_CONTENT_LENGTH, MAX_DOCUMENT_DESCRIPTION_LENGTH, MAX_DOCUMENT_ID_LENGTH,
     MAX_DOCUMENT_NAME_LENGTH, MAX_DOCUMENT_TAG_LENGTH, MAX_DOCUMENT_TAGS_COUNT,
-    MAX_INDEXED_METADATA_VALUE_LENGTH, MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
+    MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
     MAX_MODEL_NAME_LENGTH,
     MAX_SEARCH_LIMIT, MAX_SEARCH_QUERY_LENGTH, MAX_TOP_K_VALUE, MAX_VECTOR_DIMENSIONS,
     MAX_VECTOR_NAME_LENGTH,
@@ -62,7 +62,7 @@ pub fn validate_collection_name(name: &str) -> VResult {
     if name.is_empty() {
         return Err(err("ensure this value has at least 1 characters"));
     }
-    if name.len() > MAX_COLLECTION_NAME_LENGTH {
+    if name.chars().count() > MAX_COLLECTION_NAME_LENGTH {
         return Err(err(format!(
             "ensure this value has at most {MAX_COLLECTION_NAME_LENGTH} characters"
         )));
@@ -123,16 +123,16 @@ pub fn validate_document(doc: &Document) -> VResult {
 fn validate_document_id(id: &str) -> VResult {
     let stripped = id.trim();
     if stripped.is_empty() {
-        return Err(err("Document ID cannot be empty or whitespace"));
+        return Err(err("id: Document ID cannot be empty or whitespace"));
     }
     if !RE_ALPHANUMERIC.is_match(stripped) {
         return Err(err(
-            "Document ID can only contain letters, numbers, underscores, and hyphens",
+            "id: Document ID can only contain letters, numbers, underscores, and hyphens",
         ));
     }
-    if stripped.len() > MAX_DOCUMENT_ID_LENGTH {
+    if stripped.chars().count() > MAX_DOCUMENT_ID_LENGTH {
         return Err(err(format!(
-            "ensure this value has at most {MAX_DOCUMENT_ID_LENGTH} characters"
+            "id: ensure this value has at most {MAX_DOCUMENT_ID_LENGTH} characters"
         )));
     }
     Ok(())
@@ -142,7 +142,7 @@ fn validate_document_id(id: &str) -> VResult {
 fn validate_tags(tags: &[String]) -> VResult {
     if tags.len() > MAX_DOCUMENT_TAGS_COUNT {
         return Err(err(format!(
-            "ensure this value has at most {MAX_DOCUMENT_TAGS_COUNT} items"
+            "tags: ensure this value has at most {MAX_DOCUMENT_TAGS_COUNT} items"
         )));
     }
     let mut seen = std::collections::HashSet::new();
@@ -152,15 +152,15 @@ fn validate_tags(tags: &[String]) -> VResult {
             continue;
         }
         if t.contains('|') {
-            return Err(err(format!("Tag '{t}' cannot contain pipe characters (|)")));
+            return Err(err(format!("tags: Tag '{t}' cannot contain pipe characters (|)")));
         }
-        if t.len() > MAX_DOCUMENT_TAG_LENGTH {
+        if t.chars().count() > MAX_DOCUMENT_TAG_LENGTH {
             return Err(err(format!(
-                "Tag '{t}' exceeds {MAX_DOCUMENT_TAG_LENGTH} character limit"
+                "tags: Tag '{t}' exceeds {MAX_DOCUMENT_TAG_LENGTH} character limit"
             )));
         }
         if !seen.insert(t.to_string()) {
-            return Err(err("Tags must not contain duplicates"));
+            return Err(err("tags: Tags must not contain duplicates"));
         }
     }
     Ok(())
@@ -168,9 +168,9 @@ fn validate_tags(tags: &[String]) -> VResult {
 
 fn validate_document_name_opt(name: Option<&str>) -> VResult {
     if let Some(n) = name {
-        if n.len() > MAX_DOCUMENT_NAME_LENGTH {
+        if n.chars().count() > MAX_DOCUMENT_NAME_LENGTH {
             return Err(err(format!(
-                "ensure this value has at most {MAX_DOCUMENT_NAME_LENGTH} characters"
+                "name: ensure this value has at most {MAX_DOCUMENT_NAME_LENGTH} characters"
             )));
         }
     }
@@ -179,9 +179,9 @@ fn validate_document_name_opt(name: Option<&str>) -> VResult {
 
 fn validate_document_description_opt(desc: Option<&str>) -> VResult {
     if let Some(d) = desc {
-        if d.len() > MAX_DOCUMENT_DESCRIPTION_LENGTH {
+        if d.chars().count() > MAX_DOCUMENT_DESCRIPTION_LENGTH {
             return Err(err(format!(
-                "ensure this value has at most {MAX_DOCUMENT_DESCRIPTION_LENGTH} characters"
+                "description: ensure this value has at most {MAX_DOCUMENT_DESCRIPTION_LENGTH} characters"
             )));
         }
     }
@@ -190,9 +190,9 @@ fn validate_document_description_opt(desc: Option<&str>) -> VResult {
 
 fn validate_document_content_opt(content: Option<&str>) -> VResult {
     if let Some(c) = content {
-        if c.len() > MAX_DOCUMENT_CONTENT_LENGTH {
+        if c.chars().count() > MAX_DOCUMENT_CONTENT_LENGTH {
             return Err(err(format!(
-                "ensure this value has at most {MAX_DOCUMENT_CONTENT_LENGTH} characters"
+                "content: ensure this value has at most {MAX_DOCUMENT_CONTENT_LENGTH} characters"
             )));
         }
     }
@@ -205,12 +205,12 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
         // key format
         if !RE_ALPHANUMERIC.is_match(key) {
             return Err(err(format!(
-                "Metadata key '{key}' can only contain letters, numbers, underscores, and hyphens"
+                "metadata.{key}: key can only contain letters, numbers, underscores, and hyphens"
             )));
         }
-        if key.len() > MAX_METADATA_KEY_LENGTH {
+        if key.chars().count() > MAX_METADATA_KEY_LENGTH {
             return Err(err(format!(
-                "Metadata key '{key}' exceeds {MAX_METADATA_KEY_LENGTH} character limit"
+                "metadata.{key}: key exceeds {MAX_METADATA_KEY_LENGTH} character limit"
             )));
         }
 
@@ -222,7 +222,7 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
                 // MetaValue dict form
                 let val = map.get("value").ok_or_else(|| {
                     err(format!(
-                        "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. \
+                        "metadata.{key}: value is a dict but missing 'value' or 'type' fields. \
                         For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
                     ))
                 })?;
@@ -231,7 +231,7 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
                     .and_then(|t| t.as_str())
                     .ok_or_else(|| {
                         err(format!(
-                            "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. \
+                            "metadata.{key}: value is a dict but missing 'value' or 'type' fields. \
                             For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
                         ))
                     })?;
@@ -239,9 +239,9 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
             }
             Value::String(s) => {
                 // raw string → type = "string"
-                if s.len() > MAX_METADATA_VALUE_LENGTH {
+                if s.chars().count() > MAX_METADATA_VALUE_LENGTH {
                     return Err(err(format!(
-                        "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
+                        "metadata.{key}: string value exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
                     )));
                 }
             }
@@ -253,7 +253,7 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
             other => {
                 let type_name = json_type_name(other);
                 return Err(err(format!(
-                    "Metadata value for key '{key}' must be string, int, float, bool, or MetaValue \
+                    "metadata.{key}: value must be string, int, float, bool, or MetaValue \
                     (required for datetime), got {type_name}"
                 )));
             }
@@ -266,18 +266,18 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
     let allowed = ["string", "integer", "float", "boolean", "datetime"];
     if !allowed.contains(&type_str) {
         return Err(err(format!(
-            "Invalid metadata type '{type_str}' for key '{key}'. Allowed types: {allowed:?}"
+            "metadata.{key}: invalid type '{type_str}'. Allowed types: {allowed:?}"
         )));
     }
     match type_str {
         "string" => {
             match val.as_str() {
-                Some(s) if s.len() > MAX_METADATA_VALUE_LENGTH => Err(err(format!(
-                    "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
+                Some(s) if s.chars().count() > MAX_METADATA_VALUE_LENGTH => Err(err(format!(
+                    "metadata.{key}: string value exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
                 ))),
                 Some(_) => Ok(()),
                 None => Err(err(format!(
-                    "Metadata value for key '{key}' must be string for type='string', got {}",
+                    "metadata.{key}: value must be string for type='string', got {}",
                     json_type_name(val)
                 ))),
             }
@@ -287,7 +287,7 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
                 Ok(())
             } else {
                 Err(err(format!(
-                    "Metadata value for key '{key}' must be integer for type='integer', got {}",
+                    "metadata.{key}: value must be integer for type='integer', got {}",
                     json_type_name(val)
                 )))
             }
@@ -297,7 +297,7 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
                 Ok(())
             } else {
                 Err(err(format!(
-                    "Metadata value for key '{key}' must be number for type='float', got {}",
+                    "metadata.{key}: value must be number for type='float', got {}",
                     json_type_name(val)
                 )))
             }
@@ -307,7 +307,7 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
                 Ok(())
             } else {
                 Err(err(format!(
-                    "Metadata value for key '{key}' must be boolean for type='boolean', got {}",
+                    "metadata.{key}: value must be boolean for type='boolean', got {}",
                     json_type_name(val)
                 )))
             }
@@ -319,12 +319,12 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
                     Ok(())
                 } else {
                     Err(err(format!(
-                        "Metadata value for key '{key}' must be a valid ISO 8601 datetime string, got '{s}'"
+                        "metadata.{key}: value must be a valid ISO 8601 datetime string, got '{s}'"
                     )))
                 }
             }
             None => Err(err(format!(
-                "Metadata value for key '{key}' must be string (ISO 8601) for type='datetime', got {}",
+                "metadata.{key}: value must be string (ISO 8601) for type='datetime', got {}",
                 json_type_name(val)
             ))),
         },
@@ -366,12 +366,14 @@ fn validate_at_least_one_field(doc: &Document) -> VResult {
 pub fn validate_bulk_upload(req: &mut BulkUploadRequest) -> VResult {
     if req.documents.len() > MAX_BULK_UPLOAD {
         return Err(err(format!(
-            "ensure this value has at most {MAX_BULK_UPLOAD} items"
+            "documents: ensure this value has at most {MAX_BULK_UPLOAD} items"
         )));
     }
-    for doc in &mut req.documents {
+    for (i, doc) in req.documents.iter_mut().enumerate() {
         normalize_document_python(doc);
-        validate_document(doc)?;
+        validate_document(doc).map_err(|e| {
+            ValidationError(format!("documents[{}]: {}", i, e.0))
+        })?;
     }
     Ok(())
 }
@@ -438,9 +440,9 @@ fn validate_vector_config(v: &VectorConfig) -> VResult {
 }
 
 fn validate_model_name_length(field: &str, s: &str) -> VResult {
-    if s.len() > MAX_MODEL_NAME_LENGTH {
+    if s.chars().count() > MAX_MODEL_NAME_LENGTH {
         return Err(err(format!(
-            "ensure this value has at most {MAX_MODEL_NAME_LENGTH} characters (field: {field})"
+            "{field}: ensure this value has at most {MAX_MODEL_NAME_LENGTH} characters"
         )));
     }
     Ok(())
@@ -450,16 +452,16 @@ fn validate_model_name_length(field: &str, s: &str) -> VResult {
 /// Matches `vector.py`: pattern and max length apply to **raw** `name` (`v`), not trimmed.
 fn validate_vector_name(name: &str) -> VResult {
     if name.trim().is_empty() {
-        return Err(err("Vector configuration name cannot be empty or whitespace"));
+        return Err(err("name: Vector configuration name cannot be empty or whitespace"));
     }
     if !RE_ALPHANUMERIC.is_match(name) {
         return Err(err(
-            "Vector name can only contain letters, numbers, underscores, and hyphens",
+            "name: Vector name can only contain letters, numbers, underscores, and hyphens",
         ));
     }
-    if name.len() > MAX_VECTOR_NAME_LENGTH {
+    if name.chars().count() > MAX_VECTOR_NAME_LENGTH {
         return Err(err(format!(
-            "Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
+            "name: Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
         )));
     }
     Ok(())
@@ -469,21 +471,21 @@ fn validate_vector_name(name: &str) -> VResult {
 fn validate_metadata_index(mi: &MetadataIndex) -> VResult {
     if !RE_ALPHANUMERIC.is_match(&mi.key) {
         return Err(err(format!(
-            "Metadata key '{}' can only contain letters, numbers, underscores, and hyphens",
+            "metadata_indexes.{}: key can only contain letters, numbers, underscores, and hyphens",
             mi.key
         )));
     }
-    if mi.key.len() > MAX_METADATA_KEY_LENGTH {
+    if mi.key.chars().count() > MAX_METADATA_KEY_LENGTH {
         return Err(err(format!(
-            "Metadata key '{}' cannot exceed {MAX_METADATA_KEY_LENGTH} characters",
+            "metadata_indexes.{}: key cannot exceed {MAX_METADATA_KEY_LENGTH} characters",
             mi.key
         )));
     }
     let allowed = ["string", "integer", "float", "boolean", "datetime"];
     if !allowed.contains(&mi.value_type.as_str()) {
         return Err(err(format!(
-            "Invalid metadata type '{}' for indexed key '{}'. Allowed types: {allowed:?}",
-            mi.value_type, mi.key
+            "metadata_indexes.{}: invalid type '{}'. Allowed types: {allowed:?}",
+            mi.key, mi.value_type
         )));
     }
     Ok(())
@@ -533,16 +535,16 @@ fn validate_custom_vector_data_value(v: &Value) -> VResult {
 fn validate_custom_query_vector_name_stripped(raw: &str) -> VResult {
     let t = raw.trim();
     if t.is_empty() {
-        return Err(err("Vector name cannot be empty or whitespace"));
+        return Err(err("vector_name: Vector name cannot be empty or whitespace"));
     }
     if !RE_ALPHANUMERIC.is_match(t) {
         return Err(err(
-            "Vector name can only contain letters, numbers, underscores, and hyphens",
+            "vector_name: Vector name can only contain letters, numbers, underscores, and hyphens",
         ));
     }
-    if t.len() > MAX_VECTOR_NAME_LENGTH {
+    if t.chars().count() > MAX_VECTOR_NAME_LENGTH {
         return Err(err(format!(
-            "Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
+            "vector_name: Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
         )));
     }
     Ok(())
@@ -701,20 +703,20 @@ pub fn normalize_search_query_python(q: &mut SearchQuery) {
 pub fn validate_search_query(q: &SearchQuery) -> VResult {
     // @field_validator('query') — validate_query_not_empty
     if q.query.trim().is_empty() {
-        return Err(err("Query string cannot be empty or whitespace"));
+        return Err(err("query: Query string cannot be empty or whitespace"));
     }
-    if q.query.len() > MAX_SEARCH_QUERY_LENGTH {
+    if q.query.chars().count() > MAX_SEARCH_QUERY_LENGTH {
         return Err(err(format!(
-            "ensure this value has at most {MAX_SEARCH_QUERY_LENGTH} characters"
+            "query: ensure this value has at most {MAX_SEARCH_QUERY_LENGTH} characters"
         )));
     }
     // limit ge=1, le=MAX_SEARCH_LIMIT
     if q.settings.limit < 1 {
-        return Err(err("ensure this value is greater than or equal to 1"));
+        return Err(err("limit: ensure this value is greater than or equal to 1"));
     }
     if q.settings.limit > MAX_SEARCH_LIMIT {
         return Err(err(format!(
-            "ensure this value is less than or equal to {MAX_SEARCH_LIMIT}"
+            "limit: ensure this value is less than or equal to {MAX_SEARCH_LIMIT}"
         )));
     }
     // @field_validator('score_threshold') — validate_score_threshold_number
@@ -724,22 +726,22 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
     if let Some(tags) = &q.settings.document_tags {
         if tags.len() > MAX_DOCUMENT_TAGS_COUNT {
             return Err(err(format!(
-                "ensure this value has at most {MAX_DOCUMENT_TAGS_COUNT} items"
+                "document_tags: ensure this value has at most {MAX_DOCUMENT_TAGS_COUNT} items"
             )));
         }
         for tag in tags {
             let t = tag.trim();
             if t.is_empty() {
-                return Err(err("Document tags cannot be empty or whitespace"));
+                return Err(err("document_tags: Document tags cannot be empty or whitespace"));
             }
             if t.contains('|') {
                 return Err(err(format!(
-                    "Document tag '{t}' cannot contain pipe characters (|)"
+                    "document_tags: Document tag '{t}' cannot contain pipe characters (|)"
                 )));
             }
-            if t.len() > MAX_DOCUMENT_TAG_LENGTH {
+            if t.chars().count() > MAX_DOCUMENT_TAG_LENGTH {
                 return Err(err(format!(
-                    "Document tag '{t}' exceeds {MAX_DOCUMENT_TAG_LENGTH} character limit"
+                    "document_tags: Document tag '{t}' exceeds {MAX_DOCUMENT_TAG_LENGTH} character limit"
                 )));
             }
         }
@@ -762,16 +764,16 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
 /// modeled value trimmed (Rust: [`normalize_search_query_python`] afterward).
 fn validate_search_vector_name(name: &str) -> VResult {
     if name.trim().is_empty() {
-        return Err(err("Vector name cannot be empty or whitespace"));
+        return Err(err("vector_weights.vector_name: Vector name cannot be empty or whitespace"));
     }
     if !RE_ALPHANUMERIC.is_match(name) {
         return Err(err(
-            "Vector name can only contain letters, numbers, underscores, and hyphens",
+            "vector_weights.vector_name: Vector name can only contain letters, numbers, underscores, and hyphens",
         ));
     }
-    if name.len() > MAX_VECTOR_NAME_LENGTH {
+    if name.chars().count() > MAX_VECTOR_NAME_LENGTH {
         return Err(err(format!(
-            "Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
+            "vector_weights.vector_name: Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
         )));
     }
     Ok(())

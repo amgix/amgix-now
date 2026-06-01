@@ -1425,10 +1425,10 @@ pub fn validate_metadata_types(
 fn metadata_string_value_len(value: &serde_json::Value) -> usize {
     if let Some(map) = value.as_object() {
         if let Some(v) = map.get("value").and_then(|v| v.as_str()) {
-            return v.len();
+            return v.chars().count();
         }
     }
-    value.as_str().map(|s| s.len()).unwrap_or(0)
+    value.as_str().map(|s| s.chars().count()).unwrap_or(0)
 }
 
 fn infer_metadata_value_type(value: &serde_json::Value) -> String {

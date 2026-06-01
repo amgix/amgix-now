@@ -123,7 +123,7 @@ fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<s
             }))
         }
         serde_json::Value::String(s) => {
-            if s.len() > MAX_METADATA_VALUE_LENGTH {
+            if s.chars().count() > MAX_METADATA_VALUE_LENGTH {
                 return Err(format!(
                     "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
                 ));
@@ -181,7 +181,7 @@ fn validate_and_clone_meta_inner(
 ) -> Result<serde_json::Value, String> {
     match type_str {
         "string" => match val.as_str() {
-            Some(s) if s.len() > MAX_METADATA_VALUE_LENGTH => Err(format!(
+            Some(s) if s.chars().count() > MAX_METADATA_VALUE_LENGTH => Err(format!(
                 "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
             )),
             Some(s) => Ok(serde_json::Value::String(s.to_string())),

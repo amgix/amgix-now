@@ -71,12 +71,29 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Va
 }
 
 /// FastAPI / Pydantic shape: `{ "detail": [ { "type", "loc", "msg", "input" }, ... ] }`.
+///
+/// Validation error messages use `"field: message"` format; this function splits on the first `: `
+/// to build a proper `loc` array matching Pydantic's output.
 fn validation_error_detail_list(msg: impl Into<String>) -> Value {
+    let msg = msg.into();
+    let (loc, clean_msg) = if let Some(colon_pos) = msg.find(": ") {
+        let field_path = &msg[..colon_pos];
+        let rest = &msg[colon_pos + 2..];
+        // Build loc from path segments split by '.'
+        // e.g. "documents[0].description" -> ["body", "documents[0]", "description"]
+        let mut loc_parts: Vec<Value> = vec![json!("body")];
+        for part in field_path.split('.') {
+            loc_parts.push(json!(part));
+        }
+        (json!(loc_parts), rest.to_string())
+    } else {
+        (json!(["body"]), msg)
+    };
     json!([
         {
             "type": "validation_error",
-            "loc": ["body"],
-            "msg": msg.into(),
+            "loc": loc,
+            "msg": clean_msg,
             "input": Value::Null
         }
     ])
