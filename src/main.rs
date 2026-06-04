@@ -455,15 +455,15 @@ async fn get_collection_stats(
         }
     }
 
-    let stats = app.db.get_collection_stats(&real_collection_name).await.map_err(|e| {
+    let doc_count = app.db.get_document_count(&real_collection_name).await.map_err(|e| {
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get collection stats: {e}"),
+            format!("Failed to get document count: {e}"),
         )
     })?;
 
     Ok(Json(CollectionStatsResponse {
-        doc_count: stats.doc_count,
+        doc_count: doc_count as i64,
         queue: QueueInfo::empty(),
     }))
 }

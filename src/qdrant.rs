@@ -394,6 +394,16 @@ impl QdrantDb {
     }
 
     // -----------------------------------------------------------------------
+    // get_document_count
+    // -----------------------------------------------------------------------
+
+    pub async fn get_document_count(&self, collection_name: &str) -> Result<u64, DbError> {
+        let info = self.client.get_collection(collection_name).await?;
+        info.result
+            .and_then(|r| r.points_count)
+            .ok_or_else(|| DbError::Config("Collection points_count is unavailable".into()))
+    }
+
     // get_collection_stats / set_collection_stats
     // -----------------------------------------------------------------------
 
