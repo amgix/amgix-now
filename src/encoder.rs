@@ -82,6 +82,11 @@ const STATS_LOCKS_CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Max REST **bulk** jobs buffered (`try_send` → HTTP 429 when full).
 pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
+/// Max bulk jobs processed concurrently.
+pub const BULK_UPSERT_CONCURRENT_MAX: usize = 4;
+/// Bulk batches are split into chunks of this size before vectorization so each chunk
+/// runs on its own rayon thread concurrently with other chunks.
+pub const BULK_UPSERT_CHUNK_SIZE: usize = 32;
 /// Max single-doc micro-batches pulled off the singles ingress channel **in flight at once**.
 /// One task still `recv`s and builds batches; this bounds overlapping `document_upsert_bulk_internal`
 /// work (per parallel micro-batch pipeline).
@@ -518,23 +523,84 @@ impl UpsertIngress {
             let doc_locks = doc_locks.clone();
             let index_pool = Arc::clone(&index_pool);
             tokio::spawn(async move {
-                while let Some(BulkIngressJob {
-                    collection_name,
-                    documents,
-                    reply,
-                }) = bulk_rx.recv().await
-                {
-                    let out = document_upsert_bulk_internal(
-                        &db,
-                        &cache,
-                        &stats_batcher,
-                        &doc_locks,
-                        &index_pool,
-                        &collection_name,
-                        documents,
-                    )
-                    .await;
-                    let _ = reply.send(out);
+                let mut inflight = JoinSet::new();
+                loop {
+                    while inflight.len() >= BULK_UPSERT_CONCURRENT_MAX {
+                        if let Some(res) = inflight.join_next().await {
+                            if let Err(e) = res {
+                                tracing::warn!("bulk upsert task panicked: {e}");
+                            }
+                        }
+                    }
+                    match bulk_rx.recv().await {
+                        None => break,
+                        Some(BulkIngressJob {
+                            collection_name,
+                            documents,
+                            reply,
+                        }) => {
+                            let db = Arc::clone(&db);
+                            let cache = cache.clone();
+                            let stats_batcher = stats_batcher.clone();
+                            let doc_locks = doc_locks.clone();
+                            let index_pool = Arc::clone(&index_pool);
+                            inflight.spawn(async move {
+                                // Split into chunks and run each concurrently so vectorization
+                                // spreads across rayon threads rather than running serially.
+                                let chunks: Vec<Vec<Document>> = documents
+                                    .chunks(BULK_UPSERT_CHUNK_SIZE)
+                                    .map(|c| c.to_vec())
+                                    .collect();
+                                let mut chunk_set = JoinSet::new();
+                                for chunk in chunks {
+                                    let db = Arc::clone(&db);
+                                    let cache = cache.clone();
+                                    let stats_batcher = stats_batcher.clone();
+                                    let doc_locks = doc_locks.clone();
+                                    let index_pool = Arc::clone(&index_pool);
+                                    let collection_name = collection_name.clone();
+                                    chunk_set.spawn(async move {
+                                        document_upsert_bulk_internal(
+                                            &db,
+                                            &cache,
+                                            &stats_batcher,
+                                            &doc_locks,
+                                            &index_pool,
+                                            &collection_name,
+                                            chunk,
+                                        )
+                                        .await
+                                    });
+                                }
+                                // Collect all chunk results; fail fast on first error.
+                                let mut all_skipped: Vec<String> = Vec::new();
+                                let mut first_err: Option<UpsertSyncError> = None;
+                                while let Some(res) = chunk_set.join_next().await {
+                                    match res {
+                                        Ok(Ok(skipped)) => all_skipped.extend(skipped),
+                                        Ok(Err(e)) => {
+                                            if first_err.is_none() {
+                                                first_err = Some(e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("bulk chunk task panicked: {e}");
+                                        }
+                                    }
+                                }
+                                let out = match first_err {
+                                    Some(e) => Err(e),
+                                    None => Ok(all_skipped),
+                                };
+                                let _ = reply.send(out);
+                            });
+                        }
+                    }
+                }
+                while let Some(res) = inflight.join_next().await {
+                    if let Err(e) = res {
+                        tracing::warn!("bulk upsert task panicked: {e}");
+                    }
                 }
             })
         };

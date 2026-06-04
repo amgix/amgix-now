@@ -65,31 +65,33 @@ fn embed_dense_batch(
 
     for chunk in docs.chunks(DENSE_MODEL_BATCH_SIZE) {
         let chunk_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let batch = chunk_refs.len();
 
-        // Tokenize — produces padded tensors already on device.
+        // Tokenize — encode_batch with add_special_tokens=true pads all sequences to the
+        // same length, so every encoding has identical len.
         let tokens = embedder
             .tokenizer
             .encode_batch(chunk_refs, true)
             .map_err(|e| format!("Tokenization failed for '{model_id}': {e}"))?;
 
+        let seq_len = tokens[0].get_ids().len();
+
+        // Build flat [batch * seq_len] buffers — one H2D transfer each instead of
+        // batch-many small transfers followed by Tensor::stack.
+        let mut flat_ids: Vec<u32> = Vec::with_capacity(batch * seq_len);
+        let mut flat_mask: Vec<u32> = Vec::with_capacity(batch * seq_len);
+        for t in &tokens {
+            flat_ids.extend_from_slice(t.get_ids());
+            flat_mask.extend_from_slice(t.get_attention_mask());
+        }
+
         // Serialize GPU model inference across all threads when running on GPU.
         let _gpu_guard = maybe_gpu_inference_permit();
 
-        let token_id_vecs: Vec<Tensor> = tokens
-            .iter()
-            .map(|t| Tensor::new(t.get_ids(), device))
-            .collect::<candle_core::Result<_>>()
-            .map_err(|e| format!("Tensor creation failed: {e}"))?;
-        let mask_vecs: Vec<Tensor> = tokens
-            .iter()
-            .map(|t| Tensor::new(t.get_attention_mask(), device))
-            .collect::<candle_core::Result<_>>()
-            .map_err(|e| format!("Tensor creation failed: {e}"))?;
-
-        let token_ids = Tensor::stack(&token_id_vecs, 0)
-            .map_err(|e| format!("stack token_ids failed: {e}"))?;
-        let attention_mask = Tensor::stack(&mask_vecs, 0)
-            .map_err(|e| format!("stack attention_mask failed: {e}"))?;
+        let token_ids = Tensor::from_slice(&flat_ids, (batch, seq_len), device)
+            .map_err(|e| format!("token_ids tensor failed: {e}"))?;
+        let attention_mask = Tensor::from_slice(&flat_mask, (batch, seq_len), device)
+            .map_err(|e| format!("attention_mask tensor failed: {e}"))?;
         let token_type_ids = token_ids
             .zeros_like()
             .map_err(|e| format!("zeros_like failed: {e}"))?;
@@ -113,14 +115,20 @@ fn embed_dense_batch(
             pooled
         };
 
-        // Single host copy for the whole mini-batch.
-        let batch_vecs = pooled
-            .to_dtype(DType::F32)
-            .map_err(|e| format!("to_dtype(f32) failed: {e}"))?
-            .to_vec2::<f32>()
-            .map_err(|e| format!("to_vec2 failed: {e}"))?;
+        // Copy to host; cast to F32 only if the output isn't already F32.
+        let pooled_f32 = if pooled.dtype() == DType::F32 {
+            pooled
+        } else {
+            pooled
+                .to_dtype(DType::F32)
+                .map_err(|e| format!("to_dtype(f32) failed: {e}"))?
+        };
 
         drop(_gpu_guard);
+
+        let batch_vecs = pooled_f32
+            .to_vec2::<f32>()
+            .map_err(|e| format!("to_vec2 failed: {e}"))?;
 
         results.extend(batch_vecs);
     }
