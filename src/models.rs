@@ -5,10 +5,37 @@
 //! so data written by either service is readable by the other.
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+/// Serialize metadata by flattening `{"value": x, "type": y}` objects to just `x`.
+fn serialize_metadata_flat<S>(
+    metadata: &Option<HashMap<String, Value>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match metadata {
+        None => serializer.serialize_none(),
+        Some(map) => {
+            let flat: HashMap<&str, &Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    let out = if let Value::Object(obj) = v {
+                        obj.get("value").unwrap_or(v)
+                    } else {
+                        v
+                    };
+                    (k.as_str(), out)
+                })
+                .collect();
+            flat.serialize(serializer)
+        }
+    }
+}
 
 /// Stable [`Hash`] for [`serde_json::Value`] (object keys sorted so order-independent).
 pub(crate) fn hash_json_value<H: Hasher>(v: &Value, state: &mut H) {
@@ -466,7 +493,7 @@ pub struct Document {
     pub description: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_metadata_flat")]
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub custom_vectors: Option<Vec<CustomDocumentVector>>,
@@ -782,7 +809,7 @@ pub struct SearchResult {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_metadata_flat")]
     pub metadata: Option<HashMap<String, Value>>,
     pub score: f64,
     #[serde(default)]
