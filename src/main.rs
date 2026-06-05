@@ -39,7 +39,7 @@ use models::{
     parse_document_timestamp_for_api, BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
     CollectionExistsResponse, CollectionStatsResponse, Document, DocumentStatus,
     DocumentStatusResponse, OkResponse, QueueInfo, QueuedDocumentStatus, ReadyResponse, SearchQuery,
-    SearchResult, SystemInfoResponse, VectorConfigInternal, VersionResponse,
+    SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
 use validation::{
@@ -546,7 +546,7 @@ async fn upsert_documents_bulk(
 async fn get_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
-) -> Result<Json<Document>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
     let rows = app
@@ -573,7 +573,9 @@ async fn get_document(
             )
         })?;
 
-    Ok(Json(Document::from(doc_with)))
+    let val = serde_json::to_value(Document::from(doc_with))
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {e}")))?;
+    Ok(Json(models::flatten_doc_metadata(val)))
 }
 
 /// `GET /v1/collections/{collection_name}/documents/{document_id}/status` — mirrors Python
@@ -665,7 +667,7 @@ async fn search(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
     payload: Result<Json<SearchQuery>, JsonRejection>,
-) -> Result<Json<Vec<SearchResult>>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Json(mut query) = payload.map_err(|e| json_rejection_response(e))?;
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_search_query(&query).map_err(validation_error)?;
@@ -676,7 +678,17 @@ async fn search(
         .search(real_collection_name.to_string(), query)
         .await
     {
-        Ok(results) => Ok(Json(results)),
+        Ok(results) => {
+            let vals: Vec<Value> = results
+                .into_iter()
+                .map(|r| {
+                    serde_json::to_value(r)
+                        .map(models::flatten_doc_metadata)
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            Ok(Json(Value::Array(vals)))
+        }
         Err(SearchError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(SearchError::InvalidFilter(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
         Err(SearchError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),

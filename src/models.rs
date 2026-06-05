@@ -5,36 +5,32 @@
 //! so data written by either service is readable by the other.
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-/// Serialize metadata by flattening `{"value": x, "type": y}` objects to just `x`.
-fn serialize_metadata_flat<S>(
-    metadata: &Option<HashMap<String, Value>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match metadata {
-        None => serializer.serialize_none(),
-        Some(map) => {
-            let flat: HashMap<&str, &Value> = map
+/// Flatten a serialized document/search-result JSON value's `metadata` field
+/// from `{"key": {"value": x, "type": y}}` to `{"key": x}`.
+/// Called at the API response boundary so internal/storage serialization is unaffected.
+pub fn flatten_doc_metadata(mut val: Value) -> Value {
+    if let Value::Object(ref mut map) = val {
+        if let Some(Value::Object(meta)) = map.get_mut("metadata") {
+            let flattened: serde_json::Map<String, Value> = meta
                 .iter()
                 .map(|(k, v)| {
                     let out = if let Value::Object(obj) = v {
-                        obj.get("value").unwrap_or(v)
+                        obj.get("value").cloned().unwrap_or_else(|| v.clone())
                     } else {
-                        v
+                        v.clone()
                     };
-                    (k.as_str(), out)
+                    (k.clone(), out)
                 })
                 .collect();
-            flat.serialize(serializer)
+            *meta = flattened;
         }
     }
+    val
 }
 
 /// Stable [`Hash`] for [`serde_json::Value`] (object keys sorted so order-independent).
@@ -493,7 +489,7 @@ pub struct Document {
     pub description: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(default, serialize_with = "serialize_metadata_flat")]
+    #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub custom_vectors: Option<Vec<CustomDocumentVector>>,
@@ -829,7 +825,7 @@ pub struct SearchResult {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(default, serialize_with = "serialize_metadata_flat")]
+    #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
     pub score: f64,
     #[serde(default)]
