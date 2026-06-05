@@ -1182,7 +1182,11 @@ pub(crate) async fn document_upsert_bulk_internal(
     }
 
     if !to_patch.is_empty() {
-        let patch_docs: Vec<Document> = to_patch.iter().map(|d| (*d).clone()).collect();
+        let mut patch_docs: Vec<Document> = to_patch.iter().map(|d| (*d).clone()).collect();
+        for doc in &mut patch_docs {
+            normalize_document_metadata_inplace(doc)
+                .map_err(UpsertSyncError::Vectorization)?;
+        }
         db.patch_documents(collection_name, &patch_docs, collection_config.store_content)
             .await
             .map_err(UpsertSyncError::Db)?;
