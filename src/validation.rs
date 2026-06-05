@@ -115,7 +115,6 @@ pub fn validate_document(doc: &Document) -> VResult {
             validate_custom_document_vector(c)?;
         }
     }
-    validate_at_least_one_field(doc)?;
     Ok(())
 }
 
@@ -343,19 +342,6 @@ fn json_type_name(v: &Value) -> &'static str {
         Value::Array(_) => "list",
         Value::Object(_) => "dict",
     }
-}
-
-/// @model_validator — validate_at_least_one_field_has_content
-fn validate_at_least_one_field(doc: &Document) -> VResult {
-    let has_name = doc.name.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let has_desc = doc.description.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    let has_content = doc.content.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    if !has_name && !has_desc && !has_content {
-        return Err(err(
-            "Document must have at least one non-empty field (name, description, or content)",
-        ));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
