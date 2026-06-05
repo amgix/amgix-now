@@ -1,6 +1,7 @@
 mod amgix;
 mod common;
 mod encoder;
+mod filter_parser;
 mod functions;
 mod models;
 mod qdrant;

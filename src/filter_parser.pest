@@ -1,0 +1,36 @@
+// Filter expression grammar.
+// Operator precedence (tightest to loosest): NOT > AND > OR
+// Mirrors the lark grammar in amgix-server/src/core/models/filter_parser.py
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+// Entry point
+expr = { or_expr }
+
+or_expr  = { and_expr  ~ (OR  ~ and_expr)* }
+and_expr = { not_expr  ~ (AND ~ not_expr)* }
+not_expr = { NOT ~ not_expr | atom }
+atom     = { "(" ~ expr ~ ")" | comparison }
+
+comparison = { field ~ op ~ value }
+
+field = @{ ASCII_ALPHANUMERIC ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+op = { lte | gte | lt | gt | eq }
+lte = { "<=" }
+gte = { ">=" }
+lt  = { "<" }
+gt  = { ">" }
+eq  = { "=" }
+
+value = { string | float | integer | boolean | null }
+
+string  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+float   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ "-"? ~ ASCII_DIGIT+ }
+boolean = @{ ^"true" | ^"false" }
+null    = @{ ^"null" }
+
+AND = _{ ^"AND" }
+OR  = _{ ^"OR" }
+NOT = _{ ^"NOT" }

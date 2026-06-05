@@ -617,7 +617,7 @@ fn default_weight() -> f64 {
     1.0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MetadataFilter {
     #[serde(rename = "and", default)]
     pub and_: Option<Vec<MetadataFilter>>,
@@ -655,6 +655,26 @@ impl Hash for MetadataFilter {
         self.op.hash(state);
         if let Some(ref v) = self.value {
             hash_json_value(v, state);
+        }
+    }
+}
+
+fn deserialize_metadata_filter<'de, D>(deserializer: D) -> Result<Option<MetadataFilter>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Option<Value> = Option::deserialize(deserializer)?;
+    match v {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            let filter = crate::filter_parser::parse_filter(&s)
+                .map_err(serde::de::Error::custom)?;
+            Ok(Some(filter))
+        }
+        Some(other) => {
+            let filter: MetadataFilter =
+                serde_json::from_value(other).map_err(serde::de::Error::custom)?;
+            Ok(Some(filter))
         }
     }
 }
@@ -706,7 +726,7 @@ pub struct SearchQuerySettings {
     pub document_tags: Option<Vec<String>>,
     #[serde(default)]
     pub document_tags_match_all: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_metadata_filter")]
     pub metadata_filter: Option<MetadataFilter>,
     #[serde(default)]
     pub raw_scores: bool,
