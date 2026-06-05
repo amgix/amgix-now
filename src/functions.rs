@@ -266,7 +266,6 @@ pub fn doc_payload_only(
     let mut val = serde_json::to_value(doc)
         .map_err(|e| DbError::Config(format!("Serialization error: {e}")))?;
     if let serde_json::Value::Object(ref mut map) = val {
-        map.remove("custom_vectors");
         if !store_content {
             map.remove("content");
         }
