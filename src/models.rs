@@ -216,7 +216,7 @@ fn default_top_k() -> u32 {
     DEFAULT_TOP_K
 }
 
-fn default_wmtr_word_weight() -> u32 {
+fn default_wmtr_word_ratio() -> u32 {
     DEFAULT_WMTR_WORD_WEIGHT_PERCENTAGE
 }
 
@@ -274,8 +274,8 @@ pub struct VectorConfig {
     pub dimensions: Option<u32>,
     #[serde(default = "default_top_k")]
     pub top_k: u32,
-    #[serde(default = "default_wmtr_word_weight")]
-    pub wmtr_word_weight: u32,
+    #[serde(default = "default_wmtr_word_ratio", alias = "wmtr_word_weight")]
+    pub wmtr_word_ratio: u32,
     #[serde(default = "default_index_fields")]
     pub index_fields: Vec<DocumentField>,
     #[serde(default = "default_language_code")]
@@ -332,8 +332,8 @@ pub struct VectorConfigInternal {
     pub dimensions: Option<u32>,
     #[serde(default = "default_top_k")]
     pub top_k: u32,
-    #[serde(default = "default_wmtr_word_weight")]
-    pub wmtr_word_weight: u32,
+    #[serde(default = "default_wmtr_word_ratio", alias = "wmtr_word_weight")]
+    pub wmtr_word_ratio: u32,
     #[serde(default = "default_index_fields")]
     pub index_fields: Vec<DocumentField>,
     #[serde(default = "default_language_code")]
@@ -364,7 +364,7 @@ impl From<VectorConfig> for VectorConfigInternal {
             query_revision: v.query_revision,
             dimensions: v.dimensions,
             top_k: v.top_k,
-            wmtr_word_weight: v.wmtr_word_weight,
+            wmtr_word_ratio: v.wmtr_word_ratio,
             index_fields: v.index_fields,
             language_default_code: v.language_default_code,
             language_detect: v.language_detect,
@@ -392,7 +392,7 @@ impl From<VectorConfigInternal> for VectorConfig {
             query_revision: None,
             dimensions: v.dimensions,
             top_k: v.top_k,
-            wmtr_word_weight: v.wmtr_word_weight,
+            wmtr_word_ratio: v.wmtr_word_ratio,
             index_fields: v.index_fields,
             language_default_code: v.language_default_code,
             language_detect: v.language_detect,

@@ -416,7 +416,7 @@ pub fn validate_collection_config(config: &CollectionConfig) -> VResult {
 fn validate_vector_config(v: &VectorConfig) -> VResult {
     validate_vector_name(&v.name)?;
     validate_top_k(v.top_k)?;
-    validate_wmtr_word_weight(v.wmtr_word_weight)?;
+    validate_wmtr_word_ratio(v.wmtr_word_ratio)?;
     validate_language_confidence(v.language_confidence)?;
     validate_language_code(Some(v.language_default_code.as_str()))?;
     validate_dense_distance(&v.dense_distance, &v.vector_type)?;
@@ -567,8 +567,8 @@ fn validate_top_k(top_k: u32) -> VResult {
     Ok(())
 }
 
-/// wmtr_word_weight ge=0, le=100
-fn validate_wmtr_word_weight(w: u32) -> VResult {
+/// wmtr_word_ratio ge=0, le=100
+fn validate_wmtr_word_ratio(w: u32) -> VResult {
     if w > 100 {
         return Err(err("ensure this value is less than or equal to 100"));
     }

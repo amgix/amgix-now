@@ -20,7 +20,7 @@ impl VectorBase for WMTRVector {
             text.to_string(),
             lang_code,
             config.top_k as usize,
-            config.wmtr_word_weight as u32,
+            config.wmtr_word_ratio as u32,
             true,
             avgdl as f32,
             trigram_weight as f32,
