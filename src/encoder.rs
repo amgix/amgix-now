@@ -906,7 +906,10 @@ async fn run_search_bucket(
         let res = db
             .search(collection_name, &qv, &collection_config)
             .await
-            .map_err(SearchError::Db);
+            .map_err(|e| match e {
+                DbError::Config(m) => SearchError::InvalidFilter(m),
+                e => SearchError::Db(e),
+            });
         let _ = j.reply.send(res);
     }
 }

@@ -698,7 +698,10 @@ async fn fetch_documents(
         .db
         .fetch_documents(&real_collection_name, &request, &collection_config)
         .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))?;
+        .map_err(|e| match e {
+            DbError::Config(m) => api_error(StatusCode::BAD_REQUEST, m),
+            e => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")),
+        })?;
 
     let documents: Vec<Value> = response
         .documents

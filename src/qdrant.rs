@@ -664,7 +664,7 @@ impl QdrantDb {
         query: &SearchQueryWithVectors,
         collection_config: &CollectionConfigInternal,
     ) -> Result<Vec<SearchResult>, DbError> {
-        let final_filter = build_search_filter(query, collection_config);
+        let final_filter = build_search_filter(query, collection_config)?;
 
         // weight_lookup: (vector_name, field) → weight — mirrors Python lines 585-586.
         let weight_lookup: HashMap<(String, String), f64> = query
@@ -873,7 +873,7 @@ impl QdrantDb {
         request: &DocumentFetchRequest,
         collection_config: &CollectionConfigInternal,
     ) -> Result<DocumentFetchResponse, DbError> {
-        let scroll_filter = build_fetch_filter(request, collection_config);
+        let scroll_filter = build_fetch_filter(request, collection_config)?;
 
         let offset: Option<PointId> = request.after.as_deref().map(|s| s.to_string().into());
 
@@ -915,7 +915,7 @@ impl QdrantDb {
 fn build_fetch_filter(
     request: &DocumentFetchRequest,
     collection_config: &CollectionConfigInternal,
-) -> Option<Filter> {
+) -> Result<Option<Filter>, DbError> {
     let mut conditions: Vec<Condition> = Vec::new();
 
     if let Some(tags) = &request.document_tags {
@@ -963,9 +963,10 @@ fn build_fetch_filter(
     let metadata_filter = request
         .metadata_filter
         .as_ref()
-        .and_then(|mf| convert_metadata_filter(mf, collection_config));
+        .map(|mf| convert_metadata_filter(mf, collection_config))
+        .transpose()?;
 
-    match (tags_filter, metadata_filter) {
+    Ok(match (tags_filter, metadata_filter) {
         (Some(tf), Some(mf)) => Some(Filter {
             must: vec![tf.into(), mf.into()],
             ..Default::default()
@@ -973,17 +974,41 @@ fn build_fetch_filter(
         (Some(tf), None) => Some(tf),
         (None, Some(mf)) => Some(mf),
         (None, None) => None,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Search filter — mirrors _convert_metadata_filter_to_qdrant
 // ---------------------------------------------------------------------------
 
+fn parse_datetime_for_filter(s: &str) -> Result<Timestamp, DbError> {
+    let normalized = s.replace('Z', "+00:00");
+    // RFC3339 / ISO 8601 with timezone
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
+        return Ok(Timestamp { seconds: dt.timestamp(), nanos: dt.timestamp_subsec_nanos() as i32 });
+    }
+    // Naive datetime with fractional seconds
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Ok(Timestamp { seconds: dt.and_utc().timestamp(), nanos: dt.and_utc().timestamp_subsec_nanos() as i32 });
+    }
+    // Naive datetime without fractional seconds
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(Timestamp { seconds: dt.and_utc().timestamp(), nanos: 0 });
+    }
+    // Date only — treat as start of day UTC
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
+        let dt = d.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        return Ok(Timestamp { seconds: dt.timestamp(), nanos: 0 });
+    }
+    Err(DbError::Config(format!(
+        "Invalid datetime value '{s}': expected ISO 8601 (e.g. '2021-05-01', '2021-05-01T00:00:00Z')"
+    )))
+}
+
 fn build_search_filter(
     query: &SearchQueryWithVectors,
     collection_config: &CollectionConfigInternal,
-) -> Option<Filter> {
+) -> Result<Option<Filter>, DbError> {
     let mut search_conditions: Vec<Condition> = Vec::new();
 
     if let Some(tags) = &query.settings.document_tags {
@@ -1034,9 +1059,10 @@ fn build_search_filter(
         .settings
         .metadata_filter
         .as_ref()
-        .and_then(|mf| convert_metadata_filter(mf, collection_config));
+        .map(|mf| convert_metadata_filter(mf, collection_config))
+        .transpose()?;
 
-    match (tags_filter, metadata_filter) {
+    Ok(match (tags_filter, metadata_filter) {
         (Some(tf), Some(mf)) => Some(Filter {
             must: vec![tf.into(), mf.into()],
             ..Default::default()
@@ -1044,15 +1070,15 @@ fn build_search_filter(
         (Some(tf), None) => Some(tf),
         (None, Some(mf)) => Some(mf),
         (None, None) => None,
-    }
+    })
 }
 
 fn convert_metadata_filter(
     node: &MetadataFilter,
     collection_config: &CollectionConfigInternal,
-) -> Option<Filter> {
+) -> Result<Filter, DbError> {
     let condition = convert_metadata_node(node, collection_config)?;
-    Some(match condition {
+    Ok(match condition {
         Condition {
             condition_one_of: Some(qdrant_client::qdrant::condition::ConditionOneOf::Filter(f)),
         } => f,
@@ -1063,7 +1089,7 @@ fn convert_metadata_filter(
 fn convert_metadata_node(
     node: &MetadataFilter,
     collection_config: &CollectionConfigInternal,
-) -> Option<Condition> {
+) -> Result<Condition, DbError> {
     if let Some(key) = &node.key {
         let field_path = format!("metadata.{key}.value");
 
@@ -1088,7 +1114,9 @@ fn convert_metadata_node(
                 Some(serde_json::Value::Number(n)) => {
                     qdrant_client::qdrant::r#match::MatchValue::Integer(n.as_i64().unwrap_or(0))
                 }
-                _ => return None,
+                _ => return Err(DbError::Config(format!(
+                    "Metadata filter for key '{key}': missing or unsupported value type for operator '{op}'"
+                ))),
             };
             let field_condition: Condition = FieldCondition {
                 key: field_path,
@@ -1102,43 +1130,46 @@ fn convert_metadata_node(
                 field_condition
             }
         } else {
-            let val_f64 = raw_value.and_then(|v| v.as_f64()).unwrap_or(0.0);
             let val_str = raw_value.and_then(|v| v.as_str()).map(str::to_string);
 
             if is_datetime {
-                let ts = val_str
-                    .as_deref()
-                    .and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(&s.replace('Z', "+00:00")).ok()
-                    })
-                    .map(|dt| Timestamp {
-                        seconds: dt.timestamp(),
-                        nanos: dt.timestamp_subsec_nanos() as i32,
-                    });
+                let s = val_str.as_deref().ok_or_else(|| DbError::Config(format!(
+                    "Metadata filter for key '{key}': datetime value must be a string"
+                )))?;
+                let ts = parse_datetime_for_filter(s)?;
                 let mut dr = DatetimeRange::default();
                 match op {
-                    "gt" => dr.gt = ts,
-                    "gte" => dr.gte = ts,
-                    "lt" => dr.lt = ts,
-                    "lte" => dr.lte = ts,
-                    _ => return None,
+                    "gt" => dr.gt = Some(ts),
+                    "gte" => dr.gte = Some(ts),
+                    "lt" => dr.lt = Some(ts),
+                    "lte" => dr.lte = Some(ts),
+                    _ => return Err(DbError::Config(format!(
+                        "Unsupported operator '{op}' for datetime key '{key}'"
+                    ))),
                 }
                 FieldCondition { key: field_path, datetime_range: Some(dr), ..Default::default() }
                     .into()
             } else {
+                let val_f64 = raw_value
+                    .and_then(|v| v.as_f64())
+                    .ok_or_else(|| DbError::Config(format!(
+                        "Metadata filter for key '{key}': numeric value required for operator '{op}'"
+                    )))?;
                 let mut r = Range::default();
                 match op {
                     "gt" => r.gt = Some(val_f64),
                     "gte" => r.gte = Some(val_f64),
                     "lt" => r.lt = Some(val_f64),
                     "lte" => r.lte = Some(val_f64),
-                    _ => return None,
+                    _ => return Err(DbError::Config(format!(
+                        "Unsupported operator '{op}' for key '{key}'"
+                    ))),
                 }
                 FieldCondition { key: field_path, range: Some(r), ..Default::default() }.into()
             }
         };
 
-        return Some(condition);
+        return Ok(condition);
     }
 
     let must: Vec<Condition> = node
@@ -1146,27 +1177,24 @@ fn convert_metadata_node(
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter_map(|c| convert_metadata_node(c, collection_config))
-        .collect();
+        .map(|c| convert_metadata_node(c, collection_config))
+        .collect::<Result<_, _>>()?;
     let should: Vec<Condition> = node
         .or_
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .filter_map(|c| convert_metadata_node(c, collection_config))
-        .collect();
+        .map(|c| convert_metadata_node(c, collection_config))
+        .collect::<Result<_, _>>()?;
     let must_not: Vec<Condition> = node
         .not_
         .as_deref()
-        .and_then(|n| convert_metadata_node(n, collection_config))
+        .map(|n| convert_metadata_node(n, collection_config))
+        .transpose()?
         .into_iter()
         .collect();
 
-    if must.is_empty() && should.is_empty() && must_not.is_empty() {
-        return None;
-    }
-
-    Some(Condition {
+    Ok(Condition {
         condition_one_of: Some(qdrant_client::qdrant::condition::ConditionOneOf::Filter(
             Filter { must, should, must_not, ..Default::default() },
         )),
