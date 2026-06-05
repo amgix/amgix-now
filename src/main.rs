@@ -31,14 +31,15 @@ use common::{
     AMGIX_VARIANT, VectorType, DATABASE_KIND,
 };
 use encoder::{
-    document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_models,
-    CollectionConfigCache, NamedLocks, SearchError, SearchIngress, StatsUpdateBatcher,
-    UpsertIngress, UpsertSyncError,
+    document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_metadata_filter,
+    validate_models, CollectionConfigCache, NamedLocks, SearchError, SearchIngress,
+    StatsUpdateBatcher, UpsertIngress, UpsertSyncError,
 };
 use models::{
     parse_document_timestamp_for_api, BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
-    CollectionExistsResponse, CollectionStatsResponse, Document, DocumentStatus,
-    DocumentStatusResponse, OkResponse, QueueInfo, QueuedDocumentStatus, ReadyResponse, SearchQuery,
+    CollectionExistsResponse, CollectionStatsResponse, Document, DocumentFetchRequest,
+    DocumentStatus, DocumentStatusResponse, OkResponse, QueueInfo,
+    QueuedDocumentStatus, ReadyResponse, SearchQuery,
     SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
@@ -663,6 +664,58 @@ async fn delete_document(
     }
 }
 
+async fn fetch_documents(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+    payload: Result<Json<DocumentFetchRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(request) = payload.map_err(|e| json_rejection_response(e))?;
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+
+    if request.page_size == 0 || request.page_size > 1000 {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "page_size must be between 1 and 1000".to_string(),
+        ));
+    }
+
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = app
+        .db
+        .get_collection_info_internal(&real_collection_name)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(m) => api_error(StatusCode::NOT_FOUND, m),
+            e => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")),
+        })?;
+
+    if let Some(mf) = &request.metadata_filter {
+        validate_metadata_filter(&collection_config, mf)
+            .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
+    let response = app
+        .db
+        .fetch_documents(&real_collection_name, &request, &collection_config)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))?;
+
+    let documents: Vec<Value> = response
+        .documents
+        .into_iter()
+        .map(|d| {
+            serde_json::to_value(d)
+                .map(models::flatten_doc_metadata)
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "documents": documents,
+        "after": response.after,
+    })))
+}
+
 async fn search(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
@@ -982,6 +1035,10 @@ async fn main() {
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}",
             get(get_document).delete(delete_document),
+        )
+        .route(
+            "/v1/collections/{collection_name}/documents/fetch",
+            post(fetch_documents),
         )
         .route(
             "/v1/collections/{collection_name}/search",

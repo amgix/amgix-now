@@ -18,7 +18,7 @@ use qdrant_client::qdrant::{
     Match, PointId, PointStruct, PointsIdsList, PointsSelector, PointsUpdateOperation,
     QueryBatchPointsBuilder, QueryPointsBuilder, Range,
     RepeatedStrings, SparseIndexConfig, SparseVector, SparseVectorConfig,
-    SparseVectorParams, Timestamp, UpdateBatchPointsBuilder, UpsertPointsBuilder,
+    SparseVectorParams, ScrollPointsBuilder, Timestamp, UpdateBatchPointsBuilder, UpsertPointsBuilder,
     VectorInput, VectorParams, VectorParamsMap, VectorsConfig, Modifier, Query,
     PayloadIncludeSelector,
 };
@@ -34,7 +34,8 @@ use crate::functions::{
     rrf_fuse, scored_point_id, search_result_from_point, split_first_underscore,
 };
 use crate::models::{
-    CollectionConfigInternal, Document, DocumentWithVectors, MetadataFilter, MetadataIndex,
+    CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse,
+    DocumentWithVectors, MetadataFilter, MetadataIndex,
     SearchQueryWithVectors, SearchResult, VectorScore,
 };
 
@@ -858,6 +859,120 @@ impl QdrantDb {
             .await?;
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fetch_documents — cursor-based pagination via Qdrant scroll
+// ---------------------------------------------------------------------------
+
+impl QdrantDb {
+    pub async fn fetch_documents(
+        &self,
+        collection_name: &str,
+        request: &DocumentFetchRequest,
+        collection_config: &CollectionConfigInternal,
+    ) -> Result<DocumentFetchResponse, DbError> {
+        let scroll_filter = build_fetch_filter(request, collection_config);
+
+        let offset: Option<PointId> = request.after.as_deref().map(|s| s.to_string().into());
+
+        let mut builder = ScrollPointsBuilder::new(collection_name)
+            .limit(request.page_size)
+            .with_payload(true)
+            .with_vectors(false);
+        if let Some(f) = scroll_filter {
+            builder = builder.filter(f);
+        }
+        if let Some(off) = offset {
+            builder = builder.offset(off);
+        }
+
+        let response = self.client.scroll(builder).await?;
+
+        let documents: Vec<Document> = response
+            .result
+            .iter()
+            .map(|point| {
+                let payload_json = serde_json::Value::Object(
+                    point.payload.iter().map(|(k, v)| (k.clone(), qdrant_val_to_json(v))).collect(),
+                );
+                serde_json::from_value(payload_json)
+                    .map_err(|e| DbError::Config(format!("Document deserialization error: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let after = response.next_page_offset.map(|pid| match pid.point_id_options {
+            Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(u)) => u,
+            Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)) => n.to_string(),
+            None => String::new(),
+        });
+
+        Ok(DocumentFetchResponse { documents, after })
+    }
+}
+
+fn build_fetch_filter(
+    request: &DocumentFetchRequest,
+    collection_config: &CollectionConfigInternal,
+) -> Option<Filter> {
+    let mut conditions: Vec<Condition> = Vec::new();
+
+    if let Some(tags) = &request.document_tags {
+        if !tags.is_empty() {
+            if request.document_tags_match_all {
+                for tag in tags {
+                    conditions.push(
+                        FieldCondition {
+                            key: "tags".to_string(),
+                            r#match: Some(Match {
+                                match_value: Some(
+                                    qdrant_client::qdrant::r#match::MatchValue::Keyword(tag.clone()),
+                                ),
+                            }),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                }
+            } else {
+                conditions.push(
+                    FieldCondition {
+                        key: "tags".to_string(),
+                        r#match: Some(Match {
+                            match_value: Some(
+                                qdrant_client::qdrant::r#match::MatchValue::Keywords(
+                                    RepeatedStrings { strings: tags.clone() },
+                                ),
+                            ),
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    let tags_filter = if conditions.is_empty() {
+        None
+    } else {
+        Some(Filter { must: conditions, ..Default::default() })
+    };
+
+    let metadata_filter = request
+        .metadata_filter
+        .as_ref()
+        .and_then(|mf| convert_metadata_filter(mf, collection_config));
+
+    match (tags_filter, metadata_filter) {
+        (Some(tf), Some(mf)) => Some(Filter {
+            must: vec![tf.into(), mf.into()],
+            ..Default::default()
+        }),
+        (Some(tf), None) => Some(tf),
+        (None, Some(mf)) => Some(mf),
+        (None, None) => None,
     }
 }
 

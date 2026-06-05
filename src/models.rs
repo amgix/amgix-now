@@ -831,3 +831,32 @@ pub struct SearchResult {
     #[serde(default)]
     pub vector_scores: Vec<VectorScore>,
 }
+
+// ---------------------------------------------------------------------------
+// DocumentFetchRequest / DocumentFetchResponse
+// Mirrors amgix-server DocumentFetchRequest / DocumentFetchResponse.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentFetchRequest {
+    #[serde(default = "default_fetch_page_size")]
+    pub page_size: u32,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_metadata_filter")]
+    pub metadata_filter: Option<MetadataFilter>,
+    #[serde(default)]
+    pub document_tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub document_tags_match_all: bool,
+}
+
+fn default_fetch_page_size() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentFetchResponse {
+    pub documents: Vec<Document>,
+    pub after: Option<String>,
+}
