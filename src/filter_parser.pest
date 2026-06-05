@@ -16,9 +16,10 @@ comparison = { field ~ op ~ value }
 
 field = @{ ASCII_ALPHANUMERIC ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
 
-op = { lte | gte | lt | gt | eq }
+op = { lte | gte | neq | lt | gt | eq }
 lte = { "<=" }
 gte = { ">=" }
+neq = { "!=" }
 lt  = { "<" }
 gt  = { ">" }
 eq  = { "=" }

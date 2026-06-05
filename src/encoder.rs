@@ -1556,9 +1556,9 @@ fn validate_filter_node(
 
         match *expected_type {
             "string" => {
-                if op != "eq" {
+                if op != "eq" && op != "neq" {
                     return Err(MetadataFilterError(format!(
-                        "Metadata filter operator '{op}' is not supported for string key '{key}'. Use 'eq'."
+                        "Metadata filter operator '{op}' is not supported for string key '{key}'. Use 'eq' or '!='."
                     )));
                 }
                 match value {
@@ -1585,9 +1585,9 @@ fn validate_filter_node(
                 }
             }
             "boolean" => {
-                if op != "eq" {
+                if op != "eq" && op != "neq" {
                     return Err(MetadataFilterError(format!(
-                        "Metadata filter operator '{op}' is not supported for boolean key '{key}'. Use 'eq'."
+                        "Metadata filter operator '{op}' is not supported for boolean key '{key}'. Use 'eq' or '!='."
                     )));
                 }
                 match value {

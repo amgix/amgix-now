@@ -53,8 +53,14 @@ fn build_filter(pair: Pair<Rule>) -> Result<MetadataFilter, String> {
         }
         Rule::not_expr => {
             let inner = pair.into_inner().next().unwrap();
-            let operand = build_filter(inner)?;
-            Ok(MetadataFilter { not_: Some(Box::new(operand)), ..Default::default() })
+            if inner.as_rule() == Rule::atom {
+                // no NOT keyword — just pass through the atom
+                build_filter(inner)
+            } else {
+                // NOT ~ not_expr branch
+                let operand = build_filter(inner)?;
+                Ok(MetadataFilter { not_: Some(Box::new(operand)), ..Default::default() })
+            }
         }
         Rule::atom => {
             let inner = pair.into_inner().next().unwrap();
@@ -82,6 +88,7 @@ fn parse_op(pair: Pair<Rule>) -> Result<String, String> {
     let inner = pair.into_inner().next().unwrap();
     let op = match inner.as_rule() {
         Rule::eq  => "eq",
+        Rule::neq => "neq",
         Rule::lt  => "lt",
         Rule::gt  => "gt",
         Rule::lte => "lte",

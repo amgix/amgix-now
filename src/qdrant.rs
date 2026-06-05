@@ -1077,7 +1077,7 @@ fn convert_metadata_node(
         let op = node.op.as_deref().unwrap_or("");
         let raw_value = node.value.as_ref();
 
-        let condition: Condition = if op == "eq" {
+        let condition: Condition = if op == "eq" || op == "neq" {
             let match_value = match raw_value {
                 Some(serde_json::Value::String(s)) => {
                     qdrant_client::qdrant::r#match::MatchValue::Keyword(s.clone())
@@ -1090,12 +1090,17 @@ fn convert_metadata_node(
                 }
                 _ => return None,
             };
-            FieldCondition {
+            let field_condition: Condition = FieldCondition {
                 key: field_path,
                 r#match: Some(Match { match_value: Some(match_value) }),
                 ..Default::default()
             }
-            .into()
+            .into();
+            if op == "neq" {
+                Filter { must_not: vec![field_condition], ..Default::default() }.into()
+            } else {
+                field_condition
+            }
         } else {
             let val_f64 = raw_value.and_then(|v| v.as_f64()).unwrap_or(0.0);
             let val_str = raw_value.and_then(|v| v.as_str()).map(str::to_string);
