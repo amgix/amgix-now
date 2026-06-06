@@ -295,7 +295,7 @@ impl QdrantDb {
         collection_name: &str,
         mi: &MetadataIndex,
     ) -> Result<(), DbError> {
-        let field_path = format!("metadata.{}.value", mi.key);
+        let field_path = format!("metadata.{}", mi.key);
         let field_type = match mi.value_type.as_str() {
             "string" => FieldType::Keyword,
             "integer" => FieldType::Integer,
@@ -1091,7 +1091,7 @@ fn convert_metadata_node(
     collection_config: &CollectionConfigInternal,
 ) -> Result<Condition, DbError> {
     if let Some(key) = &node.key {
-        let field_path = format!("metadata.{key}.value");
+        let field_path = format!("metadata.{key}");
 
         let is_datetime = collection_config
             .metadata_indexes

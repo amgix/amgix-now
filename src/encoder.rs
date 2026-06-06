@@ -1134,7 +1134,13 @@ pub(crate) async fn document_upsert_bulk_internal(
         Err(e) => return Err(UpsertSyncError::Db(e)),
     };
 
-    // Mirrors Python: validate_metadata_types(collection_config, document) per doc.
+    // Normalize metadata first (unwrap legacy {value,type} form to flat values),
+    // then validate types against collection indexes.
+    let mut documents = documents;
+    for doc in &mut documents {
+        normalize_document_metadata_inplace(doc)
+            .map_err(UpsertSyncError::Vectorization)?;
+    }
     for doc in &documents {
         validate_metadata_types(&collection_config, doc)
             .map_err(|e| UpsertSyncError::Vectorization(e.0))?;
@@ -1473,18 +1479,17 @@ pub fn validate_metadata_types(
 
     for idx in indexes {
         if let Some(value) = metadata.get(&idx.key) {
-            if is_null_meta_value(value) {
+            if value.is_null() {
                 continue;
             }
-            let actual_type = infer_metadata_value_type(value);
-            if actual_type != idx.value_type {
+            if !metadata_value_matches_index_type(value, &idx.value_type) {
                 return Err(MetadataTypeError(format!(
-                    "Metadata key '{}' has type '{}' but collection config expects type '{}'",
-                    idx.key, actual_type, idx.value_type
+                    "Metadata key '{}' value does not match collection config expected type '{}'",
+                    idx.key, idx.value_type
                 )));
             }
             if idx.value_type == "string" {
-                let len = metadata_string_value_len(value);
+                let len = value.as_str().map(|s| s.chars().count()).unwrap_or(0);
                 if len > MAX_INDEXED_METADATA_VALUE_LENGTH {
                     return Err(MetadataTypeError(format!(
                         "String metadata value for key '{}' exceeds {} character limit",
@@ -1498,37 +1503,17 @@ pub fn validate_metadata_types(
     Ok(())
 }
 
-fn is_null_meta_value(value: &serde_json::Value) -> bool {
-    if let Some(map) = value.as_object() {
-        return map.get("value").map(|v| v.is_null()).unwrap_or(false);
-    }
-    value.is_null()
-}
-
-fn metadata_string_value_len(value: &serde_json::Value) -> usize {
-    if let Some(map) = value.as_object() {
-        if let Some(v) = map.get("value").and_then(|v| v.as_str()) {
-            return v.chars().count();
-        }
-    }
-    value.as_str().map(|s| s.chars().count()).unwrap_or(0)
-}
-
-fn infer_metadata_value_type(value: &serde_json::Value) -> String {
-    // Handle both raw primitives and MetaValue dict form {"value": ..., "type": "..."}
-    if let Some(map) = value.as_object() {
-        if let Some(type_val) = map.get("type").and_then(|t| t.as_str()) {
-            return type_val.to_string();
-        }
-    }
-    match value {
-        serde_json::Value::String(_) => "string".to_string(),
-        serde_json::Value::Bool(_) => "boolean".to_string(),
-        serde_json::Value::Number(n) => {
-            if n.is_i64() || n.is_u64() { "integer".to_string() } else { "float".to_string() }
-        }
-        serde_json::Value::Array(_) => "array".to_string(),
-        serde_json::Value::Object(_) | serde_json::Value::Null => "object".to_string(),
+fn metadata_value_matches_index_type(value: &serde_json::Value, expected_type: &str) -> bool {
+    match expected_type {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "float" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "datetime" => value
+            .as_str()
+            .map(|s| chrono::DateTime::parse_from_rfc3339(&s.replace('Z', "+00:00")).is_ok())
+            .unwrap_or(false),
+        _ => false,
     }
 }
 

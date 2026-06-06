@@ -10,9 +10,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-/// Flatten a serialized document/search-result JSON value's `metadata` field
-/// from `{"key": {"value": x, "type": y}}` to `{"key": x}`.
-/// Called at the API response boundary so internal/storage serialization is unaffected.
+/// Unwrap legacy wrapped metadata entries `{"key": {"value": x, "type": y}}` to flat `{"key": x}`.
+/// Called at the API response boundary for reads of pre-migration storage data.
 pub fn flatten_doc_metadata(mut val: Value) -> Value {
     if let Value::Object(ref mut map) = val {
         if let Some(Value::Object(meta)) = map.get_mut("metadata") {

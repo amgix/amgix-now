@@ -73,11 +73,11 @@ pub fn linear_weighted_score_fuse(
 
 // ---------------------------------------------------------------------------
 // Metadata normalization — mirrors `document.py` `Document.validate_metadata`
-// converting primitives + `{value,type}` dicts → canonical MetaValue maps for payload.
+// converting primitives + `{value,type}` dicts → flat values for storage.
 // Qdrant / API JSON must match Python `Document.model_dump()` shape.
 // ---------------------------------------------------------------------------
 
-/// Mirrors Python `validate_metadata`: every entry becomes `{ "value": …, "type": "…" }`.
+/// Mirrors Python `validate_metadata`: every entry is stored as a flat JSON value.
 ///
 /// Caller must ensure API validation (`validation::validate_document`) already passed.
 pub fn normalize_document_metadata_inplace(doc: &mut Document) -> Result<(), String> {
@@ -97,30 +97,19 @@ pub fn normalize_document_metadata_inplace(doc: &mut Document) -> Result<(), Str
 fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<serde_json::Value, String> {
     match value {
         serde_json::Value::Object(map) => {
-            let val = map.get("value").ok_or_else(|| {
-                format!(
-                    "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
-                )
-            })?;
-            let type_str = map
-                .get("type")
-                .and_then(|t| t.as_str())
-                .ok_or_else(|| {
-                    format!(
-                        "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
-                    )
-                })?;
-            let allowed = ["string", "integer", "float", "boolean", "datetime", "array", "object"];
-            if !allowed.contains(&type_str) {
-                return Err(format!(
-                    "Invalid metadata type '{type_str}' for key '{key}'. Allowed types: {allowed:?}"
-                ));
+            if let (Some(val), Some(type_str)) = (
+                map.get("value"),
+                map.get("type").and_then(|t| t.as_str()),
+            ) {
+                let allowed = ["string", "integer", "float", "boolean", "datetime", "array", "object"];
+                if !allowed.contains(&type_str) {
+                    return Err(format!(
+                        "Invalid metadata type '{type_str}' for key '{key}'. Allowed types: {allowed:?}"
+                    ));
+                }
+                return validate_and_clone_meta_inner(key, type_str, val);
             }
-            let inner = validate_and_clone_meta_inner(key, type_str, val)?;
-            Ok(serde_json::json!({
-                "value": inner,
-                "type": type_str
-            }))
+            Ok(serde_json::Value::Object(map))
         }
         serde_json::Value::String(s) => {
             if s.chars().count() > MAX_METADATA_VALUE_LENGTH {
@@ -128,36 +117,12 @@ fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<s
                     "String metadata value for key '{key}' exceeds {MAX_METADATA_VALUE_LENGTH} character limit"
                 ));
             }
-            Ok(serde_json::json!({
-                "value": s,
-                "type": "string"
-            }))
+            Ok(serde_json::Value::String(s))
         }
-        serde_json::Value::Bool(b) => Ok(serde_json::json!({
-            "value": b,
-            "type": "boolean"
-        })),
-        serde_json::Value::Number(n) => {
-            if n.as_i64().is_some() || n.as_u64().is_some() {
-                Ok(serde_json::json!({
-                    "value": n,
-                    "type": "integer"
-                }))
-            } else {
-                Ok(serde_json::json!({
-                    "value": n,
-                    "type": "float"
-                }))
-            }
-        }
-        serde_json::Value::Array(arr) => Ok(serde_json::json!({
-            "value": arr,
-            "type": "array"
-        })),
-        serde_json::Value::Null => Ok(serde_json::json!({
-            "value": null,
-            "type": "object"
-        })),
+        serde_json::Value::Bool(b) => Ok(serde_json::Value::Bool(b)),
+        serde_json::Value::Number(n) => Ok(serde_json::Value::Number(n)),
+        serde_json::Value::Array(arr) => Ok(serde_json::Value::Array(arr)),
+        serde_json::Value::Null => Ok(serde_json::Value::Null),
         other => Err(format!(
             "Metadata value for key '{key}' must be string, int, float, bool, array, null, or MetaValue (required for datetime and object), got {}",
             json_type_name(&other)
