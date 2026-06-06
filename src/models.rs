@@ -776,6 +776,8 @@ pub struct SearchQuerySettings {
     pub wmtr_trigram_weight: f64,
     #[serde(default = "default_fusion_mode")]
     pub fusion_mode: String,
+    #[serde(default, deserialize_with = "crate::join_parser::deserialize_join_field")]
+    pub join: Option<crate::join_parser::JoinField>,
 }
 
 impl PartialEq for SearchQuerySettings {
@@ -790,6 +792,7 @@ impl PartialEq for SearchQuerySettings {
             && self.raw_scores == other.raw_scores
             && self.wmtr_trigram_weight.to_bits() == other.wmtr_trigram_weight.to_bits()
             && self.fusion_mode == other.fusion_mode
+            && self.join == other.join
     }
 }
 
@@ -807,6 +810,7 @@ impl Hash for SearchQuerySettings {
         self.raw_scores.hash(state);
         self.wmtr_trigram_weight.to_bits().hash(state);
         self.fusion_mode.hash(state);
+        self.join.hash(state);
     }
 }
 
@@ -876,6 +880,8 @@ pub struct SearchResult {
     pub score: f64,
     #[serde(default)]
     pub vector_scores: Vec<VectorScore>,
+    #[serde(default)]
+    pub joined: Option<HashMap<String, Vec<Document>>>,
 }
 
 // ---------------------------------------------------------------------------

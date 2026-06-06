@@ -910,6 +910,117 @@ impl QdrantDb {
 
         Ok(DocumentFetchResponse { documents, after })
     }
+
+    pub async fn fetch_documents_by_metadata_values(
+        &self,
+        collection_name: &str,
+        metadata_key: &str,
+        values: &[serde_json::Value],
+        metadata_filter: Option<&MetadataFilter>,
+        collection_config: &CollectionConfigInternal,
+        max_documents: usize,
+    ) -> Result<Vec<Document>, DbError> {
+        if values.is_empty() || max_documents == 0 {
+            return Ok(vec![]);
+        }
+
+        let field_path = format!("metadata.{metadata_key}");
+        let in_condition = join_values_match_condition(&field_path, values)?;
+
+        let extra_filter = metadata_filter
+            .map(|mf| convert_metadata_filter(mf, collection_config))
+            .transpose()?;
+
+        let scroll_filter = match extra_filter {
+            Some(extra) => Filter {
+                must: vec![in_condition, extra.into()],
+                ..Default::default()
+            },
+            None => Filter {
+                must: vec![in_condition],
+                ..Default::default()
+            },
+        };
+
+        let response = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(collection_name)
+                    .limit(max_documents as u32)
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .filter(scroll_filter),
+            )
+            .await?;
+
+        response
+            .result
+            .iter()
+            .map(|point| {
+                let payload_json = serde_json::Value::Object(
+                    point
+                        .payload
+                        .iter()
+                        .map(|(k, v)| (k.clone(), qdrant_val_to_json(v)))
+                        .collect(),
+                );
+                serde_json::from_value(payload_json)
+                    .map_err(|e| DbError::Config(format!("Document deserialization error: {e}")))
+            })
+            .collect()
+    }
+}
+
+fn join_values_match_condition(
+    field_path: &str,
+    values: &[serde_json::Value],
+) -> Result<Condition, DbError> {
+    if values.len() == 1 {
+        let match_value = json_to_match_value(&values[0])?;
+        return Ok(FieldCondition {
+            key: field_path.to_string(),
+            r#match: Some(Match {
+                match_value: Some(match_value),
+            }),
+            ..Default::default()
+        }
+        .into());
+    }
+
+    let should: Result<Vec<Condition>, DbError> = values
+        .iter()
+        .map(|v| {
+            let match_value = json_to_match_value(v)?;
+            Ok(FieldCondition {
+                key: field_path.to_string(),
+                r#match: Some(Match {
+                    match_value: Some(match_value),
+                }),
+                ..Default::default()
+            }
+            .into())
+        })
+        .collect();
+
+    Ok(Filter {
+        should: should?,
+        ..Default::default()
+    }
+    .into())
+}
+
+fn json_to_match_value(
+    v: &serde_json::Value,
+) -> Result<qdrant_client::qdrant::r#match::MatchValue, DbError> {
+    use qdrant_client::qdrant::r#match::MatchValue;
+    match v {
+        serde_json::Value::String(s) => Ok(MatchValue::Keyword(s.clone())),
+        serde_json::Value::Bool(b) => Ok(MatchValue::Boolean(*b)),
+        serde_json::Value::Number(n) => Ok(MatchValue::Integer(n.as_i64().unwrap_or(0))),
+        _ => Err(DbError::Config(
+            "Join metadata value must be a string, boolean, or number".to_string(),
+        )),
+    }
 }
 
 fn build_fetch_filter(

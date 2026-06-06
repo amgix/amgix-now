@@ -3,8 +3,10 @@ mod common;
 mod encoder;
 mod filter_parser;
 mod functions;
+mod join_parser;
 mod models;
 mod qdrant;
+mod search_join;
 mod validation;
 mod vectors;
 

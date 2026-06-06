@@ -910,6 +910,16 @@ async fn run_search_bucket(
                 DbError::Config(m) => SearchError::InvalidFilter(m),
                 e => SearchError::Db(e),
             });
+        let res = match (&res, &j.query.settings.join) {
+            (Ok(results), Some(join)) => crate::search_join::enrich_search_results_with_joins(
+                db,
+                cache,
+                results.clone(),
+                join,
+            )
+            .await,
+            _ => res,
+        };
         let _ = j.reply.send(res);
     }
 }
@@ -1399,6 +1409,7 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
             raw_scores: false,
             wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
             fusion_mode: "rrf".to_string(),
+            join: None,
         },
     };
 

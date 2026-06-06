@@ -1,0 +1,54 @@
+// Join expression grammar. Filter rules mirror filter_parser.pest (same as Python join_parser + FILTER_EXPR_GRAMMAR).
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+join_expr = { collection ~ join_keys? ~ filter_part? ~ EOI }
+
+collection = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+
+join_keys = { "[" ~ parent_ref ~ "=" ~ child_ref ~ "]" }
+
+parent_ref = { parent_id | parent_meta }
+parent_id = { "$id" }
+parent_meta = { "$.meta." ~ meta_key }
+
+child_ref = { child_id | child_meta }
+child_id = { "$$id" }
+child_meta = { "$$.meta." ~ meta_key }
+
+meta_key = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+filter_part = { "(" ~ expr ~ ")" }
+
+// --- filter expression (mirrors filter_parser.pest) ---
+
+expr = { or_expr }
+
+or_expr  = { and_expr ~ (OR ~ and_expr)* }
+and_expr = { not_expr ~ (AND ~ not_expr)* }
+not_expr = { NOT ~ not_expr | atom }
+atom     = { "(" ~ expr ~ ")" | comparison }
+
+comparison = { field ~ op ~ value }
+
+field = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+op = { lte | gte | neq | lt | gt | eq }
+lte = { "<=" }
+gte = { ">=" }
+neq = { "!=" }
+lt  = { "<" }
+gt  = { ">" }
+eq  = { "=" }
+
+value = { string | float | integer | boolean | null }
+
+string  = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+float   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ "-"? ~ ASCII_DIGIT+ }
+boolean = @{ ^"true" | ^"false" }
+null    = @{ ^"null" }
+
+AND = _{ ^"AND" }
+OR  = _{ ^"OR" }
+NOT = _{ ^"NOT" }
