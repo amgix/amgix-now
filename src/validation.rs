@@ -370,10 +370,6 @@ pub fn validate_bulk_upload(req: &mut BulkUploadRequest) -> VResult {
 // ---------------------------------------------------------------------------
 
 pub fn validate_collection_config(config: &CollectionConfig) -> VResult {
-    // @field_validator('vectors') — validate_vectors_not_empty
-    if config.vectors.is_empty() {
-        return Err(err("Collection must have at least one vector configuration"));
-    }
     // @field_validator('vectors') — validate_unique_vector_names
     let mut seen = std::collections::HashSet::new();
     let mut duplicates: Vec<&str> = Vec::new();

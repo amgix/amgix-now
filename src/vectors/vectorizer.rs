@@ -92,6 +92,9 @@ pub fn route_embed_dispatch(
                 WMTRVector.get_sparse_vector(config, docs, av, trigram_weight)?,
             ))
         }
+        VectorType::Noop => Ok(RoutedEmbed::Sparse(
+            vec![(vec![], vec![]); docs.len()],
+        )),
         VectorType::DenseCustom | VectorType::SparseCustom => Err(
             "route_embed_dispatch must not be called for dense_custom/sparse_custom".to_string(),
         ),
@@ -233,6 +236,20 @@ impl Vectorizer {
                                         sparse_values: Some(values.clone()),
                                     });
                                     token_lengths[doc_idx].insert(field_vector_name, token_length);
+                                }
+                            }
+                        }
+                        VectorType::Noop => {
+                            for doc_idx in 0..n {
+                                for field in &config.index_fields {
+                                    vectors[doc_idx].push(VectorData {
+                                        vector_name: config.name.clone(),
+                                        field: *field,
+                                        vector_type: config.vector_type.clone(),
+                                        dense_vector: None,
+                                        sparse_indices: Some(vec![]),
+                                        sparse_values: Some(vec![]),
+                                    });
                                 }
                             }
                         }
@@ -611,6 +628,20 @@ impl Vectorizer {
                             dense_vector: None,
                             sparse_indices: Some(indices.clone()),
                             sparse_values: Some(values.clone()),
+                        });
+                    }
+                }
+            }
+            VectorType::Noop => {
+                for qi in 0..n {
+                    for field in fields {
+                        per_query[qi].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: None,
+                            sparse_indices: Some(vec![]),
+                            sparse_values: Some(vec![]),
                         });
                     }
                 }

@@ -292,13 +292,60 @@ pub struct VectorConfig {
     pub keep_case: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_noop_vectors() -> Vec<VectorConfig> {
+    vec![VectorConfig {
+        name: "noop".to_string(),
+        vector_type: VectorType::Noop,
+        model: None,
+        revision: None,
+        query_model: None,
+        query_revision: None,
+        dimensions: None,
+        top_k: default_top_k(),
+        wmtr_word_ratio: default_wmtr_word_ratio(),
+        index_fields: default_index_fields(),
+        language_default_code: default_language_code(),
+        language_detect: false,
+        language_confidence: default_language_confidence(),
+        normalization: None,
+        dense_distance: default_dense_distance(),
+        keep_case: default_keep_case(),
+    }]
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CollectionConfig {
     pub vectors: Vec<VectorConfig>,
-    #[serde(default = "default_store_content")]
     pub store_content: bool,
-    #[serde(default)]
     pub metadata_indexes: Option<Vec<MetadataIndex>>,
+}
+
+impl<'de> Deserialize<'de> for CollectionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            vectors: Option<Vec<VectorConfig>>,
+            #[serde(default = "default_store_content")]
+            store_content: bool,
+            #[serde(default)]
+            metadata_indexes: Option<Vec<MetadataIndex>>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let vectors = match raw.vectors {
+            Some(v) if !v.is_empty() => v,
+            _ => default_noop_vectors(),
+        };
+        Ok(CollectionConfig {
+            vectors,
+            store_content: raw.store_content,
+            metadata_indexes: raw.metadata_indexes,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

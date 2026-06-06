@@ -71,6 +71,8 @@ pub enum VectorType {
     Keyword,
     DenseCustom,
     SparseCustom,
+    /// Always returns an empty sparse vector.
+    Noop,
 }
 
 impl<'de> serde::Deserialize<'de> for VectorType {
@@ -90,6 +92,7 @@ impl<'de> serde::Deserialize<'de> for VectorType {
             "keyword" => Ok(Self::Wmtr),
             "dense_custom" => Ok(Self::DenseCustom),
             "sparse_custom" => Ok(Self::SparseCustom),
+            "noop" => Ok(Self::Noop),
             _ => Err(serde::de::Error::custom(format!(
                 "unknown vector type: {lowered:?} (expected snake_case literal, e.g. dense_model)",
             ))),
@@ -139,6 +142,7 @@ impl VectorType {
                 | VectorType::Wmtr
                 | VectorType::Keyword
                 | VectorType::SparseCustom
+                | VectorType::Noop
         )
     }
 }
@@ -155,6 +159,7 @@ impl std::fmt::Display for VectorType {
             VectorType::Keyword => "keyword",
             VectorType::DenseCustom => "dense_custom",
             VectorType::SparseCustom => "sparse_custom",
+            VectorType::Noop => "noop",
         };
         write!(f, "{s}")
     }
