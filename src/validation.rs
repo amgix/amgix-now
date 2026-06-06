@@ -213,28 +213,27 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
             )));
         }
 
-        // value must be a MetaValue dict: {"value": ..., "type": "..."}
-        // or a primitive (string / number / bool).
-        // Python converts primitives → MetaValue; we validate the raw JSON shape here.
+        // MetaValue dict form {"value": ..., "type": "..."}, plain object dict, or primitive.
         match value {
             Value::Object(map) => {
-                // MetaValue dict form
-                let val = map.get("value").ok_or_else(|| {
-                    err(format!(
-                        "metadata.{key}: value is a dict but missing 'value' or 'type' fields. \
-                        For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
-                    ))
-                })?;
-                let type_str = map
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| {
+                if map.len() == 2 && map.contains_key("value") && map.contains_key("type") {
+                    let val = map.get("value").ok_or_else(|| {
                         err(format!(
                             "metadata.{key}: value is a dict but missing 'value' or 'type' fields. \
                             For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
                         ))
                     })?;
-                validate_meta_value_type(key, type_str, val)?;
+                    let type_str = map
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .ok_or_else(|| {
+                            err(format!(
+                                "metadata.{key}: value is a dict but missing 'value' or 'type' fields. \
+                                For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
+                            ))
+                        })?;
+                    validate_meta_value_type(key, type_str, val)?;
+                }
             }
             Value::String(s) => {
                 // raw string → type = "string"

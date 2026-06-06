@@ -97,16 +97,18 @@ pub fn normalize_document_metadata_inplace(doc: &mut Document) -> Result<(), Str
 fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<serde_json::Value, String> {
     match value {
         serde_json::Value::Object(map) => {
-            if let (Some(val), Some(type_str)) = (
-                map.get("value"),
-                map.get("type").and_then(|t| t.as_str()),
-            ) {
+            if map.len() == 2
+                && map.contains_key("value")
+                && map.get("type").and_then(|t| t.as_str()).is_some()
+            {
+                let type_str = map.get("type").and_then(|t| t.as_str()).unwrap();
                 let allowed = ["string", "integer", "float", "boolean", "datetime", "array", "object"];
                 if !allowed.contains(&type_str) {
                     return Err(format!(
                         "Invalid metadata type '{type_str}' for key '{key}'. Allowed types: {allowed:?}"
                     ));
                 }
+                let val = map.get("value").unwrap();
                 return validate_and_clone_meta_inner(key, type_str, val);
             }
             Ok(serde_json::Value::Object(map))
