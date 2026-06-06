@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 /// Unwrap legacy wrapped metadata entries `{"key": {"value": x, "type": y}}` to flat `{"key": x}`.
+/// Only applies when the object contains exactly `value` and `type` keys.
 /// Called at the API response boundary for reads of pre-migration storage data.
 pub fn flatten_doc_metadata(mut val: Value) -> Value {
     if let Value::Object(ref mut map) = val {
@@ -19,7 +20,11 @@ pub fn flatten_doc_metadata(mut val: Value) -> Value {
                 .iter()
                 .map(|(k, v)| {
                     let out = if let Value::Object(obj) = v {
-                        obj.get("value").cloned().unwrap_or_else(|| v.clone())
+                        if obj.len() == 2 && obj.contains_key("value") && obj.contains_key("type") {
+                            obj.get("value").cloned().unwrap_or_else(|| v.clone())
+                        } else {
+                            v.clone()
+                        }
                     } else {
                         v.clone()
                     };
