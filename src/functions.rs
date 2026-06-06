@@ -154,8 +154,12 @@ fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<s
             "value": arr,
             "type": "array"
         })),
+        serde_json::Value::Null => Ok(serde_json::json!({
+            "value": null,
+            "type": "object"
+        })),
         other => Err(format!(
-            "Metadata value for key '{key}' must be string, int, float, bool, array, or MetaValue (required for datetime and object), got {}",
+            "Metadata value for key '{key}' must be string, int, float, bool, array, null, or MetaValue (required for datetime and object), got {}",
             json_type_name(&other)
         )),
     }
@@ -251,11 +255,11 @@ fn validate_and_clone_meta_inner(
             }
         }
         "object" => {
-            if val.is_object() {
+            if val.is_object() || val.is_null() {
                 Ok(val.clone())
             } else {
                 Err(format!(
-                    "Metadata value for key '{key}' must be object for type='object', got {}",
+                    "Metadata value for key '{key}' must be object or null for type='object', got {}",
                     json_type_name(val)
                 ))
             }

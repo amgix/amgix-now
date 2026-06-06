@@ -1473,6 +1473,9 @@ pub fn validate_metadata_types(
 
     for idx in indexes {
         if let Some(value) = metadata.get(&idx.key) {
+            if is_null_meta_value(value) {
+                continue;
+            }
             let actual_type = infer_metadata_value_type(value);
             if actual_type != idx.value_type {
                 return Err(MetadataTypeError(format!(
@@ -1493,6 +1496,13 @@ pub fn validate_metadata_types(
     }
 
     Ok(())
+}
+
+fn is_null_meta_value(value: &serde_json::Value) -> bool {
+    if let Some(map) = value.as_object() {
+        return map.get("value").map(|v| v.is_null()).unwrap_or(false);
+    }
+    value.is_null()
 }
 
 fn metadata_string_value_len(value: &serde_json::Value) -> usize {
@@ -1518,8 +1528,7 @@ fn infer_metadata_value_type(value: &serde_json::Value) -> String {
             if n.is_i64() || n.is_u64() { "integer".to_string() } else { "float".to_string() }
         }
         serde_json::Value::Array(_) => "array".to_string(),
-        serde_json::Value::Object(_) => "object".to_string(),
-        serde_json::Value::Null => "unknown".to_string(),
+        serde_json::Value::Object(_) | serde_json::Value::Null => "object".to_string(),
     }
 }
 

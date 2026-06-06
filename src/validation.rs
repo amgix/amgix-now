@@ -250,10 +250,11 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
                 let _ = n;
             }
             Value::Array(_) => {} // raw array → type = "array"
+            Value::Null => {} // raw null → type = "object" with null value
             other => {
                 let type_name = json_type_name(other);
                 return Err(err(format!(
-                    "metadata.{key}: value must be string, int, float, bool, array, or MetaValue \
+                    "metadata.{key}: value must be string, int, float, bool, array, null, or MetaValue \
                     (required for datetime and object), got {type_name}"
                 )));
             }
@@ -339,11 +340,11 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
             }
         }
         "object" => {
-            if val.is_object() {
+            if val.is_object() || val.is_null() {
                 Ok(())
             } else {
                 Err(err(format!(
-                    "metadata.{key}: value must be object for type='object', got {}",
+                    "metadata.{key}: value must be object or null for type='object', got {}",
                     json_type_name(val)
                 )))
             }
