@@ -110,7 +110,7 @@ fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<s
                         "Metadata value for key '{key}' is a dict but missing 'value' or 'type' fields. For datetime, use {{\"value\": \"...\", \"type\": \"datetime\"}}"
                     )
                 })?;
-            let allowed = ["string", "integer", "float", "boolean", "datetime"];
+            let allowed = ["string", "integer", "float", "boolean", "datetime", "array", "object"];
             if !allowed.contains(&type_str) {
                 return Err(format!(
                     "Invalid metadata type '{type_str}' for key '{key}'. Allowed types: {allowed:?}"
@@ -150,8 +150,12 @@ fn normalize_one_metadata_value(key: &str, value: serde_json::Value) -> Result<s
                 }))
             }
         }
+        serde_json::Value::Array(arr) => Ok(serde_json::json!({
+            "value": arr,
+            "type": "array"
+        })),
         other => Err(format!(
-            "Metadata value for key '{key}' must be string, int, float, bool, or MetaValue (required for datetime), got {}",
+            "Metadata value for key '{key}' must be string, int, float, bool, array, or MetaValue (required for datetime and object), got {}",
             json_type_name(&other)
         )),
     }
@@ -236,6 +240,26 @@ fn validate_and_clone_meta_inner(
                 json_type_name(val)
             )),
         },
+        "array" => {
+            if val.is_array() {
+                Ok(val.clone())
+            } else {
+                Err(format!(
+                    "Metadata value for key '{key}' must be array for type='array', got {}",
+                    json_type_name(val)
+                ))
+            }
+        }
+        "object" => {
+            if val.is_object() {
+                Ok(val.clone())
+            } else {
+                Err(format!(
+                    "Metadata value for key '{key}' must be object for type='object', got {}",
+                    json_type_name(val)
+                ))
+            }
+        }
         _ => unreachable!(),
     }
 }

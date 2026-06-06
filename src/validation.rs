@@ -249,11 +249,12 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
                 // raw int or float — accepted as-is (type inferred)
                 let _ = n;
             }
+            Value::Array(_) => {} // raw array → type = "array"
             other => {
                 let type_name = json_type_name(other);
                 return Err(err(format!(
-                    "metadata.{key}: value must be string, int, float, bool, or MetaValue \
-                    (required for datetime), got {type_name}"
+                    "metadata.{key}: value must be string, int, float, bool, array, or MetaValue \
+                    (required for datetime and object), got {type_name}"
                 )));
             }
         }
@@ -262,7 +263,7 @@ fn validate_metadata(metadata: &std::collections::HashMap<String, Value>) -> VRe
 }
 
 fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
-    let allowed = ["string", "integer", "float", "boolean", "datetime"];
+    let allowed = ["string", "integer", "float", "boolean", "datetime", "array", "object"];
     if !allowed.contains(&type_str) {
         return Err(err(format!(
             "metadata.{key}: invalid type '{type_str}'. Allowed types: {allowed:?}"
@@ -327,6 +328,26 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
                 json_type_name(val)
             ))),
         },
+        "array" => {
+            if val.is_array() {
+                Ok(())
+            } else {
+                Err(err(format!(
+                    "metadata.{key}: value must be array for type='array', got {}",
+                    json_type_name(val)
+                )))
+            }
+        }
+        "object" => {
+            if val.is_object() {
+                Ok(())
+            } else {
+                Err(err(format!(
+                    "metadata.{key}: value must be object for type='object', got {}",
+                    json_type_name(val)
+                )))
+            }
+        }
         _ => unreachable!(),
     }
 }

@@ -1517,7 +1517,9 @@ fn infer_metadata_value_type(value: &serde_json::Value) -> String {
         serde_json::Value::Number(n) => {
             if n.is_i64() || n.is_u64() { "integer".to_string() } else { "float".to_string() }
         }
-        _ => "unknown".to_string(),
+        serde_json::Value::Array(_) => "array".to_string(),
+        serde_json::Value::Object(_) => "object".to_string(),
+        serde_json::Value::Null => "unknown".to_string(),
     }
 }
 
