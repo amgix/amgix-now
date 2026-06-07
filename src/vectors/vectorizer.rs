@@ -22,6 +22,7 @@ use crate::vectors::trigrams::TrigramsVector;
 use crate::vectors::vector_base::VectorBase;
 use crate::vectors::whitespace::WhiteSpaceVector;
 use crate::vectors::wmtr::WMTRVector;
+use crate::vectors::noop::NoopVector;
 
 #[derive(Debug)]
 pub enum RoutedEmbed {
@@ -92,9 +93,18 @@ pub fn route_embed_dispatch(
                 WMTRVector.get_sparse_vector(config, docs, av, trigram_weight)?,
             ))
         }
-        VectorType::Noop => Ok(RoutedEmbed::Sparse(
-            vec![(vec![], vec![]); docs.len()],
-        )),
+        VectorType::Noop => {
+            let av = avgdls.ok_or_else(|| {
+                format!(
+                    "avgdl entries required for custom tokenization vector '{}' ({:?})",
+                    config.name,
+                    VectorType::Noop,
+                )
+            })?;
+            Ok(RoutedEmbed::Sparse(
+                NoopVector.get_sparse_vector(config, docs, av, trigram_weight)?,
+            ))
+        }
         VectorType::DenseCustom | VectorType::SparseCustom => Err(
             "route_embed_dispatch must not be called for dense_custom/sparse_custom".to_string(),
         ),
@@ -239,26 +249,13 @@ impl Vectorizer {
                                 }
                             }
                         }
-                        VectorType::Noop => {
-                            for doc_idx in 0..n {
-                                for field in &config.index_fields {
-                                    vectors[doc_idx].push(VectorData {
-                                        vector_name: config.name.clone(),
-                                        field: *field,
-                                        vector_type: config.vector_type.clone(),
-                                        dense_vector: None,
-                                        sparse_indices: Some(vec![]),
-                                        sparse_values: Some(vec![]),
-                                    });
-                                }
-                            }
-                        }
                         VectorType::SparseModel
                         | VectorType::FullText
                         | VectorType::Trigrams
                         | VectorType::Whitespace
                         | VectorType::Wmtr
-                        | VectorType::Keyword => {
+                        | VectorType::Keyword
+                        | VectorType::Noop => {
                             let mut texts: Vec<String> = Vec::new();
                             let mut avgdls: Vec<f64> = Vec::new();
                             let is_custom = config.vector_type.is_custom_tokenization();
@@ -632,26 +629,13 @@ impl Vectorizer {
                     }
                 }
             }
-            VectorType::Noop => {
-                for qi in 0..n {
-                    for field in fields {
-                        per_query[qi].push(VectorData {
-                            vector_name: config.name.clone(),
-                            field: *field,
-                            vector_type: config.vector_type.clone(),
-                            dense_vector: None,
-                            sparse_indices: Some(vec![]),
-                            sparse_values: Some(vec![]),
-                        });
-                    }
-                }
-            }
             VectorType::SparseModel
             | VectorType::FullText
             | VectorType::Trigrams
             | VectorType::Whitespace
             | VectorType::Wmtr
-            | VectorType::Keyword => {
+            | VectorType::Keyword
+            | VectorType::Noop => {
                 let effective_config =
                     sparse_model_config_query_embedding(config.clone());
 

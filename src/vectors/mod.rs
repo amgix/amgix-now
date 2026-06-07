@@ -3,6 +3,7 @@ pub mod dense_model;
 pub mod st_pooling;
 pub mod full_text;
 pub mod model_cache;
+pub mod noop;
 pub mod sparse_custom;
 pub mod sparse_model;
 pub mod trigrams;

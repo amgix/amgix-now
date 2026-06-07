@@ -118,6 +118,7 @@ impl VectorType {
                 | VectorType::Whitespace
                 | VectorType::Wmtr
                 | VectorType::Keyword
+                | VectorType::Noop
         )
     }
 
