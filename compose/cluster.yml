@@ -1,0 +1,77 @@
+name: amgix-cluster
+
+x-api-image: &amgix-now
+  build:
+    context: ..
+    dockerfile: build/Dockerfile.cpu
+    args:
+      AMGIX_VERSION: 0.1.0-dev
+  image: amgix-now:dev
+
+services:
+
+  proxy:
+    image: nginx:alpine
+    # container_name: amgix-api-proxy
+    ports:
+      - "8234:80"
+    volumes:
+      - ./nginx-api-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - amgix-one
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    # container_name: amgix-qdrant
+    ports:
+      - "6333:6333"  # HTTP
+      - "6334:6334"  # gRPC
+    volumes:
+      - ../data/qdrant:/qdrant/storage
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    # container_name: amgix-rabbitmq
+    ports:
+      # - "5672:15672"
+      - "15672:15672"
+
+  amgix-one:
+    image: amgixio/amgix-one:1
+    pull_policy: always
+    expose:
+      - "8234"
+    depends_on:
+      - qdrant
+      - rabbitmq
+    environment:
+      - AMGIX_DATABASE_URL=qdrant://qdrant:6334
+      - AMGIX_AMQP_URL=amqp://guest:guest@rabbitmq/
+    volumes:
+      - ../data/amgix-cache:/data/amgix/cache
+
+  amgix-now:
+    <<: *amgix-now
+    expose:
+      - "8235"
+    depends_on:
+      - qdrant
+      - rabbitmq
+    volumes:
+      - ../data/amgix-cache:/data/amgix/cache
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    environment:
+      - AMGIX_DATABASE_URL=qdrant://qdrant:6334
+      - AMGIX_AMQP_URL=amqp://guest:guest@rabbitmq/
+
+

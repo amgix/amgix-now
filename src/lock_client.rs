@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::bunny_talk::BunnyTalk;
@@ -75,6 +75,7 @@ impl LockClient {
                     last_err = None;
                 }
                 Err(e) => {
+                    warn!("Lock acquire RPC failed (will retry): {e}");
                     last_err = Some(e);
                 }
             }

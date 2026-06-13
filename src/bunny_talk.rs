@@ -12,7 +12,7 @@ use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Exchange
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const APP_PREFIX: &str = "amgix";
@@ -21,6 +21,8 @@ const RPC_TIMEOUT_SECONDS: u64 = 60;
 const HEARTBEAT_SECONDS: u16 = 35;
 const MAX_RETRIES: u32 = 10;
 const RETRY_DELAY_SECONDS: u64 = 5;
+const CONNECT_ATTEMPT_TIMEOUT_SECONDS: u64 = 10;
+const SETUP_TIMEOUT_SECONDS: u64 = 30;
 
 // CLASSIC_QUEUE_ARGUMENTS values from constants.py
 const MAX_QUEUE_MESSAGES: i64 = 500_000;
@@ -30,6 +32,28 @@ const REPLY_QUEUE_EXPIRES_MS: i64 = ((RPC_TIMEOUT_SECONDS + 5) * 1000) as i64;
 
 fn hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// `amqp://user:pass@host/` is an empty vhost, not the default `/`. Match aio_pika / Python defaults.
+fn normalize_amqp_vhost(url: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (url, None),
+    };
+    let Some(at_pos) = base.rfind('@') else {
+        return url.to_string();
+    };
+    let host_and_path = &base[at_pos + 1..];
+    if host_and_path.ends_with('/')
+        && !host_and_path[..host_and_path.len() - 1].contains('/')
+    {
+        let fixed_base = format!("{}/%2f", base.trim_end_matches('/'));
+        return match query {
+            Some(q) => format!("{fixed_base}?{q}"),
+            None => fixed_base,
+        };
+    }
+    url.to_string()
 }
 
 fn classic_queue_args() -> FieldTable {
@@ -79,6 +103,7 @@ pub struct BunnyTalk {
 impl BunnyTalk {
     pub async fn create(amqp_url: &str) -> Result<Arc<Self>, String> {
         let host = hostname();
+        let amqp_url = normalize_amqp_vhost(amqp_url);
         let url_with_heartbeat = if amqp_url.contains('?') {
             format!("{}&heartbeat={}", amqp_url, HEARTBEAT_SECONDS)
         } else {
@@ -92,21 +117,48 @@ impl BunnyTalk {
 
         let mut last_err = String::new();
         for attempt in 1..=MAX_RETRIES {
-            match Connection::connect(&url_with_heartbeat, props.clone()).await {
-                Ok(connection) => {
-                    return Self::setup(connection, &host).await;
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    if attempt < MAX_RETRIES {
-                        error!(
-                            "Failed to connect to RabbitMQ (attempt {}/{}): {}",
-                            attempt, MAX_RETRIES, e
-                        );
-                        error!("Retrying in {} seconds...", RETRY_DELAY_SECONDS);
-                        tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECONDS)).await;
+            info!(
+                "Connecting to RabbitMQ (attempt {}/{})",
+                attempt, MAX_RETRIES
+            );
+            let connect_timeout = Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECONDS);
+            let connect_result =
+                tokio::time::timeout(connect_timeout, Connection::connect(&url_with_heartbeat, props.clone()))
+                    .await;
+
+            match connect_result {
+                Ok(Ok(connection)) => {
+                    info!("RabbitMQ connection established, setting up client");
+                    let setup_timeout = Duration::from_secs(SETUP_TIMEOUT_SECONDS);
+                    match tokio::time::timeout(setup_timeout, Self::setup(connection, &host)).await {
+                        Ok(Ok(instance)) => return Ok(instance),
+                        Ok(Err(e)) => last_err = e,
+                        Err(_) => {
+                            last_err = format!(
+                                "RabbitMQ setup timed out after {} seconds",
+                                SETUP_TIMEOUT_SECONDS
+                            );
+                        }
                     }
                 }
+                Ok(Err(e)) => {
+                    last_err = e.to_string();
+                }
+                Err(_) => {
+                    last_err = format!(
+                        "RabbitMQ connect timed out after {} seconds",
+                        CONNECT_ATTEMPT_TIMEOUT_SECONDS
+                    );
+                }
+            }
+
+            if attempt < MAX_RETRIES {
+                error!(
+                    "Failed to connect to RabbitMQ (attempt {}/{}): {}",
+                    attempt, MAX_RETRIES, last_err
+                );
+                error!("Retrying in {} seconds...", RETRY_DELAY_SECONDS);
+                tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECONDS)).await;
             }
         }
         Err(format!(
@@ -307,6 +359,10 @@ impl BunnyTalk {
                 ))
             }
         }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connection.status().connected() && self.channel.status().connected()
     }
 
     pub async fn close(&self) {

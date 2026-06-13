@@ -42,7 +42,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "8"
+          cpus: "4"
 
   amgix-now:
     container_name: amgix-now

@@ -67,6 +67,7 @@ struct AppState {
     upsert_ingress: UpsertIngress,
     search_ingress: SearchIngress,
     doc_locks: NamedLocks,
+    bunny: Option<Arc<bunny_talk::BunnyTalk>>,
 }
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -193,13 +194,17 @@ async fn health_check() -> Json<OkResponse> {
 }
 
 /// `GET /v1/health/ready` — same status rules and JSON body as Python `readiness_check`.
-/// In **amgix-now** there is no RabbitMQ or separate index/query workers; those probes are
-/// reported `true` when not applicable so `ready` tracks Qdrant connectivity.
+/// In **amgix-now** there are no separate index/query workers; those probes stay `true`.
+/// In cluster mode (`AMGIX_AMQP_URL` set), `rabbitmq` mirrors amgix-server: local connection + channel open.
 async fn health_ready(State(app): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
     const PARTIAL_READY: u16 = 218;
 
     let database = app.db.is_connected().await;
-    let rabbitmq = true;
+    let rabbitmq = app
+        .bunny
+        .as_ref()
+        .map(|b| b.is_connected())
+        .unwrap_or(true);
     let index = true;
     let query = true;
     let ready = database && rabbitmq && index && query;
@@ -886,6 +891,26 @@ async fn main() {
 
     let sync_db_writes = amgix_now_sync_db_writes_from_env();
 
+    let amqp_url = std::env::var("AMGIX_AMQP_URL").ok();
+
+    let bunny = if let Some(ref url) = amqp_url {
+        tracing::info!("AMGIX_AMQP_URL set — connecting to RabbitMQ");
+        match bunny_talk::BunnyTalk::create(url).await {
+            Ok(b) => {
+                tracing::info!("RabbitMQ connected");
+                Some(b)
+            }
+            Err(e) => {
+                tracing::error!("RabbitMQ connect failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let lock_client = bunny.as_ref().map(|b| lock_client::LockClient::new(Arc::clone(b)));
+
     let db = match QdrantDb::new(&qdrant_client_url(&db_url), sync_db_writes) {
         Ok(d) => Arc::new(d),
         Err(e) => {
@@ -896,7 +921,20 @@ async fn main() {
 
     db.wait_connected().await;
 
-    if let Err(e) = db.configure().await {
+    if let Some(ref lc) = lock_client {
+        tracing::info!("Acquiring database-configure lock...");
+        let _guard = match lc.acquire(&["database-configure"], std::time::Duration::from_secs(30)).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!("Failed to acquire database-configure lock: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = db.configure().await {
+            tracing::error!("Qdrant configure: {e}");
+            std::process::exit(1);
+        }
+    } else if let Err(e) = db.configure().await {
         tracing::error!("Qdrant configure: {e}");
         std::process::exit(1);
     }
@@ -983,6 +1021,7 @@ async fn main() {
         upsert_ingress,
         search_ingress,
         doc_locks,
+        bunny: bunny.clone(),
     };
 
     let app = Router::new()
@@ -1071,6 +1110,10 @@ async fn main() {
     search_shutdown.shutdown_and_wait().await;
 
     stats_shutdown.shutdown_and_wait().await;
+
+    if let Some(ref b) = bunny {
+        b.close().await;
+    }
 
     if let Err(e) = serve_result {
         tracing::error!("server error: {e}");
