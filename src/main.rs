@@ -1,4 +1,5 @@
 mod amgix;
+mod bunny_talk;
 mod common;
 mod encoder;
 mod filter_parser;
