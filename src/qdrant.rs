@@ -93,6 +93,7 @@ impl Default for CollectionStats {
 pub struct QdrantDb {
     pub client: Qdrant,
     pub meta_collection: String,
+    pub metrics_collection: String,
     /// When true, upserts/deletes pass Qdrant `wait=true` so the API returns after data is visible.
     sync_db_writes: bool,
 }
@@ -113,6 +114,7 @@ impl QdrantDb {
         Ok(QdrantDb {
             client,
             meta_collection: sys_collection_name("meta"),
+            metrics_collection: sys_collection_name("metrics"),
             sync_db_writes,
         })
     }
@@ -128,7 +130,14 @@ impl QdrantDb {
     // -----------------------------------------------------------------------
 
     pub async fn configure(&self) -> Result<(), DbError> {
+        self.configure_meta_collection().await?;
+        self.configure_metrics_collection().await?;
+        Ok(())
+    }
+
+    async fn configure_meta_collection(&self) -> Result<(), DbError> {
         if !self.client.collection_exists(&self.meta_collection).await? {
+            tracing::info!("Creating system meta collection");
             let vectors_config = VectorsConfig {
                 config: Some(qdrant_client::qdrant::vectors_config::Config::ParamsMap(
                     VectorParamsMap {
@@ -149,6 +158,50 @@ impl QdrantDb {
                         .vectors_config(vectors_config),
                 )
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn configure_metrics_collection(&self) -> Result<(), DbError> {
+        if !self.client.collection_exists(&self.metrics_collection).await? {
+            tracing::info!("Creating system metrics collection");
+            let vectors_config = VectorsConfig {
+                config: Some(qdrant_client::qdrant::vectors_config::Config::ParamsMap(
+                    VectorParamsMap {
+                        map: HashMap::from([(
+                            "dummy".to_string(),
+                            VectorParams {
+                                size: 1,
+                                distance: Distance::Dot as i32,
+                                ..Default::default()
+                            },
+                        )]),
+                    },
+                )),
+            };
+            self.client
+                .create_collection(
+                    CreateCollectionBuilder::new(&self.metrics_collection)
+                        .vectors_config(vectors_config),
+                )
+                .await?;
+
+            for (field, field_type) in [
+                ("key", FieldType::Keyword),
+                ("bucket_seconds", FieldType::Integer),
+                ("bucket_start", FieldType::Integer),
+            ] {
+                self.client
+                    .create_field_index(
+                        CreateFieldIndexCollectionBuilder::new(
+                            &self.metrics_collection,
+                            field,
+                            field_type,
+                        )
+                        .wait(true),
+                    )
+                    .await?;
+            }
         }
         Ok(())
     }
