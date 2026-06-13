@@ -996,6 +996,8 @@ async fn main() {
     );
     let web_threads = std::env::var("TOKIO_WORKER_THREADS").unwrap_or_default();
     tracing::info!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
+    let cluster_mode = if bunny.is_some() { "cluster" } else { "standalone" };
+    tracing::info!("Cluster mode: {cluster_mode}");
 
     let collection_cache = CollectionConfigCache::new();
     let doc_locks = NamedLocks::new();
