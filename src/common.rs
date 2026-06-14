@@ -244,6 +244,15 @@ pub fn string_to_uuid(s: &str) -> Uuid {
     Uuid::new_v5(&DOC_NAMESPACE, s.as_bytes())
 }
 
+/// Distributed per-document lock name.
+/// Matches Python: `f"doc-{database._string_to_uuid(f"{collection_name}-{document_id}")}"`
+pub fn doc_lock_name(collection_name: &str, document_id: &str) -> String {
+    format!(
+        "doc-{}",
+        string_to_uuid(&format!("{collection_name}-{document_id}"))
+    )
+}
+
 /// System collection name, e.g. `amgix_sys_meta`.
 pub fn sys_collection_name(suffix: &str) -> String {
     format!("{APP_PREFIX}_sys_{suffix}")

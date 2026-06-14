@@ -122,7 +122,7 @@ pub struct TokenLengthUpdate {
 //
 // Used for:
 //   - stats locks  (key = collection_name)  — mirrors _stats_locks
-//   - per-doc locks (key = "{collection}-{doc_id}") — mirrors lock_client per-doc
+//   - per-doc locks via `LockBackend::lock_doc` — mirrors lock_client per-doc
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -200,9 +200,17 @@ impl LockBackend {
         Self::Distributed(lock_client)
     }
 
-    /// Acquire a per-doc lock. Key format: `"{collection_name}-{doc_id}"`.
-    /// In distributed mode, acquires the distributed lock with a 60s timeout.
-    pub async fn lock(&self, key: &str) -> Result<LockBackendGuard, String> {
+    /// Acquire a per-document lock (name matches Python encoder lock_client).
+    pub async fn lock_doc(
+        &self,
+        collection_name: &str,
+        document_id: &str,
+    ) -> Result<LockBackendGuard, String> {
+        let key = crate::common::doc_lock_name(collection_name, document_id);
+        self.lock(&key).await
+    }
+
+    async fn lock(&self, key: &str) -> Result<LockBackendGuard, String> {
         match self {
             LockBackend::Local(locks) => {
                 Ok(LockBackendGuard::Local(locks.lock(key).await))
@@ -1307,7 +1315,7 @@ pub(crate) async fn document_upsert_bulk_internal(
     let mut guards = Vec::with_capacity(doc_ids.len());
     for id in &doc_ids {
         let guard = doc_locks
-            .lock(&format!("{collection_name}-{id}"))
+            .lock_doc(collection_name, id)
             .await
             .map_err(|e| UpsertSyncError::Db(DbError::Config(e)))?;
         guards.push(guard);
@@ -1490,9 +1498,8 @@ pub async fn document_delete_sync(
     request_timestamp: DateTime<Utc>,
 ) -> Result<Vec<String>, UpsertSyncError> {
     let t0 = std::time::Instant::now();
-    let doc_lock_key = format!("{collection_name}-{document_id}");
     let _doc_guard = doc_locks
-        .lock(&doc_lock_key)
+        .lock_doc(collection_name, document_id)
         .await
         .map_err(|e| UpsertSyncError::Db(DbError::Config(e)))?;
 
