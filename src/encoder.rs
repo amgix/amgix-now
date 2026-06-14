@@ -243,16 +243,40 @@ struct CacheEntry {
 #[derive(Clone)]
 pub struct CollectionConfigCache {
     inner: Arc<Mutex<HashMap<String, CacheEntry>>>,
+    /// In cluster mode (multiple amgix-now nodes) the write path always bypasses
+    /// the cache to avoid stale configs from other nodes' invalidations not being
+    /// visible locally. Search reads still populate and use the cache on both modes.
+    cluster_mode: bool,
 }
 
 impl CollectionConfigCache {
-    pub fn new() -> Self {
+    pub fn new(cluster_mode: bool) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            cluster_mode,
         }
     }
 
+    /// Returns cached config for read (search) paths. Always returns `None` in
+    /// cluster mode for write paths — callers should use `get_for_read` vs
+    /// the write path which goes through `get_collection_info_for_write`.
     pub async fn get(&self, collection_name: &str) -> Option<CollectionConfigInternal> {
+        if self.cluster_mode {
+            return None;
+        }
+        let map = self.inner.lock().await;
+        map.get(collection_name).and_then(|e| {
+            if e.inserted_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
+                Some(e.config.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Cache lookup used exclusively by the search path — always checks cache
+    /// regardless of cluster mode (search staleness is acceptable).
+    pub async fn get_for_search(&self, collection_name: &str) -> Option<CollectionConfigInternal> {
         let map = self.inner.lock().await;
         map.get(collection_name).and_then(|e| {
             if e.inserted_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS) {
@@ -286,19 +310,36 @@ impl CollectionConfigCache {
     }
 }
 
-/// Fetch collection config, hitting the cache first.
-/// Returns `(config, from_cache)` — mirrors `EncoderBase.get_collection_info_cached`.
+/// Fetch collection config for the **search path** — uses cache on both standalone
+/// and cluster modes (search staleness is acceptable).
+/// Returns `(config, from_cache)`.
 pub async fn get_collection_info_cached(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
     collection_name: &str,
 ) -> Result<(CollectionConfigInternal, bool), DbError> {
-    if let Some(cached) = cache.get(collection_name).await {
+    if let Some(cached) = cache.get_for_search(collection_name).await {
         return Ok((cached, true));
     }
     let config = db.get_collection_info_internal(collection_name).await?;
     cache.set(collection_name, config.clone()).await;
     Ok((config, false))
+}
+
+/// Fetch collection config for the **write (upsert) path**.
+/// In standalone mode hits the cache; in cluster mode always reads from Qdrant
+/// so that a schema change on any node is immediately visible.
+pub async fn get_collection_info_for_write(
+    db: &QdrantDb,
+    cache: &CollectionConfigCache,
+    collection_name: &str,
+) -> Result<CollectionConfigInternal, DbError> {
+    if let Some(cached) = cache.get(collection_name).await {
+        return Ok(cached);
+    }
+    let config = db.get_collection_info_internal(collection_name).await?;
+    cache.set(collection_name, config.clone()).await;
+    Ok(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,8 +1327,8 @@ pub(crate) async fn document_upsert_bulk_internal(
         return Ok(vec![]);
     }
 
-    let collection_config = match get_collection_info_cached(db, cache, collection_name).await {
-        Ok((c, _)) => c,
+    let collection_config = match get_collection_info_for_write(db, cache, collection_name).await {
+        Ok(c) => c,
         Err(DbError::NotFound(_)) => {
             return Err(UpsertSyncError::NotFound(
                 "Collection configuration not found".to_string(),

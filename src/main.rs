@@ -1111,7 +1111,7 @@ async fn main() {
         (None, None)
     };
 
-    let collection_cache = CollectionConfigCache::new();
+    let collection_cache = CollectionConfigCache::new(bunny.is_some());
     let doc_locks = match lock_client {
         Some(lc) => LockBackend::distributed(lc),
         None => {
