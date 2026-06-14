@@ -51,8 +51,8 @@ services:
   amgix-one:
     <<: *amgix-one
     pull_policy: always
-    expose:
-      - "8234"
+    ports:
+      - "18234:8234"
     depends_on:
       - qdrant
       - rabbitmq

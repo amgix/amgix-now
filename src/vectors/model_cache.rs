@@ -291,6 +291,18 @@ impl DenseModelCache {
         Ok(handle)
     }
 
+    /// Returns non-expired cache entries as `(type_str, model, revision, loaded_at)`.
+    pub fn snapshot(&self) -> Vec<(String, String, Option<String>, Instant)> {
+        let cache = self.inner.read().unwrap();
+        cache
+            .iter()
+            .filter(|(_, (_, loaded_at))| loaded_at.elapsed() < MODEL_CACHE_TTL)
+            .map(|((model, revision), (_, loaded_at))| {
+                ("dense_model".to_string(), model.clone(), revision.clone(), *loaded_at)
+            })
+            .collect()
+    }
+
     fn evict_if_needed(
         cache: &mut HashMap<(String, Option<String>), DenseModelEntry>,
         max_size: usize,
@@ -383,6 +395,18 @@ impl SparseModelCache {
         let arc = Arc::new(embedder);
         cache.insert(key, (Arc::clone(&arc), Instant::now()));
         Ok(arc)
+    }
+
+    /// Returns non-expired cache entries as `(type_str, model, revision, loaded_at)`.
+    pub fn snapshot(&self) -> Vec<(String, String, Option<String>, Instant)> {
+        let cache = self.inner.read().unwrap();
+        cache
+            .iter()
+            .filter(|(_, (_, loaded_at))| loaded_at.elapsed() < MODEL_CACHE_TTL)
+            .map(|((model, revision), (_, loaded_at))| {
+                ("sparse_model".to_string(), model.clone(), revision.clone(), *loaded_at)
+            })
+            .collect()
     }
 
     fn evict_if_needed(

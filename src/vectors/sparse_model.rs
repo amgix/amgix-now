@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use candle_core::Tensor;
 use tokenizers::Tokenizer;
@@ -14,6 +15,14 @@ static SPARSE_CACHE: OnceLock<SparseModelCache> = OnceLock::new();
 
 fn cache() -> &'static SparseModelCache {
     SPARSE_CACHE.get_or_init(SparseModelCache::new)
+}
+
+/// Returns currently loaded (non-expired) sparse models: `(type, model, revision, loaded_at)`.
+pub fn sparse_model_cache_snapshot() -> Vec<(String, String, Option<String>, Instant)> {
+    SPARSE_CACHE
+        .get()
+        .map(|c| c.snapshot())
+        .unwrap_or_default()
 }
 
 pub struct SparseModelVector;

@@ -136,6 +136,11 @@ pub fn route_embed_dispatch(
                 m.record(crate::metrics::keys::EMBED_INFERENCE_MS, dim, elapsed_ms, Some(1));
                 m.record(crate::metrics::keys::EMBED_INFERENCE_ORIGIN_MS, dim, elapsed_ms, Some(1));
                 m.record(crate::metrics::keys::EMBED_HOPS, dim, 0.0, Some(1));
+                // Track last-used timestamp for this model key (mirrors mark_last_used).
+                let key = (type_str.clone(), model_str.to_string(), revision_str.to_string());
+                if let Ok(mut guard) = m.model_last_used.lock() {
+                    guard.insert(key, std::time::Instant::now());
+                }
             }
             Err(_) => {
                 m.record(crate::metrics::keys::EMBED_INFERENCE_ORIGIN_ERRORS, dim, 1.0, None);

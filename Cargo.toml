@@ -35,3 +35,5 @@ whatlang = "0.18.0"
 isolang = "2.4.0"
 pest = "2.8.6"
 pest_derive = "2.8.6"
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
+nvml-wrapper = "0.12.1"

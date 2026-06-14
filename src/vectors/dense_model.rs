@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use candle_core::{DType, Tensor};
 
@@ -13,6 +14,14 @@ static DENSE_CACHE: OnceLock<DenseModelCache> = OnceLock::new();
 
 fn cache() -> &'static DenseModelCache {
     DENSE_CACHE.get_or_init(DenseModelCache::new)
+}
+
+/// Returns currently loaded (non-expired) dense models: `(type, model, revision, loaded_at)`.
+pub fn dense_model_cache_snapshot() -> Vec<(String, String, Option<String>, Instant)> {
+    DENSE_CACHE
+        .get()
+        .map(|c| c.snapshot())
+        .unwrap_or_default()
 }
 
 pub struct DenseModelVector;

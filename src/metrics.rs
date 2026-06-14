@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -121,6 +121,9 @@ pub struct MetricsBucket {
 // MetricsCollector — the public handle
 // ---------------------------------------------------------------------------
 
+/// `(type, model, revision) → last used Instant`.
+pub type ModelLastUsed = Arc<Mutex<HashMap<(String, String, String), Instant>>>;
+
 /// Cloneable handle. `record()` is non-blocking; events are dropped (with a one-time warning)
 /// when the channel is full.
 #[derive(Clone)]
@@ -130,6 +133,14 @@ pub struct MetricsCollector {
     dropping: Arc<AtomicBool>,
     /// Set to true after the first disconnected error is logged; never cleared.
     thread_dead_warned: Arc<AtomicBool>,
+    /// Updated on each successful embed; serialized into node meta every tick.
+    pub model_last_used: ModelLastUsed,
+    /// Total RAM in GB — read once at startup.
+    total_ram_gb: f64,
+    /// Whether GPU inference is available — detected once at startup.
+    gpu_available: bool,
+    /// Total VRAM in GB for GPU 0 — `None` if no NVIDIA GPU present.
+    total_vram_gb: Option<f64>,
 }
 
 pub struct MetricsCollectorShutdown {
@@ -186,8 +197,22 @@ impl MetricsCollector {
         let (tx, rx) = mpsc::sync_channel::<MetricEvent>(EVENT_BUFFER_MAXLEN);
         let stop = Arc::new(AtomicBool::new(false));
         let dropping = Arc::new(AtomicBool::new(false));
+        let model_last_used: ModelLastUsed = Arc::new(Mutex::new(HashMap::new()));
+
+        // Read once at startup — these don't change at runtime.
+        let total_ram_gb = {
+            use sysinfo::System;
+            let mut sys = System::new();
+            sys.refresh_memory();
+            sys.total_memory() as f64 / (1024.0_f64.powi(3))
+        };
+        let gpu_available = crate::vectors::model_cache::is_gpu_inference();
+
+        // Detect total VRAM once — re-initialize NVML inside the report thread for per-tick queries.
+        let total_vram_gb: Option<f64> = nvml_total_vram_gb();
 
         let stop_thread = Arc::clone(&stop);
+        let model_last_used_thread = Arc::clone(&model_last_used);
         let thread = std::thread::Builder::new()
             .name("metrics-report".to_string())
             .spawn(move || {
@@ -197,7 +222,17 @@ impl MetricsCollector {
                     .thread_name("metrics-report-rt")
                     .build()
                     .expect("metrics report thread: failed to build tokio runtime");
-                rt.block_on(report_thread_main(rx, stop_thread, amqp_url, db, hostname));
+                rt.block_on(report_thread_main(
+                    rx,
+                    stop_thread,
+                    amqp_url,
+                    db,
+                    hostname,
+                    total_ram_gb,
+                    gpu_available,
+                    total_vram_gb,
+                    model_last_used_thread,
+                ));
             })
             .expect("failed to spawn metrics report thread");
 
@@ -205,6 +240,10 @@ impl MetricsCollector {
             tx,
             dropping,
             thread_dead_warned: Arc::new(AtomicBool::new(false)),
+            model_last_used,
+            total_ram_gb,
+            gpu_available,
+            total_vram_gb,
         };
         let shutdown = MetricsCollectorShutdown {
             stop,
@@ -235,7 +274,13 @@ async fn report_thread_main(
     amqp_url: String,
     db: Arc<QdrantDb>,
     hostname: String,
+    total_ram_gb: f64,
+    gpu_available: bool,
+    total_vram_gb: Option<f64>,
+    model_last_used: ModelLastUsed,
 ) {
+    // NVML is not Send, so we init it here in the report thread for per-tick VRAM queries.
+    let nvml = nvml_wrapper::Nvml::init().ok();
     let bunny = match BunnyTalk::create(&amqp_url).await {
         Ok(b) => b,
         Err(e) => {
@@ -250,7 +295,7 @@ async fn report_thread_main(
     while !stop.load(Ordering::Relaxed) {
         let (snap, completed_1m) = state.drain_and_process(&rx, true);
         let series = snap_to_series(&snap, &state.last_seen);
-        let payload = build_payload(&hostname, &series);
+        let payload = build_payload(&hostname, &series, total_ram_gb, gpu_available, total_vram_gb, nvml.as_ref(), &model_last_used);
         if let Err(e) = bunny
             .talk("metrics-leader", json!({ "payload": payload }), true, None)
             .await
@@ -648,14 +693,82 @@ fn snap_to_series(
         .collect()
 }
 
-fn build_payload(hostname: &str, series: &[Value]) -> Value {
+fn build_payload(
+    hostname: &str,
+    series: &[Value],
+    total_ram_gb: f64,
+    gpu_available: bool,
+    total_vram_gb: Option<f64>,
+    nvml: Option<&nvml_wrapper::Nvml>,
+    model_last_used: &ModelLastUsed,
+) -> Value {
+    use crate::vectors::dense_model::dense_model_cache_snapshot;
+    use crate::vectors::sparse_model::sparse_model_cache_snapshot;
+
+    // Read free RAM every tick — it changes.
+    let free_ram_gb = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.available_memory() as f64 / (1024.0_f64.powi(3))
+    };
+
+    // Loaded models from both caches.
+    let mut all_models: Vec<(String, String, Option<String>, Instant)> = dense_model_cache_snapshot();
+    all_models.extend(sparse_model_cache_snapshot());
+    all_models.sort_by(|a, b| {
+        a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0))
+    });
+    let now_instant = Instant::now();
+    let loaded_models: Vec<Value> = all_models
+        .iter()
+        .map(|(type_str, model, revision, loaded_at)| {
+            let model_key = json!([type_str, model, revision.as_deref().unwrap_or("")]);
+            let loaded_at_unix = unix_now() - now_instant.duration_since(*loaded_at).as_secs_f64();
+            let label = if revision.as_deref().unwrap_or("").is_empty() {
+                model.clone()
+            } else {
+                format!("{}:{}", model, revision.as_deref().unwrap_or(""))
+            };
+            json!({ "model_key": model_key, "loaded_at": loaded_at_unix, "label": label })
+        })
+        .collect();
+
+    // Last-used timestamps per model key — trim entries older than MODEL_IDLE_GRACE_SECONDS.
+    const MODEL_IDLE_GRACE_SECONDS: f64 = 300.0;
+    let model_last_used_json: Vec<Value> = {
+        let mut guard = model_last_used.lock().expect("model_last_used poisoned");
+        guard.retain(|_, ts| now_instant.duration_since(*ts).as_secs_f64() < MODEL_IDLE_GRACE_SECONDS);
+        guard
+            .iter()
+            .map(|(k, ts)| {
+                let model_key = json!([k.0, k.1, k.2]);
+                let last_used_at = unix_now() - now_instant.duration_since(*ts).as_secs_f64();
+                json!({ "model_key": model_key, "last_used_at": last_used_at })
+            })
+            .collect()
+    };
+
+    let meta = json!({
+        "load_models": true,
+        "at_capacity": false,
+        "total_ram_gb": (total_ram_gb * 100.0).round() / 100.0,
+        "free_ram_gb": (free_ram_gb * 100.0).round() / 100.0,
+        "total_vram_gb": total_vram_gb.map(|v| (v * 100.0).round() / 100.0),
+        "free_vram_gb": nvml_free_vram_gb(nvml).map(|v| (v * 100.0).round() / 100.0),
+        "gpu_support": gpu_available,
+        "gpu_available": gpu_available,
+        "loaded_models": loaded_models,
+        "model_last_used": model_last_used_json,
+    });
+
     json!({
         "probe": false,
         "hostname": hostname,
         "source": "amgix-now",
         "role": "now",
         "metrics": series,
-        "meta": {},
+        "meta": meta,
     })
 }
 
@@ -682,4 +795,21 @@ type BucketId = (String, Vec<String>, i64, i64);
 
 fn bucket_id(b: &MetricsBucket) -> BucketId {
     (b.key.clone(), b.dims.clone(), b.bucket_start, b.bucket_seconds)
+}
+
+/// Returns total VRAM in GB for GPU 0, or `None` if no NVIDIA GPU is present.
+/// Initializes NVML temporarily — only called once at startup.
+fn nvml_total_vram_gb() -> Option<f64> {
+    let nvml = nvml_wrapper::Nvml::init().ok()?;
+    let device = nvml.device_by_index(0).ok()?;
+    let info = device.memory_info().ok()?;
+    Some(info.total as f64 / (1024.0_f64.powi(3)))
+}
+
+/// Returns free VRAM in GB for GPU 0 using an already-initialized NVML instance.
+fn nvml_free_vram_gb(nvml: Option<&nvml_wrapper::Nvml>) -> Option<f64> {
+    let nvml = nvml?;
+    let device = nvml.device_by_index(0).ok()?;
+    let info = device.memory_info().ok()?;
+    Some(info.free as f64 / (1024.0_f64.powi(3)))
 }
