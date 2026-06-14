@@ -1,6 +1,7 @@
 mod amgix;
 mod bunny_talk;
 mod lock_client;
+mod metrics;
 mod common;
 mod encoder;
 mod filter_parser;
@@ -68,6 +69,7 @@ struct AppState {
     search_ingress: SearchIngress,
     doc_locks: LockBackend,
     bunny: Option<Arc<bunny_talk::BunnyTalk>>,
+    metrics: Option<Arc<metrics::MetricsCollector>>,
 }
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -1003,6 +1005,14 @@ async fn main() {
     let web_threads = std::env::var("TOKIO_WORKER_THREADS").unwrap_or_default();
     tracing::info!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
 
+    let (metrics_collector, metrics_shutdown) = if let Some(ref url) = amqp_url {
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+        let (c, s) = metrics::MetricsCollector::new(url.clone(), Arc::clone(&db), hostname);
+        (Some(Arc::new(c)), Some(s))
+    } else {
+        (None, None)
+    };
+
     let collection_cache = CollectionConfigCache::new();
     let doc_locks = match lock_client {
         Some(lc) => LockBackend::distributed(lc),
@@ -1034,6 +1044,7 @@ async fn main() {
         search_ingress,
         doc_locks,
         bunny: bunny.clone(),
+        metrics: metrics_collector,
     };
 
     let app = Router::new()
@@ -1122,6 +1133,10 @@ async fn main() {
     search_shutdown.shutdown_and_wait().await;
 
     stats_shutdown.shutdown_and_wait().await;
+
+    if let Some(s) = metrics_shutdown {
+        s.stop_and_join();
+    }
 
     if let Some(ref b) = bunny {
         b.close().await;

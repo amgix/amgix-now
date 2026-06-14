@@ -499,6 +499,56 @@ impl QdrantDb {
     }
 
     // -----------------------------------------------------------------------
+    // append_metric_buckets — mirrors qdrant.py append_metric_buckets
+    // -----------------------------------------------------------------------
+
+    pub async fn append_metric_buckets(
+        &self,
+        hostname: &str,
+        source: &str,
+        buckets: &[crate::metrics::MetricsBucket],
+    ) -> Result<(), DbError> {
+        if buckets.is_empty() {
+            return Ok(());
+        }
+
+        let mut points = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let identity = format!(
+                "{}:{}:{}:{}:{}:{}",
+                hostname,
+                source,
+                bucket.key,
+                bucket.dims.join(":"),
+                bucket.bucket_start,
+                bucket.bucket_seconds,
+            );
+            let point_id = string_to_uuid(&identity).to_string();
+            let mut payload = serde_json::Map::new();
+            payload.insert("hostname".into(), serde_json::json!(hostname));
+            payload.insert("source".into(), serde_json::json!(source));
+            payload.insert("key".into(), serde_json::json!(bucket.key));
+            payload.insert("dims".into(), serde_json::json!(bucket.dims));
+            payload.insert("bucket_start".into(), serde_json::json!(bucket.bucket_start));
+            payload.insert("bucket_seconds".into(), serde_json::json!(bucket.bucket_seconds));
+            payload.insert("value".into(), serde_json::json!(bucket.value));
+            payload.insert("n".into(), serde_json::json!(bucket.n));
+
+            let dummy_vectors: HashMap<String, Vec<f32>> =
+                HashMap::from([("dummy".to_string(), vec![0.0_f32])]);
+            points.push(PointStruct::new(point_id, dummy_vectors, payload));
+        }
+
+        self.client
+            .upsert_points(
+                UpsertPointsBuilder::new(&self.metrics_collection, points).wait(true),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // add_documents
     //
     // Mirrors QdrantDatabase.add_documents exactly — accepts pre-computed
