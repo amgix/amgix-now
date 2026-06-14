@@ -36,7 +36,7 @@ use common::{
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_metadata_filter,
-    validate_models, CollectionConfigCache, NamedLocks, SearchError, SearchIngress,
+    validate_models, CollectionConfigCache, LockBackend, NamedLocks, SearchError, SearchIngress,
     StatsUpdateBatcher, UpsertIngress, UpsertSyncError,
 };
 use models::{
@@ -66,7 +66,7 @@ struct AppState {
     stats_batcher: StatsUpdateBatcher,
     upsert_ingress: UpsertIngress,
     search_ingress: SearchIngress,
-    doc_locks: NamedLocks,
+    doc_locks: LockBackend,
     bunny: Option<Arc<bunny_talk::BunnyTalk>>,
 }
 
@@ -889,8 +889,6 @@ async fn main() {
     let db_url = std::env::var("AMGIX_DATABASE_URL")
         .unwrap_or_else(|_| "qdrant://localhost:6334".to_string());
 
-    let sync_db_writes = amgix_now_sync_db_writes_from_env();
-
     let amqp_url = std::env::var("AMGIX_AMQP_URL").ok();
 
     let bunny = if let Some(ref url) = amqp_url {
@@ -909,7 +907,12 @@ async fn main() {
         None
     };
 
-    let lock_client = bunny.as_ref().map(|b| lock_client::LockClient::new(Arc::clone(b)));
+    // In cluster mode distributed locks require writes to be visible immediately.
+    let sync_db_writes = bunny.is_some() || amgix_now_sync_db_writes_from_env();
+
+    let lock_client = bunny
+        .as_ref()
+        .map(|b| Arc::new(lock_client::LockClient::new(Arc::clone(b))));
 
     let db = match QdrantDb::new(&qdrant_client_url(&db_url), sync_db_writes) {
         Ok(d) => Arc::new(d),
@@ -921,7 +924,7 @@ async fn main() {
 
     db.wait_connected().await;
 
-    if let Some(ref lc) = lock_client {
+    if let Some(lc) = lock_client.as_deref() {
         tracing::info!("Acquiring database-configure lock...");
         let _guard = match lc.acquire(&["database-configure"], std::time::Duration::from_secs(30)).await {
             Ok(g) => g,
@@ -962,13 +965,16 @@ async fn main() {
                        |___/                                  
     "#);
 
+    let cluster_mode = if bunny.is_some() { "cluster" } else { "standalone" };
     tracing::info!("Amgix version: {amgix_version_display}");
     tracing::info!("Qdrant version: {qdrant_version}");
+    tracing::info!("Cluster mode: {cluster_mode}");
     tracing::info!("Synchronous Database Writes: {sync_db_writes}");
 
     let stats_locks = NamedLocks::new();
     stats_locks.start_stats_cleanup_task();
-    let (stats_batcher, stats_shutdown) = StatsUpdateBatcher::new(Arc::clone(&db), stats_locks);
+    let (stats_batcher, stats_shutdown) =
+        StatsUpdateBatcher::new(Arc::clone(&db), stats_locks, bunny.clone());
 
     let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
     let index_threads = std::env::var("AMGIX_NOW_INDEX_THREADS")
@@ -996,12 +1002,16 @@ async fn main() {
     );
     let web_threads = std::env::var("TOKIO_WORKER_THREADS").unwrap_or_default();
     tracing::info!("Web pool: {web_threads} threads, Index pool: {index_threads} threads, Search pool: {search_threads} threads");
-    let cluster_mode = if bunny.is_some() { "cluster" } else { "standalone" };
-    tracing::info!("Cluster mode: {cluster_mode}");
 
     let collection_cache = CollectionConfigCache::new();
-    let doc_locks = NamedLocks::new();
-    doc_locks.start_cleanup_task();
+    let doc_locks = match lock_client {
+        Some(lc) => LockBackend::distributed(lc),
+        None => {
+            let locks = NamedLocks::new();
+            locks.start_cleanup_task();
+            LockBackend::local(locks)
+        }
+    };
     let (upsert_ingress, upsert_shutdown) = UpsertIngress::new(
         Arc::clone(&db),
         collection_cache.clone(),

@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
+use crate::bunny_talk::BunnyTalk;
 use crate::common::{
     DocumentField, VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT,
     MAX_INDEXED_METADATA_VALUE_LENGTH,
@@ -171,6 +172,53 @@ impl NamedLocks {
 }
 
 // ---------------------------------------------------------------------------
+// LockBackend — abstracts local NamedLocks vs distributed LockClient.
+// ---------------------------------------------------------------------------
+
+/// Owned guard returned by `LockBackend::lock`. Held for the duration of the critical section;
+/// dropping it releases the lock (local) or fires a best-effort release RPC (distributed).
+pub enum LockBackendGuard {
+    Local(OwnedMutexGuard<()>),
+    Distributed(crate::lock_client::LockGuard),
+}
+
+/// Per-doc lock abstraction — local [`NamedLocks`] in standalone mode,
+/// distributed [`LockClient`] in cluster mode.
+#[derive(Clone)]
+pub enum LockBackend {
+    Local(NamedLocks),
+    Distributed(Arc<crate::lock_client::LockClient>),
+}
+
+impl LockBackend {
+    pub fn local(locks: NamedLocks) -> Self {
+        Self::Local(locks)
+    }
+
+    pub fn distributed(lock_client: Arc<crate::lock_client::LockClient>) -> Self {
+        Self::Distributed(lock_client)
+    }
+
+    /// Acquire a per-doc lock. Key format: `"{collection_name}-{doc_id}"`.
+    /// In distributed mode, acquires the distributed lock with a 60s timeout.
+    pub async fn lock(&self, key: &str) -> Result<LockBackendGuard, String> {
+        match self {
+            LockBackend::Local(locks) => {
+                Ok(LockBackendGuard::Local(locks.lock(key).await))
+            }
+            LockBackend::Distributed(lock_client) => {
+                let guard = lock_client
+                    .acquire(&[key], std::time::Duration::from_secs(60))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(LockBackendGuard::Distributed(guard))
+            }
+        }
+    }
+
+}
+
+// ---------------------------------------------------------------------------
 // CollectionConfigCache — TTL cache for collection configs.
 //
 // Mirrors EncoderBase._collection_info_cache: AMGIXCache(ttl=60, maxsize=1000).
@@ -256,17 +304,21 @@ fn apply_token_length_updates_to_stats(
     let new_docs_in_batch = updates.values().next().map(|u| u.new_doc_count).unwrap_or(0);
     let new_doc_count = old_doc_count + new_docs_in_batch;
 
-    for (field_vector_name, u) in updates {
-        let old_avgdl = stats.avgdls.get(field_vector_name).copied().unwrap_or(0.0);
-        let new_avgdl = (old_avgdl * old_doc_count as f64
-            - u.old_sum_token_lengths as f64
-            + u.new_sum_token_lengths as f64
-            + u.update_sum_token_lengths as f64)
-            / new_doc_count as f64;
-        stats.avgdls.insert(field_vector_name.clone(), new_avgdl);
+    if new_doc_count <= 0 {
+        stats.doc_count = 0;
+        stats.avgdls.clear();
+    } else {
+        for (field_vector_name, u) in updates {
+            let old_avgdl = stats.avgdls.get(field_vector_name).copied().unwrap_or(0.0);
+            let new_avgdl = (old_avgdl * old_doc_count as f64
+                - u.old_sum_token_lengths as f64
+                + u.new_sum_token_lengths as f64
+                + u.update_sum_token_lengths as f64)
+                / new_doc_count as f64;
+            stats.avgdls.insert(field_vector_name.clone(), new_avgdl);
+        }
+        stats.doc_count = new_doc_count;
     }
-
-    stats.doc_count = new_doc_count;
 }
 
 async fn persist_stats_maps_for_collection(
@@ -304,7 +356,8 @@ struct StatsJob {
 }
 
 /// Coalesces many stat updates into fewer Qdrant writes (up to [`STATS_BATCH_MAX_JOBS`] jobs or
-/// [`STATS_BATCH_WAIT`] after the first job in a window).
+/// [`STATS_BATCH_WAIT`] after the first job in a window). In cluster mode publishes via
+/// `talk("collection-stats")` instead of writing directly to Qdrant.
 #[derive(Clone)]
 pub struct StatsUpdateBatcher {
     tx: mpsc::Sender<StatsJob>,
@@ -328,11 +381,15 @@ impl StatsBatcherShutdown {
 }
 
 impl StatsUpdateBatcher {
-    pub fn new(db: Arc<QdrantDb>, stats_locks: NamedLocks) -> (Self, StatsBatcherShutdown) {
+    pub fn new(
+        db: Arc<QdrantDb>,
+        stats_locks: NamedLocks,
+        bunny: Option<Arc<BunnyTalk>>,
+    ) -> (Self, StatsBatcherShutdown) {
         let (tx, mut rx) = mpsc::channel::<StatsJob>(STATS_BATCH_CHANNEL);
         let join = tokio::spawn(async move {
             while let Some(batch) = collect_stats_batch(&mut rx).await {
-                flush_stats_job_batch(&stats_locks, &db, batch).await;
+                flush_stats_job_batch(&stats_locks, &db, &bunny, batch).await;
             }
         });
         let batcher = Self { tx: tx.clone() };
@@ -387,6 +444,7 @@ async fn collect_stats_batch(rx: &mut mpsc::Receiver<StatsJob>) -> Option<Vec<St
 async fn flush_stats_job_batch(
     stats_locks: &NamedLocks,
     db: &QdrantDb,
+    bunny: &Option<Arc<BunnyTalk>>,
     batch: Vec<StatsJob>,
 ) {
     let mut by_collection: HashMap<String, Vec<StatsJob>> = HashMap::new();
@@ -398,20 +456,57 @@ async fn flush_stats_job_batch(
     }
 
     for (collection_name, jobs) in by_collection {
-        let maps_in_order: Vec<_> = jobs.iter().map(|j| &j.updates).collect();
-        if let Err(e) = persist_stats_maps_for_collection(
-            stats_locks,
-            db,
-            &collection_name,
-            &maps_in_order,
-        )
-        .await
-        {
-            tracing::error!(
-                collection = %collection_name,
-                error = %e,
-                "stats batch persist failed after retries"
-            );
+        if let Some(bunny) = bunny {
+            // Cluster mode: publish each job as its own talk — mirrors amgix-server's one
+            // talk-per-vectorization-batch behaviour. Merging jobs would corrupt new_doc_count
+            // (each job carries the count for that batch only; summing across batches breaks the
+            // Python consumer's avgdl calculation).
+            for job in &jobs {
+                let updates: HashMap<String, serde_json::Value> = job.updates.iter().map(|(field, u)| {
+                    (field.clone(), serde_json::json!({
+                        "new_doc_count": u.new_doc_count,
+                        "new_sum_token_lengths": u.new_sum_token_lengths,
+                        "update_doc_count": u.update_doc_count,
+                        "update_sum_token_lengths": u.update_sum_token_lengths,
+                        "old_sum_token_lengths": u.old_sum_token_lengths,
+                    }))
+                }).collect();
+                if let Err(e) = bunny
+                    .talk(
+                        "collection-stats",
+                        serde_json::json!({
+                            "collection_name": collection_name,
+                            "updates": updates,
+                        }),
+                        false,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        collection = %collection_name,
+                        error = %e,
+                        "stats talk(collection-stats) failed"
+                    );
+                }
+            }
+        } else {
+            // Standalone mode: write directly to Qdrant.
+            let maps_in_order: Vec<_> = jobs.iter().map(|j| &j.updates).collect();
+            if let Err(e) = persist_stats_maps_for_collection(
+                stats_locks,
+                db,
+                &collection_name,
+                &maps_in_order,
+            )
+            .await
+            {
+                tracing::error!(
+                    collection = %collection_name,
+                    error = %e,
+                    "stats batch persist failed after retries"
+                );
+            }
         }
     }
 }
@@ -512,7 +607,7 @@ impl UpsertIngress {
         db: Arc<QdrantDb>,
         cache: CollectionConfigCache,
         stats_batcher: StatsUpdateBatcher,
-        doc_locks: NamedLocks,
+        doc_locks: LockBackend,
         index_pool: Arc<rayon::ThreadPool>,
     ) -> (Self, UpsertIngressShutdown) {
         let (bulk_tx, mut bulk_rx) = mpsc::channel::<BulkIngressJob>(BULK_UPSERT_QUEUE_CAPACITY);
@@ -929,7 +1024,7 @@ async fn process_single_document_microbatch(
     db: &Arc<QdrantDb>,
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
-    doc_locks: &NamedLocks,
+    doc_locks: &LockBackend,
     index_pool: &Arc<rayon::ThreadPool>,
 ) {
     let mut by_collection: HashMap<String, Vec<SingleIngressJob>> = HashMap::new();
@@ -960,7 +1055,7 @@ async fn respond_single_microbatch_for_collection(
     db: &Arc<QdrantDb>,
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
-    doc_locks: &NamedLocks,
+    doc_locks: &LockBackend,
     index_pool: &Arc<rayon::ThreadPool>,
 ) {
     let n = slots.len();
@@ -1125,7 +1220,7 @@ pub(crate) async fn document_upsert_bulk_internal(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
-    doc_locks: &NamedLocks,
+    doc_locks: &LockBackend,
     index_pool: &Arc<rayon::ThreadPool>,
     collection_name: &str,
     documents: Vec<Document>,
@@ -1162,7 +1257,11 @@ pub(crate) async fn document_upsert_bulk_internal(
     doc_ids.dedup();
     let mut guards = Vec::with_capacity(doc_ids.len());
     for id in &doc_ids {
-        guards.push(doc_locks.lock(&format!("{collection_name}-{id}")).await);
+        let guard = doc_locks
+            .lock(&format!("{collection_name}-{id}"))
+            .await
+            .map_err(|e| UpsertSyncError::Db(DbError::Config(e)))?;
+        guards.push(guard);
     }
 
     // Batch fetch existing documents.
@@ -1312,13 +1411,16 @@ pub(crate) async fn document_upsert_bulk_internal(
 pub async fn document_delete_sync(
     db: &QdrantDb,
     stats_batcher: &StatsUpdateBatcher,
-    doc_locks: &NamedLocks,
+    doc_locks: &LockBackend,
     collection_name: &str,
     document_id: &str,
     request_timestamp: DateTime<Utc>,
 ) -> Result<Vec<String>, UpsertSyncError> {
     let doc_lock_key = format!("{collection_name}-{document_id}");
-    let _doc_guard = doc_locks.lock(&doc_lock_key).await;
+    let _doc_guard = doc_locks
+        .lock(&doc_lock_key)
+        .await
+        .map_err(|e| UpsertSyncError::Db(DbError::Config(e)))?;
 
     let existing = db
         .get_documents(collection_name, &[document_id], true)

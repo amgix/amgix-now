@@ -1,12 +1,21 @@
 name: amgix-cluster
 
-x-api-image: &amgix-now
+x-amgix-now-image: &amgix-now
   build:
     context: ..
     dockerfile: build/Dockerfile.cpu
     args:
       AMGIX_VERSION: 0.1.0-dev
   image: amgix-now:dev
+
+x-amgix-one-image: &amgix-one
+  build:
+    context: ../../amgix-server
+    dockerfile: ../amgix-server/build/one/Dockerfile-one
+    args:
+      AMGIX_VERSION: v1.0.0-dev
+      AMGIX_BUILD_ST: CPU
+  image: amgix-one:v1.0.0-dev
 
 services:
 
@@ -40,7 +49,7 @@ services:
     cpus: "4"
 
   amgix-one:
-    image: amgixio/amgix-one:1
+    <<: *amgix-one
     pull_policy: always
     expose:
       - "8234"
@@ -73,6 +82,7 @@ services:
     environment:
       - AMGIX_DATABASE_URL=qdrant://qdrant:6334
       - AMGIX_AMQP_URL=amqp://guest:guest@rabbitmq/
+      # - AMGIX_NOW_SYNC_DB_WRITES=true
     cpus: "4"
 
 
