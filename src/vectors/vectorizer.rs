@@ -3,12 +3,15 @@
 //! Embedding is routed through [`route_embed_dispatch`] instead of a Python `EmbedRouter` closure.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
 use crate::common::{
     DocumentField, VectorType, DEFAULT_WMTR_TRIGRAM_WEIGHT,
 };
+use crate::metrics::MetricsCollector;
 use crate::models::{
     Document, DocumentWithVectors, SearchQuery, SearchQuerySettings, SearchQueryWithVectors,
     VectorConfigInternal, VectorData, VectorSearchWeight,
@@ -32,13 +35,24 @@ pub enum RoutedEmbed {
 
 /// Mirrors `EmbedRouterService.embed` routing (dense vs sparse vs custom-token batch path).
 /// Do **not** call this for `dense_custom` / `sparse_custom` — those are handled like Python.
+///
+/// Records all embed metric keys when `metrics` is `Some`. amgix-now always has `hops=0`
+/// (no routing), so origin metrics equal local metrics — same as Python when `hops==0`.
 pub fn route_embed_dispatch(
     config: &VectorConfigInternal,
     docs: &[String],
     avgdls: Option<&[f64]>,
     trigram_weight: f64,
+    metrics: Option<&MetricsCollector>,
 ) -> Result<RoutedEmbed, String> {
-    match config.vector_type {
+    let t0 = Instant::now();
+    let n_passages = docs.len();
+    let type_str = config.vector_type.to_string();
+    let model_str = config.model.as_deref().unwrap_or("");
+    let revision_str = config.revision.as_deref().unwrap_or("");
+    let dim = &[type_str.as_str(), model_str, revision_str];
+
+    let result = match config.vector_type {
         VectorType::DenseModel => Ok(RoutedEmbed::Dense(
             DenseModelVector.get_dense_vector(config, docs)?,
         )),
@@ -108,7 +122,28 @@ pub fn route_embed_dispatch(
         VectorType::DenseCustom | VectorType::SparseCustom => Err(
             "route_embed_dispatch must not be called for dense_custom/sparse_custom".to_string(),
         ),
+    };
+
+    if let Some(m) = metrics {
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        match &result {
+            Ok(_) => {
+                let n = n_passages as f64;
+                m.record(crate::metrics::keys::EMBED_BATCHES, dim, 1.0, None);
+                m.record(crate::metrics::keys::EMBED_BATCHES_ORIGIN, dim, 1.0, None);
+                m.record(crate::metrics::keys::EMBED_PASSAGES, dim, n, None);
+                m.record(crate::metrics::keys::EMBED_PASSAGES_ORIGIN, dim, n, None);
+                m.record(crate::metrics::keys::EMBED_INFERENCE_MS, dim, elapsed_ms, Some(1));
+                m.record(crate::metrics::keys::EMBED_INFERENCE_ORIGIN_MS, dim, elapsed_ms, Some(1));
+                m.record(crate::metrics::keys::EMBED_HOPS, dim, 0.0, Some(1));
+            }
+            Err(_) => {
+                m.record(crate::metrics::keys::EMBED_INFERENCE_ORIGIN_ERRORS, dim, 1.0, None);
+            }
+        }
     }
+
+    result
 }
 
 fn dense_config_with_query_embedding_model(mut c: VectorConfigInternal) -> VectorConfigInternal {
@@ -143,12 +178,14 @@ impl Vectorizer {
         documents: &[Document],
         vector_configs: &[VectorConfigInternal],
         avgdl_dict: Option<&HashMap<String, f64>>,
+        metrics: Option<Arc<MetricsCollector>>,
     ) -> Result<Vec<DocumentWithVectors>, String> {
         // Each config is independent — run them in parallel across the rayon pool when there
         // are multiple configs. Falls back to sequential for single-config collections to avoid
         // rayon overhead (mirrors the search path guard).
         let n = documents.len();
         let vectorize_config = |config: &VectorConfigInternal| -> Result<(Vec<Vec<VectorData>>, Vec<HashMap<String, usize>>), String> {
+                let m = metrics.as_deref();
                 let mut vectors: Vec<Vec<VectorData>> = vec![Vec::new(); n];
                 let mut token_lengths: Vec<HashMap<String, usize>> = vec![HashMap::new(); n];
 
@@ -166,6 +203,7 @@ impl Vectorizer {
                                 &texts,
                                 None,
                                 DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                                m,
                             )?
                             else {
                                 return Err(format!(
@@ -286,6 +324,7 @@ impl Vectorizer {
                                 &texts,
                                 if is_custom { Some(avgdls.as_slice()) } else { None },
                                 DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                                m,
                             )? {
                                 RoutedEmbed::Sparse(v) => v,
                                 RoutedEmbed::Dense(_) => {
@@ -385,10 +424,11 @@ impl Vectorizer {
         mut query: SearchQuery,
         vector_configs: &[VectorConfigInternal],
         validation_mode: bool,
+        metrics: Option<Arc<MetricsCollector>>,
     ) -> Result<SearchQueryWithVectors, String> {
         let q = query.query.clone();
         let mut batch =
-            Self::vectorize_search_queries(std::slice::from_ref(&q), &mut query.settings, vector_configs, validation_mode)?;
+            Self::vectorize_search_queries(std::slice::from_ref(&q), &mut query.settings, vector_configs, validation_mode, metrics)?;
         batch.pop().ok_or_else(|| "internal: empty search batch".to_string())
     }
 
@@ -399,6 +439,7 @@ impl Vectorizer {
         settings: &mut SearchQuerySettings,
         vector_configs: &[VectorConfigInternal],
         validation_mode: bool,
+        metrics: Option<Arc<MetricsCollector>>,
     ) -> Result<Vec<SearchQueryWithVectors>, String> {
         if query_texts.is_empty() {
             return Err("Search query batch cannot be empty".to_string());
@@ -490,6 +531,7 @@ impl Vectorizer {
                         fields,
                         settings,
                         validation_mode,
+                        metrics.as_deref(),
                     )
                     .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))
                 })
@@ -504,6 +546,7 @@ impl Vectorizer {
                     fields,
                     settings,
                     validation_mode,
+                    metrics.as_deref(),
                 )
                 .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))?;
                 out.push(batch);
@@ -533,6 +576,7 @@ impl Vectorizer {
         fields: &[DocumentField],
         settings: &SearchQuerySettings,
         validation_mode: bool,
+        metrics: Option<&MetricsCollector>,
     ) -> Result<Vec<Vec<VectorData>>, String> {
         let n = query_texts.len();
         let mut per_query: Vec<Vec<VectorData>> = vec![Vec::new(); n];
@@ -546,6 +590,7 @@ impl Vectorizer {
                     query_texts,
                     None,
                     DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                    metrics,
                 )?
                 else {
                     return Err("dense routing returned sparse".to_string());
@@ -646,6 +691,7 @@ impl Vectorizer {
                         query_texts,
                         Some(avgdls_5.as_slice()),
                         settings.wmtr_trigram_weight,
+                        metrics,
                     )
                 } else {
                     route_embed_dispatch(
@@ -653,6 +699,7 @@ impl Vectorizer {
                         query_texts,
                         None,
                         settings.wmtr_trigram_weight,
+                        metrics,
                     )
                 }?;
 

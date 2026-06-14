@@ -190,6 +190,103 @@ async fn not_implemented_amgix_now_collection_queue(Path(collection_name): Path<
     }
 }
 
+/// Axum middleware — mirrors `ApiMetricsMiddleware` + `record_api_http_request` from `api_metrics.py`.
+///
+/// Records `api_requests`, `api_request_ms`, per-operation classified metrics, and 4xx/5xx errors.
+/// No-op when `AppState.metrics` is `None` (standalone mode).
+async fn api_metrics_middleware(
+    State(app): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+
+    let t0 = std::time::Instant::now();
+    let response = next.run(request).await;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    if let Some(ref m) = app.metrics {
+        m.record(metrics::keys::API_REQUESTS, &[], 1.0, None);
+        m.record(metrics::keys::API_REQUEST_MS, &[], elapsed_ms, Some(1));
+
+        let status = response.status().as_u16();
+        if status >= 500 {
+            m.record(metrics::keys::API_ERROR_5XX, &[], 1.0, None);
+        } else if status >= 400 {
+            m.record(metrics::keys::API_ERROR_4XX, &[], 1.0, None);
+        }
+
+        // Classify by method + path pattern — mirrors _CLASSIFIED_OPERATIONS.
+        let path = uri.path();
+        match (method.as_str(), classify_api_route(path)) {
+            ("POST", Some(RouteKind::AsyncUpload)) => {
+                m.record(metrics::keys::API_ASYNC_UPLOAD, &[], 1.0, None);
+                m.record(metrics::keys::API_ASYNC_UPLOAD_MS, &[], elapsed_ms, Some(1));
+            }
+            ("POST", Some(RouteKind::SyncUpload)) => {
+                m.record(metrics::keys::API_SYNC_UPLOAD, &[], 1.0, None);
+                m.record(metrics::keys::API_SYNC_UPLOAD_MS, &[], elapsed_ms, Some(1));
+            }
+            ("POST", Some(RouteKind::BulkUpload)) => {
+                m.record(metrics::keys::API_BULK_UPLOAD, &[], 1.0, None);
+                m.record(metrics::keys::API_BULK_UPLOAD_MS, &[], elapsed_ms, Some(1));
+            }
+            ("POST", Some(RouteKind::Search)) => {
+                m.record(metrics::keys::API_SEARCH, &[], 1.0, None);
+                m.record(metrics::keys::API_SEARCH_MS, &[], elapsed_ms, Some(1));
+            }
+            ("DELETE", Some(RouteKind::AsyncDelete)) => {
+                m.record(metrics::keys::API_ASYNC_DELETE, &[], 1.0, None);
+                m.record(metrics::keys::API_ASYNC_DELETE_MS, &[], elapsed_ms, Some(1));
+            }
+            ("DELETE", Some(RouteKind::SyncDelete)) => {
+                m.record(metrics::keys::API_SYNC_DELETE, &[], 1.0, None);
+                m.record(metrics::keys::API_SYNC_DELETE_MS, &[], elapsed_ms, Some(1));
+            }
+            _ => {}
+        }
+    }
+
+    response
+}
+
+enum RouteKind {
+    AsyncUpload,
+    SyncUpload,
+    BulkUpload,
+    Search,
+    AsyncDelete,
+    SyncDelete,
+}
+
+fn classify_api_route(path: &str) -> Option<RouteKind> {
+    // Check specific suffixes before the generic segment match.
+    if path.ends_with("/documents/bulk") {
+        return Some(RouteKind::BulkUpload);
+    }
+    if path.ends_with("/documents/sync") {
+        return Some(RouteKind::SyncUpload);
+    }
+    if path.ends_with("/search") {
+        return Some(RouteKind::Search);
+    }
+    if let Some(after) = path.strip_prefix("/v1/collections/") {
+        // splitn(5) gives us up to: {c}, "documents", {id}, "sync", remainder
+        let segments: Vec<&str> = after.splitn(5, '/').collect();
+        match segments.as_slice() {
+            // POST /v1/collections/{c}/documents  → upsert_document (async)
+            [_, "documents"] => return Some(RouteKind::AsyncUpload),
+            // DELETE /v1/collections/{c}/documents/{id}/sync  → delete_document_sync
+            [_, "documents", _id, "sync"] => return Some(RouteKind::SyncDelete),
+            // DELETE /v1/collections/{c}/documents/{id}  → delete_document (async)
+            [_, "documents", _id] => return Some(RouteKind::AsyncDelete),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// `GET /v1/health/check` — process is up and serving HTTP (mirrors Python `health_check`).
 async fn health_check() -> Json<OkResponse> {
     Json(OkResponse::ok())
@@ -654,6 +751,7 @@ async fn delete_document(
         &app.db,
         &app.stats_batcher,
         &app.doc_locks,
+        app.metrics.as_deref(),
         &real_collection_name,
         &document_id,
         request_timestamp,
@@ -1028,9 +1126,10 @@ async fn main() {
         stats_batcher.clone(),
         doc_locks.clone(),
         Arc::clone(&index_pool),
+        metrics_collector.clone(),
     );
     let (search_ingress, search_shutdown) =
-        SearchIngress::new(Arc::clone(&db), collection_cache.clone(), Arc::clone(&search_pool));
+        SearchIngress::new(Arc::clone(&db), collection_cache.clone(), Arc::clone(&search_pool), metrics_collector.clone());
 
     let state = AppState {
         db,
@@ -1113,6 +1212,7 @@ async fn main() {
             "/v1/collections/{collection_name}/search",
             post(search),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), api_metrics_middleware))
         .layer(middleware::from_fn(log_failed_http_responses))
         .with_state(state);
 

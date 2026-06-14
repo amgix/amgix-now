@@ -32,6 +32,50 @@ const WINDOWS: &[i64] = &[30, 60];
 const MAX_WINDOW: i64 = 60;
 
 // ---------------------------------------------------------------------------
+// Metric keys — mirrors metrics_definitions.py MetricKey
+// ---------------------------------------------------------------------------
+
+pub mod keys {
+    pub const API_REQUESTS: &str = "api_requests";
+    pub const API_REQUEST_MS: &str = "api_request_ms";
+    pub const API_ASYNC_UPLOAD: &str = "api_async_upload";
+    pub const API_ASYNC_UPLOAD_MS: &str = "api_async_upload_ms";
+    pub const API_SYNC_UPLOAD: &str = "api_sync_upload";
+    pub const API_SYNC_UPLOAD_MS: &str = "api_sync_upload_ms";
+    pub const API_BULK_UPLOAD: &str = "api_bulk_upload";
+    pub const API_BULK_UPLOAD_MS: &str = "api_bulk_upload_ms";
+    pub const API_SEARCH: &str = "api_search";
+    pub const API_SEARCH_MS: &str = "api_search_ms";
+    pub const API_ASYNC_DELETE: &str = "api_async_delete";
+    pub const API_ASYNC_DELETE_MS: &str = "api_async_delete_ms";
+    pub const API_SYNC_DELETE: &str = "api_sync_delete";
+    pub const API_SYNC_DELETE_MS: &str = "api_sync_delete_ms";
+    pub const API_ERROR_4XX: &str = "api_error_4xx";
+    pub const API_ERROR_5XX: &str = "api_error_5xx";
+    pub const INDEX_QUEUE_DOCS_SKIPPED_STALE: &str = "index_queue_docs_skipped_stale";
+    pub const INDEX_QUEUE_DOCS_NEW: &str = "index_queue_docs_new";
+    pub const INDEX_QUEUE_DOCS_UPDATED: &str = "index_queue_docs_updated";
+    pub const INDEX_QUEUE_DOCS_DELETED: &str = "index_queue_docs_deleted";
+    pub const INDEX_QUEUE_DELETE_JOB_MS: &str = "index_queue_delete_job_ms";
+    pub const INDEX_QUEUE_FAILED: &str = "index_queue_failed";
+    pub const INDEX_QUEUE_REQUEUED: &str = "index_queue_requeued";
+    pub const INDEX_QUEUE_JOB_MS: &str = "index_queue_job_ms";
+    pub const INDEX_BULK_BATCHES: &str = "index_bulk_batches";
+    pub const INDEX_BULK_BATCH_SIZE: &str = "index_bulk_batch_size";
+    pub const INDEX_BULK_FAILED: &str = "index_bulk_failed";
+    pub const INDEX_BULK_REQUEUED: &str = "index_bulk_requeued";
+    pub const INDEX_BULK_JOB_MS: &str = "index_bulk_job_ms";
+    pub const EMBED_BATCHES_ORIGIN: &str = "embed_batches_origin";
+    pub const EMBED_PASSAGES_ORIGIN: &str = "embed_passages_origin";
+    pub const EMBED_INFERENCE_ORIGIN_MS: &str = "embed_inference_origin_ms";
+    pub const EMBED_INFERENCE_ORIGIN_ERRORS: &str = "embed_inference_origin_errors";
+    pub const EMBED_BATCHES: &str = "embed_batches";
+    pub const EMBED_PASSAGES: &str = "embed_passages";
+    pub const EMBED_INFERENCE_MS: &str = "embed_inference_ms";
+    pub const EMBED_HOPS: &str = "embed_hops";
+}
+
+// ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 

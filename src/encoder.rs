@@ -61,6 +61,7 @@ fn needs_revectorization(
     }
     false
 }
+use crate::metrics::MetricsCollector;
 use crate::qdrant::{CollectionStats, DbError, QdrantDb};
 use crate::vectors::vectorizer::Vectorizer;
 
@@ -569,6 +570,9 @@ fn send_single_ingress_reply(
 pub struct UpsertIngress {
     bulk_tx: mpsc::Sender<BulkIngressJob>,
     singles_tx: mpsc::Sender<SingleIngressJob>,
+    /// Held so the `Arc` stays alive for the worker closures that own clones of it.
+    #[allow(dead_code)]
+    metrics: Option<Arc<MetricsCollector>>,
 }
 
 /// Await [**`shutdown_and_wait`**](Self::shutdown_and_wait) **after** [`axum::serve`] returns so
@@ -609,6 +613,7 @@ impl UpsertIngress {
         stats_batcher: StatsUpdateBatcher,
         doc_locks: LockBackend,
         index_pool: Arc<rayon::ThreadPool>,
+        metrics: Option<Arc<MetricsCollector>>,
     ) -> (Self, UpsertIngressShutdown) {
         let (bulk_tx, mut bulk_rx) = mpsc::channel::<BulkIngressJob>(BULK_UPSERT_QUEUE_CAPACITY);
         let bulk = {
@@ -617,6 +622,7 @@ impl UpsertIngress {
             let stats_batcher = stats_batcher.clone();
             let doc_locks = doc_locks.clone();
             let index_pool = Arc::clone(&index_pool);
+            let metrics = metrics.clone();
             tokio::spawn(async move {
                 let mut inflight = JoinSet::new();
                 loop {
@@ -639,7 +645,9 @@ impl UpsertIngress {
                             let stats_batcher = stats_batcher.clone();
                             let doc_locks = doc_locks.clone();
                             let index_pool = Arc::clone(&index_pool);
+                            let metrics = metrics.clone();
                             inflight.spawn(async move {
+                                let t0 = std::time::Instant::now();
                                 // Split into chunks and run each concurrently so vectorization
                                 // spreads across rayon threads rather than running serially.
                                 let chunks: Vec<Vec<Document>> = documents
@@ -653,6 +661,7 @@ impl UpsertIngress {
                                     let stats_batcher = stats_batcher.clone();
                                     let doc_locks = doc_locks.clone();
                                     let index_pool = Arc::clone(&index_pool);
+                                    let metrics = metrics.clone();
                                     let collection_name = collection_name.clone();
                                     chunk_set.spawn(async move {
                                         document_upsert_bulk_internal(
@@ -661,6 +670,7 @@ impl UpsertIngress {
                                             &stats_batcher,
                                             &doc_locks,
                                             &index_pool,
+                                            metrics.clone(),
                                             &collection_name,
                                             chunk,
                                         )
@@ -687,6 +697,14 @@ impl UpsertIngress {
                                     Some(e) => Err(e),
                                     None => Ok(all_skipped),
                                 };
+                                if let Some(m) = &metrics {
+                                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                    m.record(crate::metrics::keys::INDEX_BULK_BATCHES, &[], 1.0, None);
+                                    m.record(crate::metrics::keys::INDEX_BULK_JOB_MS, &[], elapsed_ms, Some(1));
+                                    if out.is_err() {
+                                        m.record(crate::metrics::keys::INDEX_BULK_FAILED, &[], 1.0, None);
+                                    }
+                                }
                                 let _ = reply.send(out);
                             });
                         }
@@ -708,6 +726,7 @@ impl UpsertIngress {
             let stats_batcher = stats_batcher.clone();
             let doc_locks = doc_locks.clone();
             let index_pool = Arc::clone(&index_pool);
+            let metrics = metrics.clone();
             tokio::spawn(async move {
                 let mut inflight = JoinSet::new();
                 loop {
@@ -734,6 +753,7 @@ impl UpsertIngress {
                     let stats_batcher = stats_batcher.clone();
                     let doc_locks = doc_locks.clone();
                     let index_pool = Arc::clone(&index_pool);
+                    let metrics = metrics.clone();
                     inflight.spawn(async move {
                         process_single_document_microbatch(
                             batch,
@@ -742,6 +762,7 @@ impl UpsertIngress {
                             &stats_batcher,
                             &doc_locks,
                             &index_pool,
+                            metrics.clone(),
                         )
                         .await;
                     });
@@ -758,6 +779,7 @@ impl UpsertIngress {
             Self {
                 bulk_tx,
                 singles_tx,
+                metrics,
             },
             UpsertIngressShutdown { bulk, singles },
         )
@@ -777,6 +799,8 @@ struct SearchIngressJob {
 #[derive(Clone)]
 pub struct SearchIngress {
     tx: mpsc::Sender<SearchIngressJob>,
+    #[allow(dead_code)]
+    metrics: Option<Arc<MetricsCollector>>,
 }
 
 pub struct SearchIngressShutdown {
@@ -796,44 +820,49 @@ impl SearchIngress {
         db: Arc<QdrantDb>,
         cache: CollectionConfigCache,
         search_pool: Arc<rayon::ThreadPool>,
+        metrics: Option<Arc<MetricsCollector>>,
     ) -> (Self, SearchIngressShutdown) {
         let (tx, mut rx) = mpsc::channel::<SearchIngressJob>(SEARCH_INGRESS_QUEUE_CAPACITY);
-        let worker = tokio::spawn(async move {
-            let mut inflight = JoinSet::new();
-            loop {
-                while inflight.len() >= SEARCH_INGRESS_CONCURRENT_MICROBATCH_MAX {
-                    if let Some(res) = inflight.join_next().await {
-                        if let Err(e) = res {
-                            tracing::warn!("search micro-batch task panicked: {e}");
+        let worker = {
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let mut inflight = JoinSet::new();
+                loop {
+                    while inflight.len() >= SEARCH_INGRESS_CONCURRENT_MICROBATCH_MAX {
+                        if let Some(res) = inflight.join_next().await {
+                            if let Err(e) = res {
+                                tracing::warn!("search micro-batch task panicked: {e}");
+                            }
                         }
                     }
+                    let first = match rx.recv().await {
+                        None => break,
+                        Some(j) => j,
+                    };
+                    let mut batch = vec![first];
+                    while batch.len() < SEARCH_INGRESS_MICROBATCH_DRAIN_MAX {
+                        match rx.try_recv() {
+                            Ok(j) => batch.push(j),
+                            Err(_) => break,
+                        }
+                    }
+                    let db = Arc::clone(&db);
+                    let cache = cache.clone();
+                    let search_pool = Arc::clone(&search_pool);
+                    let metrics = metrics.clone();
+                    inflight.spawn(async move {
+                        process_search_microbatch(batch, db, cache, search_pool, metrics).await;
+                    });
                 }
-                let first = match rx.recv().await {
-                    None => break,
-                    Some(j) => j,
-                };
-                let mut batch = vec![first];
-                while batch.len() < SEARCH_INGRESS_MICROBATCH_DRAIN_MAX {
-                    match rx.try_recv() {
-                        Ok(j) => batch.push(j),
-                        Err(_) => break,
+                while let Some(res) = inflight.join_next().await {
+                    if let Err(e) = res {
+                        tracing::warn!("search micro-batch task panicked: {e}");
                     }
                 }
-                let db = Arc::clone(&db);
-                let cache = cache.clone();
-                let search_pool = Arc::clone(&search_pool);
-                inflight.spawn(async move {
-                    process_search_microbatch(batch, db, cache, search_pool).await;
-                });
-            }
-            while let Some(res) = inflight.join_next().await {
-                if let Err(e) = res {
-                    tracing::warn!("search micro-batch task panicked: {e}");
-                }
-            }
-        });
+            })
+        };
 
-        (Self { tx }, SearchIngressShutdown { worker })
+        (Self { tx, metrics }, SearchIngressShutdown { worker })
     }
 
     pub async fn search(
@@ -864,6 +893,7 @@ async fn process_search_microbatch(
     db: Arc<QdrantDb>,
     cache: CollectionConfigCache,
     search_pool: Arc<rayon::ThreadPool>,
+    metrics: Option<Arc<MetricsCollector>>,
 ) {
     let mut by_key: HashMap<(String, SearchQuerySettings), Vec<SearchIngressJob>> = HashMap::new();
     for j in jobs {
@@ -878,6 +908,7 @@ async fn process_search_microbatch(
             &db,
             &cache,
             &search_pool,
+            metrics.clone(),
         )
         .await;
     }
@@ -889,6 +920,7 @@ async fn run_search_bucket(
     db: &Arc<QdrantDb>,
     cache: &CollectionConfigCache,
     search_pool: &Arc<rayon::ThreadPool>,
+    metrics: Option<Arc<MetricsCollector>>,
 ) {
     let (mut collection_config, from_cache) =
         match get_collection_info_cached(db, cache, collection_name).await {
@@ -927,12 +959,13 @@ async fn run_search_bucket(
     let spawn_vectorize = |cfg: CollectionConfigInternal,
                            qt: Vec<String>,
                            sett: SearchQuerySettings,
-                           pool: Arc<rayon::ThreadPool>| {
+                           pool: Arc<rayon::ThreadPool>,
+                           m: Option<Arc<MetricsCollector>>| {
         let vecs = cfg.vectors.clone();
         let (tx, rx) = oneshot::channel();
         pool.spawn(move || {
             let mut settings = sett;
-            let r = Vectorizer::vectorize_search_queries(&qt, &mut settings, &vecs, false);
+            let r = Vectorizer::vectorize_search_queries(&qt, &mut settings, &vecs, false, m);
             let _ = tx.send(r);
         });
         rx
@@ -944,6 +977,7 @@ async fn run_search_bucket(
         query_texts.clone(),
         settings0.clone(),
         Arc::clone(&pool),
+        metrics.clone(),
     );
     let mut first = match rx.await {
         Ok(r) => r,
@@ -965,6 +999,7 @@ async fn run_search_bucket(
                 query_texts,
                 settings0,
                 pool,
+                metrics.clone(),
             );
             first = match rx.await {
                 Ok(r) => r,
@@ -1026,6 +1061,7 @@ async fn process_single_document_microbatch(
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
     index_pool: &Arc<rayon::ThreadPool>,
+    metrics: Option<Arc<MetricsCollector>>,
 ) {
     let mut by_collection: HashMap<String, Vec<SingleIngressJob>> = HashMap::new();
     for j in jobs {
@@ -1044,6 +1080,7 @@ async fn process_single_document_microbatch(
             stats_batcher,
             doc_locks,
             index_pool,
+            metrics.clone(),
         )
         .await;
     }
@@ -1057,6 +1094,7 @@ async fn respond_single_microbatch_for_collection(
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
     index_pool: &Arc<rayon::ThreadPool>,
+    metrics: Option<Arc<MetricsCollector>>,
 ) {
     let n = slots.len();
     let mut answered = vec![false; n];
@@ -1107,17 +1145,27 @@ async fn respond_single_microbatch_for_collection(
         return;
     }
 
-    match document_upsert_bulk_internal(
+    let n_merged = merged.len();
+    let t0 = std::time::Instant::now();
+    let result = document_upsert_bulk_internal(
         db,
         cache,
         stats_batcher,
         doc_locks,
         index_pool,
+        metrics.clone(),
         collection_name,
         merged,
     )
-    .await
-    {
+    .await;
+    if let Some(ref m) = metrics {
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        m.record(crate::metrics::keys::INDEX_QUEUE_JOB_MS, &[], elapsed_ms / n_merged as f64, Some(n_merged as i64));
+        if result.is_err() {
+            m.record(crate::metrics::keys::INDEX_QUEUE_FAILED, &[], 1.0, None);
+        }
+    }
+    match result {
         Ok(skipped) => {
             let skipped_set: HashSet<String> = skipped.into_iter().collect();
             for idx in 0..n {
@@ -1222,6 +1270,7 @@ pub(crate) async fn document_upsert_bulk_internal(
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
     index_pool: &Arc<rayon::ThreadPool>,
+    metrics: Option<Arc<MetricsCollector>>,
     collection_name: &str,
     documents: Vec<Document>,
 ) -> Result<Vec<String>, UpsertSyncError> {
@@ -1299,6 +1348,17 @@ pub(crate) async fn document_upsert_bulk_internal(
         }
     }
 
+    if !skipped.is_empty() {
+        if let Some(ref m) = metrics {
+            m.record(
+                crate::metrics::keys::INDEX_QUEUE_DOCS_SKIPPED_STALE,
+                &[],
+                skipped.len() as f64,
+                None,
+            );
+        }
+    }
+
     if !to_patch.is_empty() {
         let mut patch_docs: Vec<Document> = to_patch.iter().map(|d| (*d).clone()).collect();
         for doc in &mut patch_docs {
@@ -1335,9 +1395,10 @@ pub(crate) async fn document_upsert_bulk_internal(
     let pool = Arc::clone(index_pool);
 
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let metrics_for_post = metrics.clone();
 
     pool.spawn(move || {
-        let result = Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict));
+        let result = Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict), metrics);
         let _ = tx.send(result);
     });
 
@@ -1368,6 +1429,17 @@ pub(crate) async fn document_upsert_bulk_internal(
     // Build stats updates for vectorized docs only.
     let new_doc_count_batch = is_new_flags.iter().filter(|&&n| n).count() as i64;
     let update_doc_count_batch = is_new_flags.iter().filter(|&&n| !n).count() as i64;
+
+    if let Some(m) = metrics_for_post {
+        let n = docs_with_vectors.len() as f64;
+        if new_doc_count_batch > 0 {
+            m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_NEW, &[], new_doc_count_batch as f64, None);
+        }
+        if update_doc_count_batch > 0 {
+            m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_UPDATED, &[], update_doc_count_batch as f64, None);
+        }
+        m.record(crate::metrics::keys::INDEX_BULK_BATCH_SIZE, &[], n, Some(1));
+    }
 
     let mut updates: HashMap<String, TokenLengthUpdate> = HashMap::new();
     for (doc_idx, doc_with_vectors) in docs_with_vectors.iter().enumerate() {
@@ -1412,10 +1484,12 @@ pub async fn document_delete_sync(
     db: &QdrantDb,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
+    metrics: Option<&MetricsCollector>,
     collection_name: &str,
     document_id: &str,
     request_timestamp: DateTime<Utc>,
 ) -> Result<Vec<String>, UpsertSyncError> {
+    let t0 = std::time::Instant::now();
     let doc_lock_key = format!("{collection_name}-{document_id}");
     let _doc_guard = doc_locks
         .lock(&doc_lock_key)
@@ -1457,6 +1531,12 @@ pub async fn document_delete_sync(
 
     if !updates.is_empty() {
         stats_batcher.enqueue(collection_name, updates).await?;
+    }
+
+    if let Some(m) = metrics {
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_DELETED, &[], 1.0, None);
+        m.record(crate::metrics::keys::INDEX_QUEUE_DELETE_JOB_MS, &[], elapsed_ms, Some(1));
     }
 
     Ok(vec![])
@@ -1515,7 +1595,7 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
         },
     };
 
-    match Vectorizer::vectorize_search_query(dummy_query, vector_configs, true) {
+    match Vectorizer::vectorize_search_query(dummy_query, vector_configs, true, None) {
         Ok(query_with_vectors) => {
             let mut results: HashMap<String, ModelValidationResult> = HashMap::new();
 
