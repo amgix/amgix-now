@@ -24,14 +24,14 @@ fi
 if [ "${AMGIX_DATABASE_URL}" != "${AMGIX_DEFAULT_DATABASE_URL}" ]; then
     echo "[entrypoint] AMGIX_DATABASE_URL != AMGIX_DEFAULT_DATABASE_URL — disabling embedded Qdrant supervisord program"
     sed -i '/^\[program:qdrant\]/,/^\[program:amgix-now\]/ s/^autostart=true$/autostart=false/' /etc/supervisor/conf.d/amgix-now.conf
+else
+    # Fix permissions for mounted volumes (especially when /data is mounted from host)
+    mkdir -p /data/qdrant
+    chmod 755 /data/qdrant
 fi
 
 # Increase the maximum number of open files limit to 65536
 ulimit -n 65536
-
-# Fix permissions for mounted volumes (especially when /data is mounted from host)
-mkdir -p /data/qdrant
-chmod 755 /data/qdrant
 
 /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf > >(
     while IFS= read -r line; do
