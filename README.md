@@ -20,22 +20,23 @@ docker run -d -p 8235:8235 -v <path/on/host>:/data amgixio/amgix-now:0
 
 ## The Amgix Family
 
-| | Amgix Now | Amgix One | Amgix |
+| | [Amgix Now](#) | [Amgix One](https://github.com/amgix/amgix-server) | [Amgix](https://github.com/amgix/amgix-server) |
 |---|:---:|:---:|:---:|
-| Hybrid search | engine | system | system |
+| Hybrid search | engine * | system | system |
 | Single container | ✓ | ✓ | |
 | Async ingestion pipeline | | ✓ | ✓ |
-| Dashboard & metrics | | ✓ | ✓ |
+| Dashboard & metrics | ✓ ** | ✓ | ✓ |
 | PostgreSQL/MariaDB | | ✓ | ✓ |
-| High availability | limited* | awkward** | ✓ |
+| High availability | ✓ * | ✓ *** | ✓ |
 | Modular scaling | | | ✓ |
 | Model self-orchestration | | | ✓ |
 | **Throughput** | high | medium | scales with cluster |
 | **Latency** | lowest | medium | medium |
-| **Operational complexity** | lowest | medium | highest |
+| **Operational complexity** | lowest | low | medium |
 
-- \* Amgix Now can be configured as a primary/fallback behind a proxy and a shared external Qdrant instance
-- \*\* Multiple Amgix One instances can be deployed with external RabbitMQ and database instances, but it's awkward and better served by a full-scale Amgix cluster deployment
+- \* Multiple instances of Amgix Now can join a full Amgix cluster (or an instance of Amgix One)
+- \*\* Amgix Now collects and reports metrics to Amgix cluster when in cluster mode
+- \*\*\* Multiple Amgix One instances can be deployed with external RabbitMQ and database instances, but it's awkward and better served by a full-scale Amgix cluster deployment
 
 Same REST API and storage format across all three.
 
