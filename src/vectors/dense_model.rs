@@ -8,7 +8,7 @@ use crate::vectors::model_cache::{maybe_gpu_inference_permit, trusted_organizati
 use crate::vectors::st_pooling::pool_sentence_embeddings;
 use crate::vectors::vector_base::VectorBase;
 
-const DENSE_MODEL_BATCH_SIZE: usize = 32;
+const DENSE_MODEL_BATCH_SIZE: usize = 8;
 
 static DENSE_CACHE: OnceLock<DenseModelCache> = OnceLock::new();
 

@@ -3,8 +3,21 @@
 //! Embedding is routed through [`route_embed_dispatch`] instead of a Python `EmbedRouter` closure.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+static INDEX_THREADS: OnceLock<usize> = OnceLock::new();
+
+/// Set at startup from `AMGIX_NOW_INDEX_THREADS`. Controls both `RAYON_NUM_THREADS` (matmul
+/// parallelism inside candle/gemm) and the number of native threads spawned when vectorizing
+/// multiple configs concurrently.
+pub fn set_index_threads(n: usize) {
+    let _ = INDEX_THREADS.set(n);
+}
+
+fn index_threads() -> usize {
+    *INDEX_THREADS.get().unwrap_or(&1)
+}
 
 use rayon::prelude::*;
 
@@ -177,6 +190,211 @@ fn get_field_text(document: &Document, field: DocumentField) -> String {
 
 pub struct Vectorizer;
 
+/// Vectorize all documents for a single vector config. Used by both the sequential path
+/// (single-config collections) and the native-thread path (multi-config collections).
+fn vectorize_single_config(
+    config: &VectorConfigInternal,
+    documents: &[Document],
+    avgdl_dict: Option<&HashMap<String, f64>>,
+    metrics: Option<&MetricsCollector>,
+) -> Result<(Vec<Vec<VectorData>>, Vec<HashMap<String, usize>>), String> {
+    let n = documents.len();
+    let mut vectors: Vec<Vec<VectorData>> = vec![Vec::new(); n];
+    let mut token_lengths: Vec<HashMap<String, usize>> = vec![HashMap::new(); n];
+
+    let result: Result<(), String> = (|| {
+        match config.vector_type {
+            VectorType::DenseModel => {
+                let mut texts: Vec<String> = Vec::new();
+                for doc in documents {
+                    for field in &config.index_fields {
+                        texts.push(get_field_text(doc, *field));
+                    }
+                }
+                let RoutedEmbed::Dense(dense_vectors) = route_embed_dispatch(
+                    config,
+                    &texts,
+                    None,
+                    DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                    metrics,
+                )?
+                else {
+                    return Err(format!(
+                        "dense_model vector '{}' routed to non-dense embedding",
+                        config.name
+                    ));
+                };
+
+                let mut idx = 0_usize;
+                for doc_idx in 0..n {
+                    for field in &config.index_fields {
+                        let dense_vector = dense_vectors[idx].clone();
+                        if let Some(dim) = config.dimensions {
+                            if dense_vector.len() != dim as usize {
+                                return Err(format!(
+                                    "Specified dimensions {} don't match generated dimensions {} for vector '{}' field '{}'",
+                                    dim,
+                                    dense_vector.len(),
+                                    config.name,
+                                    field
+                                ));
+                            }
+                        }
+                        vectors[doc_idx].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: Some(dense_vector),
+                            sparse_indices: None,
+                            sparse_values: None,
+                        });
+                        idx += 1;
+                    }
+                }
+            }
+            VectorType::DenseCustom => {
+                let per_doc = CustomDenseVector::extract_for_documents(config, documents)?;
+                for (doc_idx, field_map) in per_doc {
+                    for field in &config.index_fields {
+                        let field_key = field.to_string();
+                        let vec = field_map.get(&field_key).ok_or_else(|| {
+                            format!(
+                                "Custom dense vector '{}' for field '{}' not provided",
+                                config.name, field_key
+                            )
+                        })?;
+                        vectors[doc_idx].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: Some(vec.clone()),
+                            sparse_indices: None,
+                            sparse_values: None,
+                        });
+                    }
+                }
+            }
+            VectorType::SparseCustom => {
+                let per_doc = CustomSparseVector::extract_for_documents(config, documents)?;
+                for (doc_idx, field_map) in per_doc {
+                    for field in &config.index_fields {
+                        let field_key = field.to_string();
+                        let pair = field_map.get(&field_key).ok_or_else(|| {
+                            format!(
+                                "Custom sparse vector '{}' for field '{}' not provided",
+                                config.name, field_key
+                            )
+                        })?;
+                        let field_vector_name = format!("{}_{}", field_key, config.name);
+                        let (indices, values) = pair;
+                        let token_length = indices.len();
+                        vectors[doc_idx].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: None,
+                            sparse_indices: Some(indices.clone()),
+                            sparse_values: Some(values.clone()),
+                        });
+                        token_lengths[doc_idx].insert(field_vector_name, token_length);
+                    }
+                }
+            }
+            VectorType::SparseModel
+            | VectorType::FullText
+            | VectorType::Trigrams
+            | VectorType::Whitespace
+            | VectorType::Wmtr
+            | VectorType::Keyword
+            | VectorType::Noop => {
+                let mut texts: Vec<String> = Vec::new();
+                let mut avgdls: Vec<f64> = Vec::new();
+                let is_custom = config.vector_type.is_custom_tokenization();
+                for doc in documents {
+                    for field in &config.index_fields {
+                        texts.push(get_field_text(doc, *field));
+                        if is_custom {
+                            let field_vector_name = format!("{}_{}", field, config.name);
+                            let table = avgdl_dict.ok_or_else(|| {
+                                format!(
+                                    "avgdl_dict required for '{}' ({:?})",
+                                    config.name, config.vector_type
+                                )
+                            })?;
+                            let avgdl_val = table.get(&field_vector_name).ok_or_else(|| {
+                                format!(
+                                    "Missing avgdl_dict entry '{field_vector_name}' for vector '{}'",
+                                    config.name
+                                )
+                            })?;
+                            avgdls.push(*avgdl_val);
+                        }
+                    }
+                }
+
+                let sparse_vectors = match route_embed_dispatch(
+                    config,
+                    &texts,
+                    if is_custom { Some(avgdls.as_slice()) } else { None },
+                    DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                    metrics,
+                )? {
+                    RoutedEmbed::Sparse(v) => v,
+                    RoutedEmbed::Dense(_) => {
+                        return Err(format!(
+                            "sparse vector '{}' routed to dense embedding",
+                            config.name
+                        ));
+                    }
+                };
+
+                let mut idx = 0_usize;
+                for doc_idx in 0..n {
+                    for field in &config.index_fields {
+                        let (indices, values) = sparse_vectors[idx].clone();
+                        let field_vector_name = format!("{}_{}", field, config.name);
+                        let token_length = indices.len();
+                        vectors[doc_idx].push(VectorData {
+                            vector_name: config.name.clone(),
+                            field: *field,
+                            vector_type: config.vector_type.clone(),
+                            dense_vector: None,
+                            sparse_indices: Some(indices),
+                            sparse_values: Some(values),
+                        });
+                        if config.vector_type.sparse_types_contains() {
+                            token_lengths[doc_idx].insert(field_vector_name.clone(), token_length);
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Ok((vectors, token_lengths)),
+        Err(e) => Err(if matches!(
+            config.vector_type,
+            VectorType::DenseCustom | VectorType::SparseCustom
+        ) {
+            e
+        } else {
+            format!(
+                "Failed to generate vector '{}' for fields {:?}: {e}",
+                config.name,
+                config
+                    .index_fields
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        }),
+    }
+}
+
 impl Vectorizer {
     /// Mirrors `Vectorizer.vectorize_documents` (sans async — routing is synchronous here).
     pub fn vectorize_documents(
@@ -185,214 +403,49 @@ impl Vectorizer {
         avgdl_dict: Option<&HashMap<String, f64>>,
         metrics: Option<Arc<MetricsCollector>>,
     ) -> Result<Vec<DocumentWithVectors>, String> {
-        // Each config is independent — run them in parallel across the rayon pool when there
-        // are multiple configs. Falls back to sequential for single-config collections to avoid
-        // rayon overhead (mirrors the search path guard).
         let n = documents.len();
-        let vectorize_config = |config: &VectorConfigInternal| -> Result<(Vec<Vec<VectorData>>, Vec<HashMap<String, usize>>), String> {
-                let m = metrics.as_deref();
-                let mut vectors: Vec<Vec<VectorData>> = vec![Vec::new(); n];
-                let mut token_lengths: Vec<HashMap<String, usize>> = vec![HashMap::new(); n];
 
-                let result: Result<(), String> = (|| {
-                    match config.vector_type {
-                        VectorType::DenseModel => {
-                            let mut texts: Vec<String> = Vec::new();
-                            for doc in documents {
-                                for field in &config.index_fields {
-                                    texts.push(get_field_text(doc, *field));
-                                }
-                            }
-                            let RoutedEmbed::Dense(dense_vectors) = route_embed_dispatch(
-                                config,
-                                &texts,
-                                None,
-                                DEFAULT_WMTR_TRIGRAM_WEIGHT,
-                                m,
-                            )?
-                            else {
-                                return Err(format!(
-                                    "dense_model vector '{}' routed to non-dense embedding",
-                                    config.name
-                                ));
-                            };
-
-                            let mut idx = 0_usize;
-                            for doc_idx in 0..n {
-                                for field in &config.index_fields {
-                                    let dense_vector = dense_vectors[idx].clone();
-                                    if let Some(dim) = config.dimensions {
-                                        if dense_vector.len() != dim as usize {
-                                            return Err(format!(
-                                                "Specified dimensions {} don't match generated dimensions {} for vector '{}' field '{}'",
-                                                dim,
-                                                dense_vector.len(),
-                                                config.name,
-                                                field
-                                            ));
-                                        }
-                                    }
-                                    vectors[doc_idx].push(VectorData {
-                                        vector_name: config.name.clone(),
-                                        field: *field,
-                                        vector_type: config.vector_type.clone(),
-                                        dense_vector: Some(dense_vector),
-                                        sparse_indices: None,
-                                        sparse_values: None,
-                                    });
-                                    idx += 1;
-                                }
-                            }
-                        }
-                        VectorType::DenseCustom => {
-                            let per_doc = CustomDenseVector::extract_for_documents(config, documents)?;
-                            for (doc_idx, field_map) in per_doc {
-                                for field in &config.index_fields {
-                                    let field_key = field.to_string();
-                                    let vec = field_map.get(&field_key).ok_or_else(|| {
-                                        format!(
-                                            "Custom dense vector '{}' for field '{}' not provided",
-                                            config.name, field_key
-                                        )
-                                    })?;
-                                    vectors[doc_idx].push(VectorData {
-                                        vector_name: config.name.clone(),
-                                        field: *field,
-                                        vector_type: config.vector_type.clone(),
-                                        dense_vector: Some(vec.clone()),
-                                        sparse_indices: None,
-                                        sparse_values: None,
-                                    });
-                                }
-                            }
-                        }
-                        VectorType::SparseCustom => {
-                            let per_doc = CustomSparseVector::extract_for_documents(config, documents)?;
-                            for (doc_idx, field_map) in per_doc {
-                                for field in &config.index_fields {
-                                    let field_key = field.to_string();
-                                    let pair = field_map.get(&field_key).ok_or_else(|| {
-                                        format!(
-                                            "Custom sparse vector '{}' for field '{}' not provided",
-                                            config.name, field_key
-                                        )
-                                    })?;
-                                    let field_vector_name = format!("{}_{}", field_key, config.name);
-                                    let (indices, values) = pair;
-                                    let token_length = indices.len();
-                                    vectors[doc_idx].push(VectorData {
-                                        vector_name: config.name.clone(),
-                                        field: *field,
-                                        vector_type: config.vector_type.clone(),
-                                        dense_vector: None,
-                                        sparse_indices: Some(indices.clone()),
-                                        sparse_values: Some(values.clone()),
-                                    });
-                                    token_lengths[doc_idx].insert(field_vector_name, token_length);
-                                }
-                            }
-                        }
-                        VectorType::SparseModel
-                        | VectorType::FullText
-                        | VectorType::Trigrams
-                        | VectorType::Whitespace
-                        | VectorType::Wmtr
-                        | VectorType::Keyword
-                        | VectorType::Noop => {
-                            let mut texts: Vec<String> = Vec::new();
-                            let mut avgdls: Vec<f64> = Vec::new();
-                            let is_custom = config.vector_type.is_custom_tokenization();
-                            for doc in documents {
-                                for field in &config.index_fields {
-                                    texts.push(get_field_text(doc, *field));
-                                    if is_custom {
-                                        let field_vector_name = format!("{}_{}", field, config.name);
-                                        let table = avgdl_dict.ok_or_else(|| {
-                                            format!(
-                                                "avgdl_dict required for '{}' ({:?})",
-                                                config.name, config.vector_type
-                                            )
-                                        })?;
-                                        let avgdl_val = table.get(&field_vector_name).ok_or_else(|| {
-                                            format!(
-                                                "Missing avgdl_dict entry '{field_vector_name}' for vector '{}'",
-                                                config.name
-                                            )
-                                        })?;
-                                        avgdls.push(*avgdl_val);
-                                    }
-                                }
-                            }
-
-                            let sparse_vectors = match route_embed_dispatch(
-                                config,
-                                &texts,
-                                if is_custom { Some(avgdls.as_slice()) } else { None },
-                                DEFAULT_WMTR_TRIGRAM_WEIGHT,
-                                m,
-                            )? {
-                                RoutedEmbed::Sparse(v) => v,
-                                RoutedEmbed::Dense(_) => {
-                                    return Err(format!(
-                                        "sparse vector '{}' routed to dense embedding",
-                                        config.name
-                                    ));
-                                }
-                            };
-
-                            let mut idx = 0_usize;
-                            for doc_idx in 0..n {
-                                for field in &config.index_fields {
-                                    let (indices, values) = sparse_vectors[idx].clone();
-                                    let field_vector_name = format!("{}_{}", field, config.name);
-                                    let token_length = indices.len();
-                                    vectors[doc_idx].push(VectorData {
-                                        vector_name: config.name.clone(),
-                                        field: *field,
-                                        vector_type: config.vector_type.clone(),
-                                        dense_vector: None,
-                                        sparse_indices: Some(indices),
-                                        sparse_values: Some(values),
-                                    });
-                                    if config.vector_type.sparse_types_contains() {
-                                        token_lengths[doc_idx]
-                                            .insert(field_vector_name.clone(), token_length);
-                                    }
-                                    idx += 1;
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                })();
-
-                match result {
-                    Ok(()) => Ok((vectors, token_lengths)),
-                    Err(e) => Err(if matches!(
-                        config.vector_type,
-                        VectorType::DenseCustom | VectorType::SparseCustom
-                    ) {
-                        e
-                    } else {
-                        format!(
-                            "Failed to generate vector '{}' for fields {:?}: {e}",
-                            config.name,
-                            config
-                                .index_fields
-                                .iter()
-                                .map(|f| f.to_string())
-                                .collect::<Vec<_>>()
-                                .join(","),
-                        )
-                    }),
-                }
-        };
-
+        // For multiple configs: spawn native threads (not Rayon workers) so candle/gemm can
+        // freely use the global Rayon pool for intra-matmul parallelism without nesting.
+        // Number of threads is capped to index_threads() (set from AMGIX_NOW_INDEX_THREADS).
+        // Single-config collections skip threading overhead entirely.
         let per_config_results: Vec<Result<(Vec<Vec<VectorData>>, Vec<HashMap<String, usize>>), String>> =
             if vector_configs.len() > 1 {
-                vector_configs.par_iter().map(|config| vectorize_config(config)).collect()
+                let max_threads = index_threads().min(vector_configs.len());
+                let chunk_size = (vector_configs.len() + max_threads - 1) / max_threads;
+                let handles: Vec<_> = vector_configs
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        let chunk: Vec<VectorConfigInternal> = chunk.to_vec();
+                        let documents: Vec<Document> = documents.to_vec();
+                        let avgdl_dict: Option<HashMap<String, f64>> = avgdl_dict.map(|m| m.clone());
+                        let metrics = metrics.clone();
+                        std::thread::spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|config| {
+                                    vectorize_single_config(
+                                        config,
+                                        &documents,
+                                        avgdl_dict.as_ref(),
+                                        metrics.as_deref(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_else(|_| {
+                        vec![Err("vectorize thread panicked".to_string())]
+                    }))
+                    .collect()
             } else {
-                vector_configs.iter().map(|config| vectorize_config(config)).collect()
+                vector_configs
+                    .iter()
+                    .map(|config| vectorize_single_config(config, documents, avgdl_dict, metrics.as_deref()))
+                    .collect()
             };
 
         // Merge per-config results into final per-doc vectors.

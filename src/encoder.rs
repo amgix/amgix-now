@@ -88,7 +88,7 @@ pub const BULK_UPSERT_QUEUE_CAPACITY: usize = 128;
 pub const BULK_UPSERT_CONCURRENT_MAX: usize = 4;
 /// Bulk batches are split into chunks of this size before vectorization so each chunk
 /// runs on its own rayon thread concurrently with other chunks.
-pub const BULK_UPSERT_CHUNK_SIZE: usize = 32;
+pub const BULK_UPSERT_CHUNK_SIZE: usize = 16;
 /// Max single-doc micro-batches pulled off the singles ingress channel **in flight at once**.
 /// One task still `recv`s and builds batches; this bounds overlapping `document_upsert_bulk_internal`
 /// work (per parallel micro-batch pipeline).
@@ -661,7 +661,6 @@ impl UpsertIngress {
         cache: CollectionConfigCache,
         stats_batcher: StatsUpdateBatcher,
         doc_locks: LockBackend,
-        index_pool: Arc<rayon::ThreadPool>,
         metrics: Option<Arc<MetricsCollector>>,
     ) -> (Self, UpsertIngressShutdown) {
         let (bulk_tx, mut bulk_rx) = mpsc::channel::<BulkIngressJob>(BULK_UPSERT_QUEUE_CAPACITY);
@@ -670,7 +669,6 @@ impl UpsertIngress {
             let cache = cache.clone();
             let stats_batcher = stats_batcher.clone();
             let doc_locks = doc_locks.clone();
-            let index_pool = Arc::clone(&index_pool);
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 let mut inflight = JoinSet::new();
@@ -693,12 +691,10 @@ impl UpsertIngress {
                             let cache = cache.clone();
                             let stats_batcher = stats_batcher.clone();
                             let doc_locks = doc_locks.clone();
-                            let index_pool = Arc::clone(&index_pool);
                             let metrics = metrics.clone();
                             inflight.spawn(async move {
                                 let t0 = std::time::Instant::now();
-                                // Split into chunks and run each concurrently so vectorization
-                                // spreads across rayon threads rather than running serially.
+                                // Split into chunks and run each concurrently.
                                 let chunks: Vec<Vec<Document>> = documents
                                     .chunks(BULK_UPSERT_CHUNK_SIZE)
                                     .map(|c| c.to_vec())
@@ -709,7 +705,6 @@ impl UpsertIngress {
                                     let cache = cache.clone();
                                     let stats_batcher = stats_batcher.clone();
                                     let doc_locks = doc_locks.clone();
-                                    let index_pool = Arc::clone(&index_pool);
                                     let metrics = metrics.clone();
                                     let collection_name = collection_name.clone();
                                     chunk_set.spawn(async move {
@@ -718,7 +713,6 @@ impl UpsertIngress {
                                             &cache,
                                             &stats_batcher,
                                             &doc_locks,
-                                            &index_pool,
                                             metrics.clone(),
                                             &collection_name,
                                             chunk,
@@ -774,7 +768,6 @@ impl UpsertIngress {
             let cache = cache.clone();
             let stats_batcher = stats_batcher.clone();
             let doc_locks = doc_locks.clone();
-            let index_pool = Arc::clone(&index_pool);
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 let mut inflight = JoinSet::new();
@@ -801,7 +794,6 @@ impl UpsertIngress {
                     let cache = cache.clone();
                     let stats_batcher = stats_batcher.clone();
                     let doc_locks = doc_locks.clone();
-                    let index_pool = Arc::clone(&index_pool);
                     let metrics = metrics.clone();
                     inflight.spawn(async move {
                         process_single_document_microbatch(
@@ -810,7 +802,6 @@ impl UpsertIngress {
                             &cache,
                             &stats_batcher,
                             &doc_locks,
-                            &index_pool,
                             metrics.clone(),
                         )
                         .await;
@@ -1109,7 +1100,6 @@ async fn process_single_document_microbatch(
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
-    index_pool: &Arc<rayon::ThreadPool>,
     metrics: Option<Arc<MetricsCollector>>,
 ) {
     let mut by_collection: HashMap<String, Vec<SingleIngressJob>> = HashMap::new();
@@ -1128,7 +1118,6 @@ async fn process_single_document_microbatch(
             cache,
             stats_batcher,
             doc_locks,
-            index_pool,
             metrics.clone(),
         )
         .await;
@@ -1142,7 +1131,6 @@ async fn respond_single_microbatch_for_collection(
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
-    index_pool: &Arc<rayon::ThreadPool>,
     metrics: Option<Arc<MetricsCollector>>,
 ) {
     let n = slots.len();
@@ -1201,7 +1189,6 @@ async fn respond_single_microbatch_for_collection(
         cache,
         stats_batcher,
         doc_locks,
-        index_pool,
         metrics.clone(),
         collection_name,
         merged,
@@ -1318,7 +1305,6 @@ pub(crate) async fn document_upsert_bulk_internal(
     cache: &CollectionConfigCache,
     stats_batcher: &StatsUpdateBatcher,
     doc_locks: &LockBackend,
-    index_pool: &Arc<rayon::ThreadPool>,
     metrics: Option<Arc<MetricsCollector>>,
     collection_name: &str,
     documents: Vec<Document>,
@@ -1441,12 +1427,11 @@ pub(crate) async fn document_upsert_bulk_internal(
             .map_err(UpsertSyncError::Vectorization)?;
     }
     let vectors_cfg = collection_config.vectors.clone();
-    let pool = Arc::clone(index_pool);
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let metrics_for_post = metrics.clone();
 
-    pool.spawn(move || {
+    tokio::task::spawn_blocking(move || {
         let result = Vectorizer::vectorize_documents(&docs_owned, &vectors_cfg, Some(&avgdl_dict), metrics);
         let _ = tx.send(result);
     });

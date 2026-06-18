@@ -1086,13 +1086,13 @@ async fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| (num_cpus).max(2));
 
-    let index_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(index_threads)
-            .thread_name(|i| format!("ingest-{i}"))
-            .build()
-            .expect("failed to build ingest thread pool"),
-    );
+    // Tell candle/gemm how many threads to use for CPU matrix multiplication.
+    // Must be set before any embedding call; candle reads it once on first matmul.
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", index_threads.to_string()); }
+
+    // Register index_threads so vectorize_documents can cap native thread spawning.
+    vectors::vectorizer::set_index_threads(index_threads);
+
     let search_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(search_threads)
@@ -1125,7 +1125,6 @@ async fn main() {
         collection_cache.clone(),
         stats_batcher.clone(),
         doc_locks.clone(),
-        Arc::clone(&index_pool),
         metrics_collector.clone(),
     );
     let (search_ingress, search_shutdown) =
