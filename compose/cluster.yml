@@ -82,6 +82,8 @@ services:
     environment:
       - AMGIX_DATABASE_URL=qdrant://qdrant:6334
       - AMGIX_AMQP_URL=amqp://guest:guest@rabbitmq/
+      # - AMGIX_NOW_INDEX_THREADS=2
+      # - AMGIX_NOW_SEARCH_THREADS=4
       # - AMGIX_NOW_SYNC_DB_WRITES=true
     cpus: "4"
 
