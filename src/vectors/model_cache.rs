@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
@@ -239,7 +240,9 @@ where
             .min_by_key(|(_, (_, last_used))| *last_used)
             .map(|(k, _)| k.clone());
         match lru_key {
-            Some(k) => cache.remove(&k),
+            Some(k) => {
+                cache.remove(&k);
+            }
             None => break,
         }
     }
