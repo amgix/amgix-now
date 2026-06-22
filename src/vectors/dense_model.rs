@@ -16,7 +16,7 @@ fn cache() -> &'static DenseModelCache {
     DENSE_CACHE.get_or_init(DenseModelCache::new)
 }
 
-/// Returns currently loaded (non-expired) dense models: `(type, model, revision, loaded_at)`.
+/// Returns currently loaded dense models: `(type, model, revision, last_used_at)`.
 pub fn dense_model_cache_snapshot() -> Vec<(String, String, Option<String>, Instant)> {
     DENSE_CACHE
         .get()

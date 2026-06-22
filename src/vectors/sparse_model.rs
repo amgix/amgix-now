@@ -17,7 +17,7 @@ fn cache() -> &'static SparseModelCache {
     SPARSE_CACHE.get_or_init(SparseModelCache::new)
 }
 
-/// Returns currently loaded (non-expired) sparse models: `(type, model, revision, loaded_at)`.
+/// Returns currently loaded sparse models: `(type, model, revision, last_used_at)`.
 pub fn sparse_model_cache_snapshot() -> Vec<(String, String, Option<String>, Instant)> {
     SPARSE_CACHE
         .get()

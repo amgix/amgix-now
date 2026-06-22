@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
@@ -97,8 +97,6 @@ pub(crate) fn maybe_gpu_inference_permit() -> Option<GpuInferencePermit> {
     limiter.acquire();
     Some(GpuInferencePermit { limiter })
 }
-
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(60 * 60); // 1 hour, mirrors MODEL_CACHE_TTL
 
 fn model_cache_size() -> usize {
     std::env::var("AMGIX_MODEL_CACHE_SIZE")
@@ -221,6 +219,32 @@ fn load_st_pooling_config_from_path(path: &Path) -> StPoolingConfig {
 
 type DenseModelEntry = (Arc<DenseModelHandle>, Instant);
 
+fn bump_cache_hit<K, V>(cache: &mut HashMap<K, (Arc<V>, Instant)>, key: &K) -> Option<Arc<V>>
+where
+    K: Eq + Hash,
+{
+    cache.get_mut(key).map(|(model, last_used)| {
+        *last_used = Instant::now();
+        Arc::clone(model)
+    })
+}
+
+fn evict_lru_if_full<K, V>(cache: &mut HashMap<K, (Arc<V>, Instant)>, max_size: usize)
+where
+    K: Clone + Eq + Hash,
+{
+    while cache.len() >= max_size {
+        let lru_key = cache
+            .iter()
+            .min_by_key(|(_, (_, last_used))| *last_used)
+            .map(|(k, _)| k.clone());
+        match lru_key {
+            Some(k) => cache.remove(&k),
+            None => break,
+        }
+    }
+}
+
 pub struct DenseModelCache {
     inner: RwLock<HashMap<(String, Option<String>), DenseModelEntry>>,
     max_size: usize,
@@ -242,21 +266,10 @@ impl DenseModelCache {
     ) -> Result<Arc<DenseModelHandle>, String> {
         let key = (model_id.to_string(), revision.map(|s| s.to_string()));
 
-        // Fast path: read lock — check cache
-        {
-            let cache = self.inner.read().unwrap();
-            if let Some((model, loaded_at)) = cache.get(&key) {
-                if loaded_at.elapsed() < MODEL_CACHE_TTL {
-                    return Ok(Arc::clone(model));
-                }
-            }
-        }
-
-        // Slow path: write lock — check again then load
-        let mut cache = self.inner.write().unwrap();
-        if let Some((model, loaded_at)) = cache.get(&key) {
-            if loaded_at.elapsed() < MODEL_CACHE_TTL {
-                return Ok(Arc::clone(model));
+        if self.inner.read().unwrap().contains_key(&key) {
+            let mut cache = self.inner.write().unwrap();
+            if let Some(handle) = bump_cache_hit(&mut cache, &key) {
+                return Ok(handle);
             }
         }
 
@@ -274,6 +287,14 @@ impl DenseModelCache {
             }
         }
 
+        {
+            let mut cache = self.inner.write().unwrap();
+            if let Some(handle) = bump_cache_hit(&mut cache, &key) {
+                return Ok(handle);
+            }
+            evict_lru_if_full(&mut cache, self.max_size);
+        }
+
         set_hf_home();
         let pooling = load_st_pooling_config(model_id, revision);
         let embedder = BertEmbedder::new(
@@ -283,45 +304,29 @@ impl DenseModelCache {
         )
         .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
 
-        // Evict expired and oldest entries if at capacity
-        Self::evict_if_needed(&mut cache, self.max_size);
-
         let handle = Arc::new(DenseModelHandle { embedder, pooling });
+        let mut cache = self.inner.write().unwrap();
+        if let Some(existing) = bump_cache_hit(&mut cache, &key) {
+            return Ok(existing);
+        }
         cache.insert(key, (Arc::clone(&handle), Instant::now()));
         Ok(handle)
     }
 
-    /// Returns non-expired cache entries as `(type_str, model, revision, loaded_at)`.
+    /// Returns cache entries as `(type_str, model, revision, last_used_at)`.
     pub fn snapshot(&self) -> Vec<(String, String, Option<String>, Instant)> {
         let cache = self.inner.read().unwrap();
         cache
             .iter()
-            .filter(|(_, (_, loaded_at))| loaded_at.elapsed() < MODEL_CACHE_TTL)
-            .map(|((model, revision), (_, loaded_at))| {
-                ("dense_model".to_string(), model.clone(), revision.clone(), *loaded_at)
+            .map(|((model, revision), (_, last_used))| {
+                (
+                    "dense_model".to_string(),
+                    model.clone(),
+                    revision.clone(),
+                    *last_used,
+                )
             })
             .collect()
-    }
-
-    fn evict_if_needed(
-        cache: &mut HashMap<(String, Option<String>), DenseModelEntry>,
-        max_size: usize,
-    ) {
-        // Remove expired entries first
-        cache.retain(|_, (_, loaded_at)| loaded_at.elapsed() < MODEL_CACHE_TTL);
-
-        // If still at capacity, remove the oldest entry
-        while cache.len() >= max_size {
-            let oldest_key = cache
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = oldest_key {
-                cache.remove(&k);
-            } else {
-                break;
-            }
-        }
     }
 }
 
@@ -352,19 +357,10 @@ impl SparseModelCache {
     ) -> Result<Arc<SparseBertEmbedder>, String> {
         let key = (model_id.to_string(), revision.map(|s| s.to_string()));
 
-        {
-            let cache = self.inner.read().unwrap();
-            if let Some((model, loaded_at)) = cache.get(&key) {
-                if loaded_at.elapsed() < MODEL_CACHE_TTL {
-                    return Ok(Arc::clone(model));
-                }
-            }
-        }
-
-        let mut cache = self.inner.write().unwrap();
-        if let Some((model, loaded_at)) = cache.get(&key) {
-            if loaded_at.elapsed() < MODEL_CACHE_TTL {
-                return Ok(Arc::clone(model));
+        if self.inner.read().unwrap().contains_key(&key) {
+            let mut cache = self.inner.write().unwrap();
+            if let Some(model) = bump_cache_hit(&mut cache, &key) {
+                return Ok(model);
             }
         }
 
@@ -382,6 +378,14 @@ impl SparseModelCache {
             }
         }
 
+        {
+            let mut cache = self.inner.write().unwrap();
+            if let Some(model) = bump_cache_hit(&mut cache, &key) {
+                return Ok(model);
+            }
+            evict_lru_if_full(&mut cache, self.max_size);
+        }
+
         set_hf_home();
         let embedder = SparseBertEmbedder::new(
             model_id.to_string(),
@@ -390,40 +394,28 @@ impl SparseModelCache {
         )
         .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
 
-        Self::evict_if_needed(&mut cache, self.max_size);
-
         let arc = Arc::new(embedder);
+        let mut cache = self.inner.write().unwrap();
+        if let Some(existing) = bump_cache_hit(&mut cache, &key) {
+            return Ok(existing);
+        }
         cache.insert(key, (Arc::clone(&arc), Instant::now()));
         Ok(arc)
     }
 
-    /// Returns non-expired cache entries as `(type_str, model, revision, loaded_at)`.
+    /// Returns cache entries as `(type_str, model, revision, last_used_at)`.
     pub fn snapshot(&self) -> Vec<(String, String, Option<String>, Instant)> {
         let cache = self.inner.read().unwrap();
         cache
             .iter()
-            .filter(|(_, (_, loaded_at))| loaded_at.elapsed() < MODEL_CACHE_TTL)
-            .map(|((model, revision), (_, loaded_at))| {
-                ("sparse_model".to_string(), model.clone(), revision.clone(), *loaded_at)
+            .map(|((model, revision), (_, last_used))| {
+                (
+                    "sparse_model".to_string(),
+                    model.clone(),
+                    revision.clone(),
+                    *last_used,
+                )
             })
             .collect()
-    }
-
-    fn evict_if_needed(
-        cache: &mut HashMap<(String, Option<String>), SparseModelEntry>,
-        max_size: usize,
-    ) {
-        cache.retain(|_, (_, loaded_at)| loaded_at.elapsed() < MODEL_CACHE_TTL);
-        while cache.len() >= max_size {
-            let oldest_key = cache
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = oldest_key {
-                cache.remove(&k);
-            } else {
-                break;
-            }
-        }
     }
 }
