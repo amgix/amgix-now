@@ -2,37 +2,71 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::common::{get_real_collection_name, MAX_SEARCH_LIMIT};
 use crate::encoder::{get_collection_info_cached, validate_metadata_filter, CollectionConfigCache, SearchError};
 use crate::join_parser::{JoinField, JoinRefKind, JoinSideRef, JoinSpec};
 use crate::models::{CollectionConfigInternal, Document, DocumentWithVectors, MetadataFilter, SearchResult};
 use crate::qdrant::{DbError, QdrantDb};
 
-pub async fn enrich_search_results_with_joins(
+trait JoinParent {
+    fn join_id(&self) -> &str;
+    fn join_metadata(&self) -> Option<&HashMap<String, Value>>;
+    fn joined_mut(&mut self) -> &mut Option<HashMap<String, Vec<Document>>>;
+}
+
+impl JoinParent for Document {
+    fn join_id(&self) -> &str {
+        &self.id
+    }
+
+    fn join_metadata(&self) -> Option<&HashMap<String, Value>> {
+        self.metadata.as_ref()
+    }
+
+    fn joined_mut(&mut self) -> &mut Option<HashMap<String, Vec<Document>>> {
+        &mut self.joined
+    }
+}
+
+impl JoinParent for SearchResult {
+    fn join_id(&self) -> &str {
+        &self.document.id
+    }
+
+    fn join_metadata(&self) -> Option<&HashMap<String, Value>> {
+        self.document.metadata.as_ref()
+    }
+
+    fn joined_mut(&mut self) -> &mut Option<HashMap<String, Vec<Document>>> {
+        &mut self.document.joined
+    }
+}
+
+pub async fn enrich_documents_with_joins<P: JoinParent>(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
-    results: Vec<SearchResult>,
+    documents: &mut [P],
     join: &JoinField,
-) -> Result<Vec<SearchResult>, SearchError> {
+    limit: u32,
+) -> Result<(), SearchError> {
     let specs = join
         .clone()
         .into_specs()
         .map_err(SearchError::InvalidFilter)?;
 
-    let mut results = results;
     for spec in specs {
-        enrich_with_spec(db, cache, &mut results, &spec).await?;
+        enrich_with_spec(db, cache, documents, &spec, limit).await?;
     }
-    Ok(results)
+    Ok(())
 }
 
-async fn enrich_with_spec(
+async fn enrich_with_spec<P: JoinParent>(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
-    results: &mut [SearchResult],
+    documents: &mut [P],
     spec: &JoinSpec,
+    limit: u32,
 ) -> Result<(), SearchError> {
-    let real_child = get_real_collection_name(&spec.collection_name);
+    let real_child = crate::common::get_real_collection_name(&spec.collection_name);
     let child_config = match get_collection_info_cached(db, cache, &real_child).await {
         Ok((cfg, _)) => cfg,
         Err(DbError::NotFound(_)) => {
@@ -48,8 +82,8 @@ async fn enrich_with_spec(
 
     let mut join_values: Vec<Value> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
-    for result in results.iter() {
-        let pv = parent_join_value(result, &spec.parent_ref);
+    for document in documents.iter() {
+        let pv = parent_join_value(document, &spec.parent_ref);
         if pv.is_none() || pv.as_ref().is_some_and(|v| v.is_null()) {
             continue;
         }
@@ -60,7 +94,7 @@ async fn enrich_with_spec(
         }
     }
 
-    let max_documents = MAX_SEARCH_LIMIT.saturating_mul(results.len() as u32) as usize;
+    let max_documents = limit.saturating_mul(documents.len() as u32) as usize;
     let children = fetch_children_for_join(
         db,
         spec,
@@ -72,18 +106,18 @@ async fn enrich_with_spec(
     .await?;
 
     let by_key = group_children_by_join_key(&children, &spec.child_ref);
-    for result in results.iter_mut() {
-        let pv = parent_join_value(result, &spec.parent_ref);
+    for document in documents.iter_mut() {
+        let pv = parent_join_value(document, &spec.parent_ref);
         let children_for_parent = match pv {
             None => vec![],
             Some(v) if v.is_null() => vec![],
             Some(v) => by_key.get(&join_value_key(&v)).cloned().unwrap_or_default(),
         };
-        if result.joined.is_none() {
-            result.joined = Some(HashMap::new());
+        if document.joined_mut().is_none() {
+            *document.joined_mut() = Some(HashMap::new());
         }
-        result
-            .joined
+        document
+            .joined_mut()
             .as_mut()
             .unwrap()
             .insert(spec.collection_name.clone(), children_for_parent);
@@ -189,12 +223,11 @@ fn group_children_by_join_key(
     groups
 }
 
-fn parent_join_value(result: &SearchResult, side: &JoinSideRef) -> Option<Value> {
+fn parent_join_value<P: JoinParent>(document: &P, side: &JoinSideRef) -> Option<Value> {
     match &side.kind {
-        JoinRefKind::Id => Some(Value::String(result.id.clone())),
-        JoinRefKind::Meta(key) => result
-            .metadata
-            .as_ref()
+        JoinRefKind::Id => Some(Value::String(document.join_id().to_string())),
+        JoinRefKind::Meta(key) => document
+            .join_metadata()
             .and_then(|m| m.get(key).cloned()),
     }
 }
@@ -211,16 +244,7 @@ fn join_value_key(value: &Value) -> String {
 }
 
 fn document_from_with_vectors(dwv: &DocumentWithVectors) -> Document {
-    Document {
-        id: dwv.id.clone(),
-        timestamp: dwv.timestamp,
-        tags: dwv.tags.clone(),
-        name: dwv.name.clone(),
-        description: dwv.description.clone(),
-        content: dwv.content.clone(),
-        metadata: dwv.metadata.clone(),
-        custom_vectors: dwv.custom_vectors.clone(),
-    }
+    Document::from(dwv.clone())
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {

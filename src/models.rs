@@ -544,6 +544,8 @@ pub struct Document {
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(default)]
     pub custom_vectors: Option<Vec<CustomDocumentVector>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined: Option<HashMap<String, Vec<Document>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +615,7 @@ impl From<DocumentWithVectors> for Document {
             content: d.content,
             metadata: d.metadata,
             custom_vectors: d.custom_vectors,
+            joined: None,
         }
     }
 }
@@ -870,23 +873,11 @@ pub struct VectorScore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub id: String,
-    pub timestamp: DateTime<Utc>,
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default)]
-    pub metadata: Option<HashMap<String, Value>>,
+    #[serde(flatten)]
+    pub document: Document,
     pub score: f64,
     #[serde(default)]
     pub vector_scores: Vec<VectorScore>,
-    #[serde(default)]
-    pub joined: Option<HashMap<String, Vec<Document>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +897,8 @@ pub struct DocumentFetchRequest {
     pub document_tags: Option<Vec<String>>,
     #[serde(default)]
     pub document_tags_match_all: bool,
+    #[serde(default, deserialize_with = "crate::join_parser::deserialize_join_field")]
+    pub join: Option<crate::join_parser::JoinField>,
 }
 
 fn default_fetch_page_size() -> u32 {

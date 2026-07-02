@@ -803,7 +803,7 @@ async fn fetch_documents(
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
     }
 
-    let response = app
+    let mut response = app
         .db
         .fetch_documents(&real_collection_name, &request, &collection_config)
         .await
@@ -811,6 +811,27 @@ async fn fetch_documents(
             DbError::Config(m) => api_error(StatusCode::BAD_REQUEST, m),
             e => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")),
         })?;
+
+    if let Some(ref join) = request.join {
+        crate::search_join::enrich_documents_with_joins(
+            &app.db,
+            &app.collection_cache,
+            &mut response.documents,
+            join,
+            request.page_size,
+        )
+        .await
+        .map_err(|e| match e {
+            SearchError::InvalidFilter(m) => api_error(StatusCode::BAD_REQUEST, m),
+            SearchError::Db(e) => {
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}"))
+            }
+            SearchError::NotFound(m) => api_error(StatusCode::NOT_FOUND, m),
+            SearchError::Vectorization(m) => api_error(StatusCode::BAD_REQUEST, m),
+            SearchError::IngressQueueFull(m) => api_error(StatusCode::TOO_MANY_REQUESTS, m),
+            SearchError::IngressWorkerExited(m) => api_error(StatusCode::SERVICE_UNAVAILABLE, m),
+        })?;
+    }
 
     let documents: Vec<Value> = response
         .documents

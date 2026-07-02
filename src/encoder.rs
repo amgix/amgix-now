@@ -1080,15 +1080,26 @@ async fn run_search_bucket(
                 DbError::Config(m) => SearchError::InvalidFilter(m),
                 e => SearchError::Db(e),
             });
-        let res = match (&res, &j.query.settings.join) {
-            (Ok(results), Some(join)) => crate::search_join::enrich_search_results_with_joins(
-                db,
-                cache,
-                results.clone(),
-                join,
-            )
-            .await,
-            _ => res,
+        let res = match res {
+            Ok(mut results) => {
+                if let Some(ref join) = j.query.settings.join {
+                    match crate::search_join::enrich_documents_with_joins(
+                        db,
+                        cache,
+                        &mut results,
+                        join,
+                        j.query.settings.limit,
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(results),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Ok(results)
+                }
+            }
+            Err(e) => Err(e),
         };
         let _ = j.reply.send(res);
     }
