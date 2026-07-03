@@ -1034,6 +1034,9 @@ async fn main() {
     let lock_client = bunny
         .as_ref()
         .map(|b| Arc::new(lock_client::LockClient::new(Arc::clone(b))));
+    if let Some(lc) = lock_client.as_deref() {
+        lc.start_cleanup_task();
+    }
 
     let db = match QdrantDb::new(&qdrant_client_url(&db_url), sync_db_writes) {
         Ok(d) => Arc::new(d),
