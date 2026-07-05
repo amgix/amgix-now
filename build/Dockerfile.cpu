@@ -27,6 +27,8 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+ARG AMGIX_VERSION=0.1.0-dev
+ENV AMGIX_VERSION=${AMGIX_VERSION}
 RUN cargo build --locked --release
 
 # -----------------------------------------------------------------------------

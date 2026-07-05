@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use common::{
     get_real_collection_name, get_user_collection_name, qdrant_client_url,
-    AMGIX_VARIANT, VectorType, DATABASE_KIND,
+    AMGIX_VARIANT, AMGIX_VERSION, VectorType, DATABASE_KIND,
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_metadata_filter,
@@ -1074,8 +1074,7 @@ async fn main() {
         }
     };
 
-    let amgix_version = std::env::var("AMGIX_VERSION").unwrap_or_default();
-    let amgix_version = amgix_version.trim().to_string();
+    let amgix_version = AMGIX_VERSION.to_string();
     let amgix_variant = AMGIX_VARIANT.to_string();
     let amgix_version_display = format!("{} ({})", amgix_version, AMGIX_VARIANT);
 
