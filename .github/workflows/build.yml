@@ -1,6 +1,6 @@
 # Build amgix-now images (CPU + GPU) and push to Docker Hub.
 # Repo secrets required: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
-name: Build containers
+name: Build
 
 on:
   push:
