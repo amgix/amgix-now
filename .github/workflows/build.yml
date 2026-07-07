@@ -1,10 +1,32 @@
-# Build amgix-now images (CPU + GPU) and push to Docker Hub.
+# Build amgix-now Docker images (CPU + GPU), release binaries, and draft GitHub release.
 # Repo secrets required: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#
+# Triggers:
+#   - push v* tag: full release (Docker push + draft GitHub release)
+#   - workflow_dispatch: test from any branch; dry_run defaults to true (no push, no release)
 name: Build
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for build (e.g. 1.2.3 or v1.2.3). Used for AMGIX_VERSION and image tags.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Skip Docker Hub push and GitHub release (default for manual test runs)'
+        type: boolean
+        default: true
+      skip_docker_push:
+        description: 'Skip Docker Hub push (only when dry_run is false)'
+        type: boolean
+        default: true
+      skip_release:
+        description: 'Skip GitHub release (only when dry_run is false)'
+        type: boolean
+        default: true
 
 jobs:
   # require-tests-passed:
@@ -36,6 +58,109 @@ jobs:
     uses: ./.github/workflows/signal-vm.yml
     secrets: inherit
 
+  build-binary-windows-cpu:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            if (-not $env:INPUT_VERSION) {
+              Write-Error 'workflow_dispatch requires version input'
+              exit 1
+            }
+            $versionNoV = $env:INPUT_VERSION -replace '^v', ''
+            $ref = "v$versionNoV"
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v') {
+            $ref = $env:GITHUB_REF_NAME
+            $versionNoV = $ref.Substring(1)
+          } else {
+            Write-Error "Run on a v* tag or workflow_dispatch with version. Ref: $env:GITHUB_REF"
+            exit 1
+          }
+          "VERSION=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "AMGIX_VERSION=$versionNoV" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: dtolnay/rust-toolchain@v1
+
+      - name: Build
+        shell: bash
+        env:
+          AMGIX_VERSION: ${{ env.AMGIX_VERSION }}
+        run: cargo build --locked --release
+
+      - name: Package release archive
+        shell: pwsh
+        run: Compress-Archive -Path target/release/amgix-now.exe -DestinationPath amgix-now-windows-x86_64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: amgix-now-windows-x86_64.zip
+          archive: false
+
+  build-binary-windows-gpu:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            if (-not $env:INPUT_VERSION) {
+              Write-Error 'workflow_dispatch requires version input'
+              exit 1
+            }
+            $versionNoV = $env:INPUT_VERSION -replace '^v', ''
+            $ref = "v$versionNoV"
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v') {
+            $ref = $env:GITHUB_REF_NAME
+            $versionNoV = $ref.Substring(1)
+          } else {
+            Write-Error "Run on a v* tag or workflow_dispatch with version. Ref: $env:GITHUB_REF"
+            exit 1
+          }
+          "VERSION=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "AMGIX_VERSION=$versionNoV" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.9.1'
+
+      - uses: dtolnay/rust-toolchain@v1
+
+      - name: Build
+        shell: bash
+        env:
+          AMGIX_VERSION: ${{ env.AMGIX_VERSION }}
+        run: cargo build --locked --release --features cuda
+
+      - name: Package release archive
+        shell: pwsh
+        run: Compress-Archive -Path target/release/amgix-now.exe -DestinationPath amgix-now-windows-x86_64-gpu.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: amgix-now-windows-x86_64-gpu.zip
+          archive: false
+
   build-now-cpu:
     needs: signal-vm
     runs-on: ubuntu-x1
@@ -47,16 +172,26 @@ jobs:
         run: docker run --rm -v ${{ github.workspace }}:/work alpine sh -c "chown -R $(id -u):$(id -g) /work || true"
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.ref_type }}" != "tag" ] || [[ ! "${{ github.ref_name }}" =~ ^v ]]; then
-            echo "This workflow only runs on tags starting with v (e.g. v1.0.0). Ref: ${{ github.ref }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -z "$INPUT_VERSION" ]; then
+              echo "workflow_dispatch requires version input"
+              exit 1
+            fi
+            VERSION_NO_V="${INPUT_VERSION#v}"
+            REF="v${VERSION_NO_V}"
+          elif [ "${{ github.ref_type }}" = "tag" ] && [[ "${{ github.ref_name }}" =~ ^v ]]; then
+            REF="${{ github.ref_name }}"
+            VERSION_NO_V="${REF#v}"
+          else
+            echo "Run on a v* tag or workflow_dispatch with version. Ref: ${{ github.ref }}"
             exit 1
           fi
-          REF="${{ github.ref_name }}"
-          VERSION_NO_V="${REF#v}"
           echo "VERSION=$REF" >> $GITHUB_ENV
           echo "AMGIX_VERSION=$VERSION_NO_V" >> $GITHUB_ENV
           echo "SHORT_MAJOR=$(echo "$VERSION_NO_V" | cut -d. -f1)" >> $GITHUB_ENV
@@ -67,23 +202,49 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Hub
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_docker_push == false)
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push amgix-now (CPU)
+      - name: Configure buildx outputs
+        id: buildx
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          PUSH_DOCKER: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_docker_push == false) }}
+        run: |
+          LOCAL='type=local,dest=./out,target=builder'
+          if [ "$PUSH_DOCKER" = "true" ]; then
+            {
+              echo "outputs<<EOF"
+              echo "type=registry,name=${DOCKERHUB_USERNAME}/amgix-now:${{ env.VERSION }},push=true"
+              echo "type=registry,name=${DOCKERHUB_USERNAME}/amgix-now:${{ env.SHORT_MINOR }},push=true"
+              echo "type=registry,name=${DOCKERHUB_USERNAME}/amgix-now:${{ env.SHORT_MAJOR }},push=true"
+              echo "$LOCAL"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "outputs=$LOCAL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and export Linux CPU binary
         uses: docker/build-push-action@v7
         with:
           context: .
           file: build/Dockerfile.cpu
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/amgix-now:${{ env.VERSION }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/amgix-now:${{ env.SHORT_MINOR }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/amgix-now:${{ env.SHORT_MAJOR }}
           build-args: |
             AMGIX_VERSION=${{ env.AMGIX_VERSION }}
+          outputs: ${{ steps.buildx.outputs.outputs }}
+
+      - name: Package Linux CPU release archive
+        run: tar czf amgix-now-x86_64-unknown-linux-gnu.tar.gz -C out/app/target/release amgix-now
+
+      - name: Upload Linux CPU artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: amgix-now-x86_64-unknown-linux-gnu.tar.gz
+          archive: false
 
   build-now-gpu:
     needs: build-now-cpu
@@ -96,16 +257,26 @@ jobs:
         run: docker run --rm -v ${{ github.workspace }}:/work alpine sh -c "chown -R $(id -u):$(id -g) /work || true"
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.ref_type }}" != "tag" ] || [[ ! "${{ github.ref_name }}" =~ ^v ]]; then
-            echo "This workflow only runs on tags starting with v (e.g. v1.0.0). Ref: ${{ github.ref }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -z "$INPUT_VERSION" ]; then
+              echo "workflow_dispatch requires version input"
+              exit 1
+            fi
+            VERSION_NO_V="${INPUT_VERSION#v}"
+            REF="v${VERSION_NO_V}"
+          elif [ "${{ github.ref_type }}" = "tag" ] && [[ "${{ github.ref_name }}" =~ ^v ]]; then
+            REF="${{ github.ref_name }}"
+            VERSION_NO_V="${REF#v}"
+          else
+            echo "Run on a v* tag or workflow_dispatch with version. Ref: ${{ github.ref }}"
             exit 1
           fi
-          REF="${{ github.ref_name }}"
-          VERSION_NO_V="${REF#v}"
           echo "VERSION=$REF" >> $GITHUB_ENV
           echo "AMGIX_VERSION=$VERSION_NO_V" >> $GITHUB_ENV
           echo "SHORT_MAJOR=$(echo "$VERSION_NO_V" | cut -d. -f1)" >> $GITHUB_ENV
@@ -116,35 +287,87 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Hub
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_docker_push == false)
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push amgix-now (GPU)
+      - name: Configure buildx outputs
+        id: buildx
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          PUSH_DOCKER: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_docker_push == false) }}
+        run: |
+          LOCAL='type=local,dest=./out,target=builder'
+          if [ "$PUSH_DOCKER" = "true" ]; then
+            {
+              echo "outputs<<EOF"
+              echo "type=registry,name=${DOCKERHUB_USERNAME}/amgix-now:${{ env.VERSION }}-gpu,push=true"
+              echo "type=registry,name=${DOCKERHUB_USERNAME}/amgix-now:${{ env.SHORT_MINOR }}-gpu,push=true"
+              echo "type=registry,name=${DOCKERHUB_USERNAME}/amgix-now:${{ env.SHORT_MAJOR }}-gpu,push=true"
+              echo "$LOCAL"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "outputs=$LOCAL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and export Linux GPU binary
         uses: docker/build-push-action@v7
         with:
           context: .
           file: build/Dockerfile.gpu
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/amgix-now:${{ env.VERSION }}-gpu
-            ${{ secrets.DOCKERHUB_USERNAME }}/amgix-now:${{ env.SHORT_MINOR }}-gpu
-            ${{ secrets.DOCKERHUB_USERNAME }}/amgix-now:${{ env.SHORT_MAJOR }}-gpu
           build-args: |
             AMGIX_VERSION=${{ env.AMGIX_VERSION }}
+          outputs: ${{ steps.buildx.outputs.outputs }}
+
+      - name: Package Linux GPU release archive
+        run: tar czf amgix-now-x86_64-unknown-linux-gnu-gpu.tar.gz -C out/app/target/release amgix-now
+
+      - name: Upload Linux GPU artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: amgix-now-x86_64-unknown-linux-gnu-gpu.tar.gz
+          archive: false
 
   create-release:
-    needs: build-now-gpu
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_release == false)
+    needs:
+      - build-now-gpu
+      - build-binary-windows-cpu
+      - build-binary-windows-gpu
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Resolve release tag
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION_NO_V="${INPUT_VERSION#v}"
+            echo "RELEASE_TAG=v${VERSION_NO_V}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
+          fi
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: amgix-now-*
+          ignore-unmatched-pattern: true
+
       - uses: softprops/action-gh-release@v3
         with:
           draft: true
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
+          files: dist/**/*
 
   clear-vm-request:
     needs: build-now-gpu
