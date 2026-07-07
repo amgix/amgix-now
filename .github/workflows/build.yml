@@ -90,6 +90,8 @@ jobs:
           "AMGIX_VERSION=$versionNoV" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Build
         shell: bash
@@ -144,6 +146,8 @@ jobs:
           cuda: '12.9.1'
 
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
 
       - name: Build
         shell: bash
