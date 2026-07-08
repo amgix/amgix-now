@@ -218,7 +218,7 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           PUSH_DOCKER: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_docker_push == false) }}
         run: |
-          LOCAL='type=local,dest=./out,target=builder'
+          LOCAL='type=local,dest=./out,platform-split=false'
           if [ "$PUSH_DOCKER" = "true" ]; then
             {
               echo "outputs<<EOF"
@@ -242,7 +242,7 @@ jobs:
           outputs: ${{ steps.buildx.outputs.outputs }}
 
       - name: Package Linux CPU release archive
-        run: tar czf amgix-now-x86_64-unknown-linux-gnu.tar.gz -C out/app/target/release amgix-now
+        run: tar czf amgix-now-x86_64-unknown-linux-gnu.tar.gz -C out/app amgix-now
 
       - name: Upload Linux CPU artifact
         uses: actions/upload-artifact@v7
@@ -303,7 +303,7 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           PUSH_DOCKER: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_docker_push == false) }}
         run: |
-          LOCAL='type=local,dest=./out,target=builder'
+          LOCAL='type=local,dest=./out,platform-split=false'
           if [ "$PUSH_DOCKER" = "true" ]; then
             {
               echo "outputs<<EOF"
@@ -327,7 +327,7 @@ jobs:
           outputs: ${{ steps.buildx.outputs.outputs }}
 
       - name: Package Linux GPU release archive
-        run: tar czf amgix-now-x86_64-unknown-linux-gnu-gpu.tar.gz -C out/app/target/release amgix-now
+        run: tar czf amgix-now-x86_64-unknown-linux-gnu-gpu.tar.gz -C out/app amgix-now
 
       - name: Upload Linux GPU artifact
         uses: actions/upload-artifact@v7
