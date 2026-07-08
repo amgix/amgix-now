@@ -174,10 +174,12 @@ pub fn trusted_organizations() -> Option<&'static HashSet<String>> {
 
 /// Sets HF_HOME so that `ApiBuilder::from_env()` inside embed_anything uses our cache dir.
 pub fn set_hf_home() {
-    let dir = hf_cache_dir();
-    // Only set if not already set by the user
+    let base = std::env::var("AMGIX_CACHE_DIR").unwrap_or_else(|_| "/data/amgix/cache".to_string());
     if std::env::var("HF_HOME").is_err() {
-        unsafe { std::env::set_var("HF_HOME", &dir); }
+        unsafe { std::env::set_var("HF_HOME", format!("{base}/huggingface")); }
+    }
+    if std::env::var("CUDA_CACHE_PATH").is_err() {
+        unsafe { std::env::set_var("CUDA_CACHE_PATH", format!("{base}/cuda")); }
     }
 }
 
