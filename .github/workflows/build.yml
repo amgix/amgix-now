@@ -153,6 +153,7 @@ jobs:
         shell: bash
         env:
           AMGIX_VERSION: ${{ env.AMGIX_VERSION }}
+          CUDA_COMPUTE_CAP: 80
         run: cargo build --locked --release --features cuda
 
       - name: Package release archive
