@@ -140,6 +140,9 @@ jobs:
           "VERSION=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "AMGIX_VERSION=$versionNoV" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
