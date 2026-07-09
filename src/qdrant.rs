@@ -26,7 +26,7 @@ use qdrant_client::Qdrant;
 
 use crate::common::{
     string_to_uuid, sys_collection_name, DenseDistance,
-    MAX_DATABASE_WAIT_SECONDS, SEARCH_PREFETCH_MULTIPLIER,
+    MAX_DATABASE_WAIT_SECONDS, search_prefetch_limit,
 };
 use tokio::time::sleep;
 use crate::functions::{
@@ -777,7 +777,7 @@ impl QdrantDb {
             .map(|w| ((w.vector_name.clone(), w.field.to_string()), w.weight))
             .collect();
 
-        let prefetch_limit = (query.settings.limit as f64 * SEARCH_PREFETCH_MULTIPLIER) as u64;
+        let prefetch_limit = search_prefetch_limit(query.settings.limit);
 
         let mut batch_requests: Vec<qdrant_client::qdrant::QueryPoints> = Vec::new();
         let mut batch_vector_names: Vec<String> = Vec::new();

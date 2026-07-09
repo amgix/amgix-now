@@ -30,6 +30,11 @@ pub const DEFAULT_WMTR_WORD_WEIGHT_PERCENTAGE: u32 = 80;
 pub const DEFAULT_WMTR_TRIGRAM_WEIGHT: f64 = 1.0;
 pub const DEFAULT_LANGUAGE_CONFIDENCE: f64 = 0.9;
 pub const SEARCH_PREFETCH_MULTIPLIER: f64 = 1.5;
+pub const SEARCH_PREFETCH_MIN: u64 = 5;
+
+pub fn search_prefetch_limit(limit: u32) -> u64 {
+    ((limit as f64 * SEARCH_PREFETCH_MULTIPLIER) as u64).max(SEARCH_PREFETCH_MIN)
+}
 
 /// Max sleep between database connection retries (seconds). Matches `MAX_DATABASE_WAIT_SECONDS` in Python.
 pub const MAX_DATABASE_WAIT_SECONDS: u64 = 30;
