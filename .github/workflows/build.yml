@@ -58,58 +58,7 @@ jobs:
     uses: ./.github/workflows/signal-vm.yml
     secrets: inherit
 
-  build-binary-windows-cpu:
-    runs-on: windows-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set version
-        shell: pwsh
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
-            if (-not $env:INPUT_VERSION) {
-              Write-Error 'workflow_dispatch requires version input'
-              exit 1
-            }
-            $versionNoV = $env:INPUT_VERSION -replace '^v', ''
-            $ref = "v$versionNoV"
-          } elseif ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v') {
-            $ref = $env:GITHUB_REF_NAME
-            $versionNoV = $ref.Substring(1)
-          } else {
-            Write-Error "Run on a v* tag or workflow_dispatch with version. Ref: $env:GITHUB_REF"
-            exit 1
-          }
-          "VERSION=$ref" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "AMGIX_VERSION=$versionNoV" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Build
-        shell: bash
-        env:
-          AMGIX_VERSION: ${{ env.AMGIX_VERSION }}
-        run: cargo build --locked --release
-
-      - name: Package release archive
-        shell: pwsh
-        run: Compress-Archive -Path target/release/amgix-now.exe -DestinationPath amgix-now-windows-x86_64.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          path: amgix-now-windows-x86_64.zip
-          archive: false
-
-  build-binary-windows-gpu:
+  build-binary-windows:
     runs-on: windows-2022
     permissions:
       contents: read
@@ -154,18 +103,34 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Build
+      - name: Build CPU binary
+        shell: cmd
+        env:
+          AMGIX_VERSION: ${{ env.AMGIX_VERSION }}
+        run: cargo build --locked --release
+
+      - name: Package CPU release archive
+        shell: pwsh
+        run: Compress-Archive -Path target/release/amgix-now.exe -DestinationPath amgix-now-windows-x86_64.zip
+
+      - name: Upload CPU artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: amgix-now-windows-x86_64.zip
+          archive: false
+
+      - name: Build GPU binary
         shell: cmd
         env:
           AMGIX_VERSION: ${{ env.AMGIX_VERSION }}
           CUDA_COMPUTE_CAP: 80
         run: cargo build --locked --release --features cuda
 
-      - name: Package release archive
+      - name: Package GPU release archive
         shell: pwsh
         run: Compress-Archive -Path target/release/amgix-now.exe -DestinationPath amgix-now-windows-x86_64-gpu.zip
 
-      - name: Upload artifact
+      - name: Upload GPU artifact
         uses: actions/upload-artifact@v7
         with:
           path: amgix-now-windows-x86_64-gpu.zip
@@ -345,8 +310,7 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.skip_release == false)
     needs:
       - build-now-gpu
-      - build-binary-windows-cpu
-      - build-binary-windows-gpu
+      - build-binary-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
