@@ -110,7 +110,7 @@ jobs:
           archive: false
 
   build-binary-windows-gpu:
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       contents: read
 
@@ -142,6 +142,8 @@ jobs:
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          vsversion: '2022'
 
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
