@@ -993,6 +993,11 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// HTTP listen address (`host:port`). Default: `127.0.0.1:8235`.
+fn amgix_now_listen_addr_from_env() -> String {
+    std::env::var("AMGIX_NOW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8235".into())
+}
+
 /// `AMGIX_NOW_SYNC_DB_WRITES`: `true` / `1` / `yes` (case-insensitive) → Qdrant `wait=true` on document upserts and deletes.
 fn amgix_now_sync_db_writes_from_env() -> bool {
     std::env::var("AMGIX_NOW_SYNC_DB_WRITES").map_or(false, |s| {
@@ -1238,8 +1243,9 @@ async fn main() {
         .layer(middleware::from_fn(log_failed_http_responses))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8235").await.unwrap();
-    tracing::info!("Listening  http://0.0.0.0:8235");
+    let listen_addr = amgix_now_listen_addr_from_env();
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
+    tracing::info!("Listening http://{listen_addr}");
 
     let shutdown = async {
         wait_for_shutdown_signal().await;
