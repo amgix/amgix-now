@@ -2,8 +2,11 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use candle_core::{DType, Tensor};
+use embed_anything::embeddings::embed::EmbeddingResult;
+use tokio::runtime::Runtime;
 
 use crate::models::VectorConfigInternal;
+
 use crate::vectors::model_cache::{maybe_gpu_inference_permit, trusted_organizations, DenseModelCache, DenseModelHandle};
 use crate::vectors::st_pooling::pool_sentence_embeddings;
 use crate::vectors::vector_base::VectorBase;
@@ -58,17 +61,34 @@ impl VectorBase for DenseModelVector {
     }
 }
 
-/// Runs dense embedding directly on the model's candle tensors, keeping all intermediate
-/// results on device (GPU or CPU) and only copying to host once per mini-batch at the end.
-/// This avoids the per-batch GPU→CPU copy that `BertEmbed::embed()` does internally.
+/// Runs dense embedding, dispatching to the BERT optimized path or the generic path
+/// depending on the model architecture detected at load time.
 fn embed_dense_batch(
     handle: &DenseModelHandle,
     docs: &[String],
     normalize: bool,
     model_id: &str,
 ) -> Result<Vec<Vec<f32>>, String> {
-    let embedder = &handle.embedder;
-    let pooling = &handle.pooling;
+    match handle {
+        DenseModelHandle::Bert { embedder, pooling } => {
+            embed_dense_batch_bert(embedder, pooling, docs, normalize, model_id)
+        }
+        DenseModelHandle::Generic(embedder) => {
+            embed_dense_batch_generic(embedder, docs, normalize, model_id)
+        }
+    }
+}
+
+/// Optimized BERT path: keeps all intermediate results on device (GPU or CPU) and only
+/// copies to host once per mini-batch, avoiding the per-batch GPU→CPU copy that
+/// `BertEmbed::embed()` does internally.
+fn embed_dense_batch_bert(
+    embedder: &embed_anything::embeddings::local::bert::BertEmbedder,
+    pooling: &crate::vectors::st_pooling::StPoolingConfig,
+    docs: &[String],
+    normalize: bool,
+    model_id: &str,
+) -> Result<Vec<Vec<f32>>, String> {
     let device = &embedder.model.device;
     let mut results: Vec<Vec<f32>> = Vec::with_capacity(docs.len());
 
@@ -145,7 +165,70 @@ fn embed_dense_batch(
     Ok(results)
 }
 
+/// Single-thread Tokio runtime used to drive async `TextEmbedder::embed` calls from
+/// sync vectorization threads (rayon workers, `std::thread::spawn`, `spawn_blocking`).
+/// Built once on first use; one runtime serves all generic-model inference calls.
+static GENERIC_EMBED_RT: OnceLock<Runtime> = OnceLock::new();
+
+fn generic_embed_rt() -> &'static Runtime {
+    GENERIC_EMBED_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_name("generic-embed-rt")
+            .build()
+            .expect("failed to build generic embed runtime")
+    })
+}
+
+/// Generic path via `embed_anything`'s `TextEmbedder`: works for any architecture
+/// that `embed_anything` supports (Model2Vec, ModernBERT, Qwen3, etc.).
+/// `TextEmbedder::embed` is async; we block on it using a dedicated single-thread
+/// runtime so this works correctly from rayon workers, native threads, and
+/// `spawn_blocking` contexts — none of which have an ambient Tokio reactor.
+fn embed_dense_batch_generic(
+    embedder: &embed_anything::embeddings::embed::TextEmbedder,
+    docs: &[String],
+    normalize: bool,
+    model_id: &str,
+) -> Result<Vec<Vec<f32>>, String> {
+    let rt = generic_embed_rt();
+    let mut results: Vec<Vec<f32>> = Vec::with_capacity(docs.len());
+
+    for chunk in docs.chunks(DENSE_MODEL_BATCH_SIZE) {
+        let chunk_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+
+        let batch_results = rt
+            .block_on(embedder.embed(&chunk_refs, Some(DENSE_MODEL_BATCH_SIZE), None))
+            .map_err(|e| format!("Embedding failed for '{model_id}': {e}"))?;
+
+        for result in batch_results {
+            let mut vec = match result {
+                EmbeddingResult::DenseVector(v) => v,
+                EmbeddingResult::MultiVector(_) => {
+                    return Err(format!(
+                        "Model '{model_id}' returned multi-vector output; only dense vectors are supported here"
+                    ));
+                }
+            };
+            if normalize {
+                l2_normalize_vec(&mut vec);
+            }
+            results.push(vec);
+        }
+    }
+
+    Ok(results)
+}
+
 /// L2-normalize a [batch, dim] tensor on-device.
 fn l2_normalize_tensor(t: &Tensor) -> candle_core::Result<Tensor> {
     t.broadcast_div(&t.sqr()?.sum_keepdim(1)?.sqrt()?)
+}
+
+/// L2-normalize a vector in place.
+fn l2_normalize_vec(v: &mut Vec<f32>) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-9 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
 }

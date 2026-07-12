@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
+use embed_anything::embeddings::embed::TextEmbedder;
 use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use serde_json::Value;
@@ -189,10 +190,66 @@ pub fn set_hf_home() {
 
 const ST_POOLING_CONFIG_PATH: &str = "1_Pooling/config.json";
 
-/// Dense model plus Sentence-Transformers pooling config loaded once at model load time.
-pub struct DenseModelHandle {
-    pub embedder: BertEmbedder,
-    pub pooling: StPoolingConfig,
+fn read_hf_config_json(model_id: &str, revision: Option<&str>) -> Result<Value, String> {
+    let api = ApiBuilder::new()
+        .with_progress(false)
+        .build()
+        .map_err(|e| format!("Failed to build HF API: {e}"))?;
+    let repo = match revision {
+        Some(rev) => Repo::with_revision(model_id.to_string(), RepoType::Model, rev.to_string()),
+        None => Repo::new(model_id.to_string(), RepoType::Model),
+    };
+    let config_path = api
+        .repo(repo)
+        .get("config.json")
+        .map_err(|e| format!("Failed to fetch config.json for '{model_id}': {e}"))?;
+    let text = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config.json for '{model_id}': {e}"))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse config.json for '{model_id}': {e}"))
+}
+
+fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModelHandle, String> {
+    let config = read_hf_config_json(model_id, revision)?;
+    let architecture = config["architectures"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if architecture == "BertModel" {
+        let pooling = load_st_pooling_config(model_id, revision);
+        let embedder = BertEmbedder::new(
+            model_id.to_string(),
+            revision.map(|s| s.to_string()),
+            None,
+        )
+        .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
+        Ok(DenseModelHandle::Bert { embedder, pooling })
+    } else {
+        let embedder = TextEmbedder::from_pretrained_hf(
+            architecture,
+            model_id,
+            revision,
+            None,
+            None,
+        )
+        .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
+        Ok(DenseModelHandle::Generic(embedder))
+    }
+}
+
+/// Dense model loaded once at model load time.
+///
+/// BERT models use the optimized on-device candle pipeline (tokenize → tensor → forward →
+/// pool → normalize). All other architectures use `embed_anything`'s `TextEmbedder`, which
+/// handles model loading and inference generically based on `config.json`.
+pub enum DenseModelHandle {
+    Bert {
+        embedder: BertEmbedder,
+        pooling: StPoolingConfig,
+    },
+    Generic(TextEmbedder),
 }
 
 fn load_st_pooling_config(model_id: &str, revision: Option<&str>) -> StPoolingConfig {
@@ -301,15 +358,7 @@ impl DenseModelCache {
         }
 
         set_hf_home();
-        let pooling = load_st_pooling_config(model_id, revision);
-        let embedder = BertEmbedder::new(
-            model_id.to_string(),
-            revision.map(|s| s.to_string()),
-            None,
-        )
-        .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
-
-        let handle = Arc::new(DenseModelHandle { embedder, pooling });
+        let handle = Arc::new(load_dense_model(model_id, revision)?);
         let mut cache = self.inner.write().unwrap();
         if let Some(existing) = bump_cache_hit(&mut cache, &key) {
             return Ok(existing);
