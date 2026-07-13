@@ -44,7 +44,7 @@ use models::{
     parse_document_timestamp_for_api, BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
     CollectionExistsResponse, CollectionStatsResponse, Document, DocumentFetchRequest,
     DocumentStatus, DocumentStatusResponse, OkResponse, QueueInfo,
-    QueuedDocumentStatus, ReadyResponse, SearchQuery,
+    QueuedDocumentStatus, ReadyResponse, SearchQuery, SearchResponse,
     SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
@@ -859,13 +859,19 @@ async fn search(
     validate_search_query(&query).map_err(validation_error)?;
     normalize_search_query_python(&mut query);
     let real_collection_name = get_real_collection_name(&collection_name);
+    let t0 = std::time::Instant::now();
     match app
         .search_ingress
         .search(real_collection_name.to_string(), query)
         .await
     {
         Ok(results) => {
-            let vals: Vec<Value> = results
+            let response = SearchResponse {
+                results,
+                query_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            };
+            let vals: Vec<Value> = response
+                .results
                 .into_iter()
                 .map(|r| {
                     serde_json::to_value(r)
@@ -873,7 +879,10 @@ async fn search(
                         .unwrap_or(Value::Null)
                 })
                 .collect();
-            Ok(Json(Value::Array(vals)))
+            Ok(Json(serde_json::json!({
+                "results": vals,
+                "query_time_ms": response.query_time_ms,
+            })))
         }
         Err(SearchError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
         Err(SearchError::InvalidFilter(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),

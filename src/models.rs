@@ -881,6 +881,17 @@ pub struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// SearchResponse
+// Mirrors amgix-server SearchResponse.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
+    pub query_time_ms: f64,
+}
+
+// ---------------------------------------------------------------------------
 // DocumentFetchRequest / DocumentFetchResponse
 // Mirrors amgix-server DocumentFetchRequest / DocumentFetchResponse.
 // ---------------------------------------------------------------------------
