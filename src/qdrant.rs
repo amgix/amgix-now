@@ -772,7 +772,7 @@ impl QdrantDb {
         // weight_lookup: (vector_name, field) → weight — mirrors Python lines 585-586.
         let weight_lookup: HashMap<(String, String), f64> = query
             .settings
-            .vector_weights
+            .vector_options
             .iter()
             .map(|w| ((w.vector_name.clone(), w.field.to_string()), w.weight))
             .collect();

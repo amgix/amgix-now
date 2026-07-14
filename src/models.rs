@@ -638,28 +638,32 @@ impl Hash for CustomVector {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VectorSearchWeight {
+pub struct VectorSearchOption {
     pub vector_name: String,
     #[serde(default = "default_weight")]
     pub weight: f64,
     pub field: DocumentField,
+    #[serde(default = "default_wmtr_trigram_weight")]
+    pub wmtr_trigram_weight: f64,
 }
 
-impl PartialEq for VectorSearchWeight {
+impl PartialEq for VectorSearchOption {
     fn eq(&self, other: &Self) -> bool {
         self.vector_name == other.vector_name
             && self.field == other.field
             && self.weight.to_bits() == other.weight.to_bits()
+            && self.wmtr_trigram_weight.to_bits() == other.wmtr_trigram_weight.to_bits()
     }
 }
 
-impl Eq for VectorSearchWeight {}
+impl Eq for VectorSearchOption {}
 
-impl Hash for VectorSearchWeight {
+impl Hash for VectorSearchOption {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.vector_name.hash(state);
         self.weight.to_bits().hash(state);
         self.field.hash(state);
+        self.wmtr_trigram_weight.to_bits().hash(state);
     }
 }
 
@@ -765,7 +769,7 @@ fn hash_opt_f64<H: Hasher>(x: &Option<f64>, state: &mut H) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuerySettings {
     #[serde(default)]
-    pub vector_weights: Vec<VectorSearchWeight>,
+    pub vector_options: Vec<VectorSearchOption>,
     #[serde(default)]
     pub custom_vectors: Option<Vec<CustomVector>>,
     #[serde(default = "default_search_limit")]
@@ -780,8 +784,6 @@ pub struct SearchQuerySettings {
     pub metadata_filter: Option<MetadataFilter>,
     #[serde(default)]
     pub raw_scores: bool,
-    #[serde(default = "default_wmtr_trigram_weight")]
-    pub wmtr_trigram_weight: f64,
     #[serde(default = "default_fusion_mode")]
     pub fusion_mode: String,
     #[serde(default, deserialize_with = "crate::join_parser::deserialize_join_field")]
@@ -790,7 +792,7 @@ pub struct SearchQuerySettings {
 
 impl PartialEq for SearchQuerySettings {
     fn eq(&self, other: &Self) -> bool {
-        self.vector_weights == other.vector_weights
+        self.vector_options == other.vector_options
             && self.custom_vectors == other.custom_vectors
             && self.limit == other.limit
             && opt_f64_eq(&self.score_threshold, &other.score_threshold)
@@ -798,7 +800,6 @@ impl PartialEq for SearchQuerySettings {
             && self.document_tags_match_all == other.document_tags_match_all
             && self.metadata_filter == other.metadata_filter
             && self.raw_scores == other.raw_scores
-            && self.wmtr_trigram_weight.to_bits() == other.wmtr_trigram_weight.to_bits()
             && self.fusion_mode == other.fusion_mode
             && self.join == other.join
     }
@@ -808,7 +809,7 @@ impl Eq for SearchQuerySettings {}
 
 impl Hash for SearchQuerySettings {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.vector_weights.hash(state);
+        self.vector_options.hash(state);
         self.custom_vectors.hash(state);
         self.limit.hash(state);
         hash_opt_f64(&self.score_threshold, state);
@@ -816,7 +817,6 @@ impl Hash for SearchQuerySettings {
         self.document_tags_match_all.hash(state);
         self.metadata_filter.hash(state);
         self.raw_scores.hash(state);
-        self.wmtr_trigram_weight.to_bits().hash(state);
         self.fusion_mode.hash(state);
         self.join.hash(state);
     }

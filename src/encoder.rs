@@ -24,7 +24,7 @@ use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
     CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
     ModelValidationResult, SearchQuery, SearchQuerySettings, SearchResult, VectorConfigInternal,
-    VectorSearchWeight,
+    VectorSearchOption,
 };
 
 fn needs_revectorization(
@@ -1607,17 +1607,18 @@ pub async fn validate_models(vector_configs: Vec<VectorConfigInternal>) -> Model
 }
 
 fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValidationResponse {
-    let vector_weights: Vec<VectorSearchWeight> = vector_configs
+    let vector_options: Vec<VectorSearchOption> = vector_configs
         .iter()
         .flat_map(|config| {
             config
                 .index_fields
                 .iter()
                 .copied()
-                .map(move |field| VectorSearchWeight {
+                .map(move |field| VectorSearchOption {
                     vector_name: config.name.clone(),
                     weight: 1.0,
                     field,
+                    wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
                 })
         })
         .collect();
@@ -1625,7 +1626,7 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
     let dummy_query = SearchQuery {
         query: "x".to_string(),
         settings: SearchQuerySettings {
-            vector_weights,
+            vector_options,
             custom_vectors: None,
             limit: DEFAULT_SEARCH_LIMIT,
             score_threshold: None,
@@ -1633,7 +1634,6 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
             document_tags_match_all: false,
             metadata_filter: None,
             raw_scores: false,
-            wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
             fusion_mode: "rrf".to_string(),
             join: None,
         },

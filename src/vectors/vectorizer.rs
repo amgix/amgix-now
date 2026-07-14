@@ -27,7 +27,7 @@ use crate::common::{
 use crate::metrics::MetricsCollector;
 use crate::models::{
     Document, DocumentWithVectors, SearchQuery, SearchQuerySettings, SearchQueryWithVectors,
-    VectorConfigInternal, VectorData, VectorSearchWeight,
+    VectorConfigInternal, VectorData, VectorSearchOption,
 };
 use crate::vectors::dense_custom::CustomDenseVector;
 use crate::vectors::dense_model::DenseModelVector;
@@ -521,11 +521,11 @@ impl Vectorizer {
 
         let mut vectors_to_generate: HashSet<(String, DocumentField)> = HashSet::new();
 
-        if !settings.vector_weights.is_empty() {
-            for weight in &settings.vector_weights {
-                if weight.weight != 0.0 {
+        if !settings.vector_options.is_empty() {
+            for option in &settings.vector_options {
+                if option.weight != 0.0 {
                     vectors_to_generate
-                        .insert((weight.vector_name.clone(), weight.field));
+                        .insert((option.vector_name.clone(), option.field));
                 }
             }
         } else {
@@ -537,36 +537,70 @@ impl Vectorizer {
             if !vectors_to_generate.is_empty() {
                 let equal_weight =
                     1.0_f64 / (vectors_to_generate.len() as f64);
-                settings.vector_weights = vectors_to_generate
+                settings.vector_options = vectors_to_generate
                     .iter()
-                    .map(|(name, field)| VectorSearchWeight {
+                    .map(|(name, field)| VectorSearchOption {
                         vector_name: name.clone(),
                         field: *field,
                         weight: equal_weight,
+                        wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
                     })
                     .collect();
             }
         }
+
+        let option_map: HashMap<(String, DocumentField), &VectorSearchOption> = settings
+            .vector_options
+            .iter()
+            .map(|o| ((o.vector_name.clone(), o.field), o))
+            .collect();
 
         let config_map: HashMap<String, &VectorConfigInternal> = vector_configs
             .iter()
             .map(|c| (c.name.clone(), c))
             .collect();
 
-        let mut vector_groups: HashMap<String, Vec<DocumentField>> = HashMap::new();
+        // Group non-WMTR vectors by name; WMTR gets one task per field (trigram weight is per option).
+        let mut normal_groups: HashMap<String, Vec<DocumentField>> = HashMap::new();
+        let mut wmtr_work: Vec<(&VectorConfigInternal, DocumentField, f64)> = Vec::new();
         for (vector_name, field) in vectors_to_generate {
-            vector_groups.entry(vector_name).or_default().push(field);
-        }
-
-        let groups: Vec<(String, Vec<DocumentField>)> = vector_groups.into_iter().collect();
-
-        for (vector_name, fields) in &groups {
-            let config = config_map.get(vector_name).ok_or_else(|| {
+            let config = config_map.get(&vector_name).ok_or_else(|| {
                 format!(
                     "Vector configuration '{vector_name}' not found. Available vectors: {}",
                     config_map.keys().cloned().collect::<Vec<_>>().join(", ")
                 )
             })?;
+            if !config.index_fields.contains(&field) {
+                return Err(format!(
+                    "Field '{field}' is not configured for vector '{vector_name}'. Available fields: {:?}",
+                    config
+                        .index_fields
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if config.vector_type == VectorType::Wmtr {
+                let option = option_map.get(&(vector_name.clone(), field));
+                let trigram_weight = option
+                    .map(|o| o.wmtr_trigram_weight)
+                    .unwrap_or(DEFAULT_WMTR_TRIGRAM_WEIGHT);
+                wmtr_work.push((config, field, trigram_weight));
+            } else {
+                normal_groups.entry(vector_name).or_default().push(field);
+            }
+        }
+
+        let mut work_items: Vec<(String, Vec<DocumentField>, f64)> = normal_groups
+            .into_iter()
+            .map(|(vector_name, fields)| (vector_name, fields, DEFAULT_WMTR_TRIGRAM_WEIGHT))
+            .collect();
+        for (config, field, trigram_weight) in wmtr_work {
+            work_items.push((config.name.clone(), vec![field], trigram_weight));
+        }
+
+        for (vector_name, fields, _) in &work_items {
+            let config = config_map.get(vector_name).expect("validated above");
             for field in fields {
                 if !config.index_fields.contains(field) {
                     return Err(format!(
@@ -578,10 +612,10 @@ impl Vectorizer {
         }
 
         let n = query_texts.len();
-        let group_results: Vec<Vec<Vec<VectorData>>> = if groups.len() > 1 {
-            groups
+        let group_results: Vec<Vec<Vec<VectorData>>> = if work_items.len() > 1 {
+            work_items
                 .par_iter()
-                .map(|(vector_name, fields)| {
+                .map(|(vector_name, fields, trigram_weight)| {
                     let config = *config_map.get(vector_name).expect("validated above");
                     Self::generate_vectors_for_query_batch(
                         config,
@@ -589,6 +623,7 @@ impl Vectorizer {
                         fields,
                         settings,
                         validation_mode,
+                        *trigram_weight,
                         metrics.as_deref(),
                     )
                     .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))
@@ -596,7 +631,7 @@ impl Vectorizer {
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             let mut out = Vec::new();
-            for (vector_name, fields) in &groups {
+            for (vector_name, fields, trigram_weight) in &work_items {
                 let config = *config_map.get(vector_name).expect("validated above");
                 let batch = Self::generate_vectors_for_query_batch(
                     config,
@@ -604,6 +639,7 @@ impl Vectorizer {
                     fields,
                     settings,
                     validation_mode,
+                    *trigram_weight,
                     metrics.as_deref(),
                 )
                 .map_err(|e| format!("Failed to generate vector '{vector_name}': {e}"))?;
@@ -634,6 +670,7 @@ impl Vectorizer {
         fields: &[DocumentField],
         settings: &SearchQuerySettings,
         validation_mode: bool,
+        trigram_weight: f64,
         metrics: Option<&MetricsCollector>,
     ) -> Result<Vec<Vec<VectorData>>, String> {
         let n = query_texts.len();
@@ -748,7 +785,7 @@ impl Vectorizer {
                         &effective_config,
                         query_texts,
                         Some(avgdls_5.as_slice()),
-                        settings.wmtr_trigram_weight,
+                        trigram_weight,
                         metrics,
                     )
                 } else {
@@ -756,7 +793,7 @@ impl Vectorizer {
                         &effective_config,
                         query_texts,
                         None,
-                        settings.wmtr_trigram_weight,
+                        trigram_weight,
                         metrics,
                     )
                 }?;

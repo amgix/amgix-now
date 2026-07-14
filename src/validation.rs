@@ -690,10 +690,10 @@ fn validate_language_config(v: &VectorConfig) -> VResult {
 // Mirrors: vector.py SearchQuery field validators
 // ---------------------------------------------------------------------------
 
-/// Mirrors Pydantic `VectorSearchWeight` / `CustomVector.vector_name`: stored names are trimmed
+/// Mirrors Pydantic `VectorSearchOption` / `CustomVector.vector_name`: stored names are trimmed
 /// **after** validation (see validators returning `strip()`).
 pub fn normalize_search_query_python(q: &mut SearchQuery) {
-    for w in &mut q.settings.vector_weights {
+    for w in &mut q.settings.vector_options {
         w.vector_name = w.vector_name.trim().to_string();
     }
     if let Some(ref mut cv) = q.settings.custom_vectors {
@@ -749,8 +749,8 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
             }
         }
     }
-    // vector_weights: each vector_name validated
-    for w in &q.settings.vector_weights {
+    // vector_options: each vector_name validated
+    for w in &q.settings.vector_options {
         validate_search_vector_name(&w.vector_name)?;
     }
     if let Some(ref cv) = q.settings.custom_vectors {
@@ -763,20 +763,20 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
     Ok(())
 }
 
-/// @field_validator('vector_name') on VectorSearchWeight — pattern on raw `v`, max len on raw,
+/// @field_validator('vector_name') on VectorSearchOption — pattern on raw `v`, max len on raw,
 /// modeled value trimmed (Rust: [`normalize_search_query_python`] afterward).
 fn validate_search_vector_name(name: &str) -> VResult {
     if name.trim().is_empty() {
-        return Err(err("vector_weights.vector_name: Vector name cannot be empty or whitespace"));
+        return Err(err("vector_options.vector_name: Vector name cannot be empty or whitespace"));
     }
     if !RE_ALPHANUMERIC.is_match(name) {
         return Err(err(
-            "vector_weights.vector_name: Vector name can only contain letters, numbers, underscores, and hyphens",
+            "vector_options.vector_name: Vector name can only contain letters, numbers, underscores, and hyphens",
         ));
     }
     if name.chars().count() > MAX_VECTOR_NAME_LENGTH {
         return Err(err(format!(
-            "vector_weights.vector_name: Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
+            "vector_options.vector_name: Vector name cannot exceed {MAX_VECTOR_NAME_LENGTH} characters"
         )));
     }
     Ok(())
