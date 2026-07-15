@@ -9,6 +9,7 @@ use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use serde_json::Value;
 
+use crate::common::cache_base_dir;
 use crate::vectors::st_pooling::StPoolingConfig;
 
 // ---------------------------------------------------------------------------
@@ -108,10 +109,11 @@ fn model_cache_size() -> usize {
 }
 
 /// Returns the HuggingFace local cache directory, mirrors HF_CACHE_DIR in Python.
-/// AMGIX_CACHE_DIR defaults to /data/amgix/cache; HF cache lives under it at /huggingface.
 pub fn hf_cache_dir() -> String {
-    let base = std::env::var("AMGIX_CACHE_DIR").unwrap_or_else(|_| "/data/amgix/cache".to_string());
-    format!("{base}/huggingface")
+    cache_base_dir()
+        .join("huggingface")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Check if a model is from a trusted organization.
@@ -175,12 +177,12 @@ pub fn trusted_organizations() -> Option<&'static HashSet<String>> {
 
 /// Sets HF_HOME so that `ApiBuilder::from_env()` inside embed_anything uses our cache dir.
 pub fn set_hf_home() {
-    let base = std::env::var("AMGIX_CACHE_DIR").unwrap_or_else(|_| "/data/amgix/cache".to_string());
+    let base = cache_base_dir();
     if std::env::var("HF_HOME").is_err() {
-        unsafe { std::env::set_var("HF_HOME", format!("{base}/huggingface")); }
+        unsafe { std::env::set_var("HF_HOME", base.join("huggingface")); }
     }
     if std::env::var("CUDA_CACHE_PATH").is_err() {
-        unsafe { std::env::set_var("CUDA_CACHE_PATH", format!("{base}/cuda")); }
+        unsafe { std::env::set_var("CUDA_CACHE_PATH", base.join("cuda")); }
     }
 }
 

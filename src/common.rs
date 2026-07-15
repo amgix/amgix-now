@@ -1,5 +1,56 @@
+use std::path::{Path, PathBuf};
+
 use once_cell::sync::Lazy;
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Host OS (compile-time target)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    Windows,
+    Linux,
+    MacOs,
+    Other,
+}
+
+pub const fn host_os() -> HostOs {
+    #[cfg(windows)]
+    {
+        HostOs::Windows
+    }
+    #[cfg(target_os = "linux")]
+    {
+        HostOs::Linux
+    }
+    #[cfg(target_os = "macos")]
+    {
+        HostOs::MacOs
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        HostOs::Other
+    }
+}
+
+fn executable_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Base cache directory. `AMGIX_CACHE_DIR` when set; otherwise `{executable_dir}/data/amgix/cache`.
+pub fn cache_base_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("AMGIX_CACHE_DIR") {
+        return PathBuf::from(v);
+    }
+    executable_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("data")
+        .join("amgix")
+        .join("cache")
+}
 
 // ---------------------------------------------------------------------------
 // Application identity

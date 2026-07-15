@@ -3,6 +3,7 @@ mod bunny_talk;
 mod lock_client;
 mod metrics;
 mod common;
+mod platform;
 mod encoder;
 mod filter_parser;
 mod functions;
@@ -1019,6 +1020,7 @@ fn amgix_now_sync_db_writes_from_env() -> bool {
 
 #[tokio::main]
 async fn main() {
+    platform::init();
     init_tracing_from_env();
 
     let db_url = std::env::var("AMGIX_DATABASE_URL")

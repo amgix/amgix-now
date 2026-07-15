@@ -103,6 +103,7 @@ dependencies = [
  "isolang",
  "lapin",
  "murmurhash3",
+ "nu-ansi-term",
  "nvml-wrapper",
  "once_cell",
  "pest",
