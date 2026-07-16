@@ -250,12 +250,6 @@ fn validate_provided_vector_shape(vd: &VectorData, config: &VectorConfigInternal
             vd.vector_name, vd.field
         )));
     };
-    if indices.is_empty() || values.is_empty() {
-        return Err(err(format!(
-            "Vector '{}' field '{}' requires sparse_indices and sparse_values",
-            vd.vector_name, vd.field
-        )));
-    }
     if indices.len() != values.len() {
         return Err(err(format!(
             "Vector '{}' field '{}': sparse_indices and sparse_values length mismatch",
