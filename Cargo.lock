@@ -95,10 +95,12 @@ name = "amgix-now"
 version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
+ "bytes",
  "candle-core",
  "candle-transformers",
  "chrono",
  "embed_anything",
+ "flate2",
  "hf-hub",
  "isolang",
  "lapin",
@@ -119,6 +121,7 @@ dependencies = [
  "sysinfo",
  "tokenizers 0.22.2",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
@@ -1299,9 +1302,9 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
-version = "1.11.1"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "bytes-utils"

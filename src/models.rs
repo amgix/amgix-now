@@ -37,6 +37,34 @@ pub fn flatten_doc_metadata(mut val: Value) -> Value {
     val
 }
 
+fn strip_null_json_fields(val: Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let stripped: serde_json::Map<String, Value> = map
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_null_json_fields(v)))
+                .collect();
+            Value::Object(stripped)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(strip_null_json_fields)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// JSON bytes for one document in collection export (API shape, null fields omitted).
+pub fn document_to_export_json(doc: &Document) -> Result<Vec<u8>, serde_json::Error> {
+    let val = serde_json::to_value(doc)?;
+    let val = flatten_doc_metadata(val);
+    let val = strip_null_json_fields(val);
+    serde_json::to_vec(&val)
+}
+
 /// Stable [`Hash`] for [`serde_json::Value`] (object keys sorted so order-independent).
 pub(crate) fn hash_json_value<H: Hasher>(v: &Value, state: &mut H) {
     match v {

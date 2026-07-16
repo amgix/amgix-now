@@ -111,6 +111,8 @@ pub const MAX_SEARCH_QUERY_LENGTH: usize = 10_000;
 pub const MAX_SEARCH_LIMIT: u32 = 100;
 pub const MAX_TOP_K_VALUE: u32 = 10_000;
 pub const MAX_VECTOR_DIMENSIONS: u32 = 8192;
+pub const DEFAULT_DOCUMENT_FETCH_PAGE_SIZE: u32 = 100;
+pub const MAX_DOCUMENT_FETCH_PAGE_SIZE: u32 = 1000;
 
 // ---------------------------------------------------------------------------
 // VectorType — all variants, mirrors enums.py exactly

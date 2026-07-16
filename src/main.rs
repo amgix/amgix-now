@@ -14,6 +14,8 @@ mod search_join;
 mod validation;
 mod vectors;
 
+use std::convert::Infallible;
+use std::io::Write;
 use std::sync::Arc;
 
 use axum::{
@@ -22,19 +24,24 @@ use axum::{
         rejection::JsonRejection,
         Path, Query, Request, State,
     },
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use bytes::Bytes;
+use chrono::Utc;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use common::{
     get_real_collection_name, get_user_collection_name, qdrant_client_url,
-    AMGIX_VARIANT, AMGIX_VERSION, VectorType, DATABASE_KIND,
+    AMGIX_VARIANT, AMGIX_VERSION, VectorType, DATABASE_KIND, MAX_DOCUMENT_FETCH_PAGE_SIZE,
 };
 use encoder::{
     document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_metadata_filter,
@@ -179,6 +186,32 @@ struct DeleteDocumentQuery {
 struct GetDocumentQuery {
     #[serde(default)]
     with_vectors: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportDocumentsQuery {
+    #[serde(default)]
+    with_vectors: bool,
+}
+
+struct GzipStreamWriter {
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+}
+
+impl Write for GzipStreamWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.tx
+            .blocking_send(Ok(Bytes::copy_from_slice(buf)))
+            .map_err(|_| std::io::Error::other("export stream consumer dropped"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Full Amgix API compatibility surface that **amgix-now** intentionally omits — same paths as FastAPI (`api/main.py`).
@@ -694,6 +727,134 @@ async fn upsert_documents_bulk(
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
     }
+}
+
+/// `GET /v1/collections/{collection_name}/documents/export` — mirrors Python `export_documents`.
+async fn export_documents(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+    Query(query): Query<ExportDocumentsQuery>,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = app
+        .db
+        .get_collection_info_internal(&real_collection_name)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(m) => api_error(StatusCode::NOT_FOUND, m),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get collection config: {e}"),
+            ),
+        })?;
+
+    let user_name = get_user_collection_name(&real_collection_name);
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let filename = format!("{user_name}-{timestamp}.json.gz");
+
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
+    let (plain_tx, plain_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    let with_vectors = query.with_vectors;
+
+    std::thread::spawn(move || {
+        let mut gz = GzEncoder::new(
+            GzipStreamWriter {
+                tx: body_tx.clone(),
+            },
+            Compression::default(),
+        );
+        for chunk in plain_rx {
+            if chunk.is_empty() {
+                break;
+            }
+            if gz.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+        let _ = gz.finish();
+        drop(body_tx);
+    });
+
+    let db = app.db.clone();
+    tokio::spawn(async move {
+        let send_plain = |bytes: Vec<u8>| {
+            let _ = plain_tx.send(bytes);
+        };
+
+        send_plain(b"[".to_vec());
+        let mut first = true;
+        let mut after: Option<String> = None;
+
+        loop {
+            let request = DocumentFetchRequest {
+                page_size: MAX_DOCUMENT_FETCH_PAGE_SIZE,
+                after: after.clone(),
+                metadata_filter: None,
+                document_tags: None,
+                document_tags_match_all: false,
+                join: None,
+                with_vectors,
+            };
+
+            let page = match db
+                .fetch_documents(&real_collection_name, &request, &collection_config)
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+
+            for doc in page.documents {
+                match models::document_to_export_json(&doc) {
+                    Ok(json_bytes) => {
+                        let chunk = if first {
+                            first = false;
+                            json_bytes
+                        } else {
+                            let mut v = Vec::with_capacity(1 + json_bytes.len());
+                            v.push(b',');
+                            v.extend(json_bytes);
+                            v
+                        };
+                        send_plain(chunk);
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            if page.after.is_none() {
+                break;
+            }
+            after = page.after;
+        }
+
+        send_plain(b"]".to_vec());
+        send_plain(Vec::new());
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(body_rx));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/gzip"))
+        .header(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                .map_err(|e| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Invalid Content-Disposition: {e}"),
+                    )
+                })?,
+        )
+        .body(body)
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build export response: {e}"),
+            )
+        })
 }
 
 /// `GET /v1/collections/{collection_name}/documents/{document_id}` — mirrors Python `get_document`.
@@ -1296,6 +1457,10 @@ async fn main() {
         .route(
             "/v1/collections/{collection_name}/documents/bulk",
             post(upsert_documents_bulk),
+        )
+        .route(
+            "/v1/collections/{collection_name}/documents/export",
+            get(export_documents),
         )
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}/sync",
