@@ -52,7 +52,7 @@ use qdrant::{DbError, QdrantDb};
 use validation::{
     normalize_document_python, normalize_search_query_python,
     validate_bulk_upload, validate_collection_config, validate_collection_name, validate_document,
-    validate_search_query,
+    validate_document_vectors, validate_search_query,
 };
 
 #[derive(Clone)]
@@ -173,6 +173,12 @@ fn query_validation_error(field: &str, msg: impl Into<String>) -> (StatusCode, J
 #[derive(Debug, Deserialize)]
 struct DeleteDocumentQuery {
     request_timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetDocumentQuery {
+    #[serde(default)]
+    with_vectors: bool,
 }
 
 /// Full Amgix API compatibility surface that **amgix-now** intentionally omits — same paths as FastAPI (`api/main.py`).
@@ -605,6 +611,22 @@ async fn upsert_document(
     normalize_document_python(&mut document);
     validate_document(&document).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = app
+        .db
+        .get_collection_info_internal(&real_collection_name)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(_) => api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get collection config: {e}"),
+            ),
+        })?;
+    validate_document_vectors(&collection_config, &document)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.0))?;
     match document_upsert_sync(&app.upsert_ingress, &real_collection_name, document).await {
         Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
@@ -630,6 +652,28 @@ async fn upsert_documents_bulk(
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_bulk_upload(&mut request).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = app
+        .db
+        .get_collection_info_internal(&real_collection_name)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(_) => api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get collection config: {e}"),
+            ),
+        })?;
+    for (i, doc) in request.documents.iter().enumerate() {
+        validate_document_vectors(&collection_config, doc).map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("documents[{i}]: {}", e.0),
+            )
+        })?;
+    }
     match document_upsert_bulk(
         &app.upsert_ingress,
         &real_collection_name,
@@ -656,12 +700,35 @@ async fn upsert_documents_bulk(
 async fn get_document(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
+    Query(query): Query<GetDocumentQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = if query.with_vectors {
+        Some(
+            app.db
+                .get_collection_info_internal(&real_collection_name)
+                .await
+                .map_err(|e| match e {
+                    DbError::NotFound(m) => api_error(StatusCode::NOT_FOUND, m),
+                    e => api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Database error: {e}"),
+                    ),
+                })?,
+        )
+    } else {
+        None
+    };
     let rows = app
         .db
-        .get_documents(&real_collection_name, &[document_id.as_str()], false)
+        .get_documents(
+            &real_collection_name,
+            &[document_id.as_str()],
+            false,
+            query.with_vectors,
+            collection_config.as_ref(),
+        )
         .await
         .map_err(|e| match e {
             DbError::NotFound(m) => api_error(StatusCode::NOT_FOUND, m),
@@ -672,7 +739,7 @@ async fn get_document(
             ),
         })?;
 
-    let doc_with = rows
+    let doc = rows
         .into_iter()
         .next()
         .flatten()
@@ -683,7 +750,7 @@ async fn get_document(
             )
         })?;
 
-    let val = serde_json::to_value(Document::from(doc_with))
+    let val = serde_json::to_value(doc)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization error: {e}")))?;
     Ok(Json(models::flatten_doc_metadata(val)))
 }
@@ -698,7 +765,7 @@ async fn get_document_status(
     let real_collection_name = get_real_collection_name(&collection_name);
     let rows = app
         .db
-        .get_documents(&real_collection_name, &[document_id.as_str()], true)
+        .get_documents(&real_collection_name, &[document_id.as_str()], true, false, None)
         .await
         .map_err(|e| match e {
             DbError::Config(m) => api_error(StatusCode::BAD_REQUEST, m),

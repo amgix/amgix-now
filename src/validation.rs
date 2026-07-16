@@ -8,9 +8,10 @@ use chrono::DateTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 
 use crate::common::{
-    DenseDistance, VectorType, MAX_BULK_UPLOAD, MAX_COLLECTION_NAME_LENGTH,
+    DenseDistance, DocumentField, VectorType, MAX_BULK_UPLOAD, MAX_COLLECTION_NAME_LENGTH,
     MAX_DOCUMENT_CONTENT_LENGTH, MAX_DOCUMENT_DESCRIPTION_LENGTH, MAX_DOCUMENT_ID_LENGTH,
     MAX_DOCUMENT_NAME_LENGTH, MAX_DOCUMENT_TAG_LENGTH, MAX_DOCUMENT_TAGS_COUNT,
     MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
@@ -19,8 +20,8 @@ use crate::common::{
     MAX_VECTOR_NAME_LENGTH,
 };
 use crate::models::{
-    BulkUploadRequest, CollectionConfig, CustomDocumentVector, Document, MetadataIndex,
-    SearchQuery, VectorConfig,
+    BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CustomDocumentVector, Document,
+    MetadataIndex, SearchQuery, VectorConfig, VectorConfigInternal, VectorData,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,161 @@ pub fn validate_document(doc: &Document) -> VResult {
         for c in cv {
             validate_custom_document_vector(c)?;
         }
+    }
+    Ok(())
+}
+
+/// Validate precomputed document vectors when provided on upsert.
+/// Mirrors `validate_document_vectors` in amgix-server `database/common.py`.
+pub fn validate_document_vectors(
+    collection_config: &CollectionConfigInternal,
+    document: &Document,
+) -> VResult {
+    let Some(vectors) = document.vectors.as_ref() else {
+        return Ok(());
+    };
+    if vectors.is_empty() {
+        return Err(err(
+            "vectors must be omitted or contain the complete non-custom vector set",
+        ));
+    }
+
+    let mut expected: HashMap<(String, DocumentField), &VectorConfigInternal> = HashMap::new();
+    for config in &collection_config.vectors {
+        if config.vector_type.is_custom_vectors() {
+            continue;
+        }
+        for field in &config.index_fields {
+            expected.insert((config.name.clone(), *field), config);
+        }
+    }
+
+    let mut provided: HashMap<(String, DocumentField), &VectorData> = HashMap::new();
+    for vd in vectors {
+        if vd.vector_type.is_custom_vectors() {
+            return Err(err(format!(
+                "Vector '{}' field '{}' has type '{}'; custom vector types must use custom_vectors",
+                vd.vector_name, vd.field, vd.vector_type
+            )));
+        }
+        let key = (vd.vector_name.clone(), vd.field);
+        if provided.contains_key(&key) {
+            return Err(err(format!(
+                "Duplicate vector entry for '{}' field '{}'",
+                vd.vector_name, vd.field
+            )));
+        }
+        let Some(config) = expected.get(&key) else {
+            return Err(err(format!(
+                "Unexpected vector '{}' field '{}' (not a non-custom collection vector slot)",
+                vd.vector_name, vd.field
+            )));
+        };
+        if vd.vector_type != config.vector_type {
+            return Err(err(format!(
+                "Vector '{}' field '{}' has type '{}', expected '{}'",
+                vd.vector_name, vd.field, vd.vector_type, config.vector_type
+            )));
+        }
+        validate_provided_vector_shape(vd, config)?;
+        provided.insert(key, vd);
+    }
+
+    let missing: Vec<_> = expected
+        .keys()
+        .filter(|k| !provided.contains_key(*k))
+        .collect();
+    if !missing.is_empty() {
+        let mut labels: Vec<String> = missing
+            .iter()
+            .map(|(name, field)| format!("{name}/{field}"))
+            .collect();
+        labels.sort();
+        return Err(err(format!(
+            "Incomplete vectors: missing non-custom slots: {}",
+            labels.join(", ")
+        )));
+    }
+
+    if let Some(custom_vectors) = &document.custom_vectors {
+        let custom_keys: HashSet<(String, DocumentField)> = custom_vectors
+            .iter()
+            .map(|cv| (cv.vector_name.clone(), cv.field))
+            .collect();
+        let overlap: Vec<_> = provided
+            .keys()
+            .filter(|k| custom_keys.contains(*k))
+            .collect();
+        if !overlap.is_empty() {
+            let mut labels: Vec<String> = overlap
+                .iter()
+                .map(|(name, field)| format!("{name}/{field}"))
+                .collect();
+            labels.sort();
+            return Err(err(format!(
+                "Duplicate vector slots in vectors and custom_vectors: {}",
+                labels.join(", ")
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_provided_vector_shape(vd: &VectorData, config: &VectorConfigInternal) -> VResult {
+    if config.vector_type.is_dense() {
+        let Some(dense) = vd.dense_vector.as_ref() else {
+            return Err(err(format!(
+                "Vector '{}' field '{}' requires dense_vector",
+                vd.vector_name, vd.field
+            )));
+        };
+        if dense.is_empty() {
+            return Err(err(format!(
+                "Vector '{}' field '{}' requires dense_vector",
+                vd.vector_name, vd.field
+            )));
+        }
+        if let Some(dim) = config.dimensions {
+            if dense.len() != dim as usize {
+                return Err(err(format!(
+                    "Vector '{}' field '{}' has {} dimensions, expected {}",
+                    vd.vector_name,
+                    vd.field,
+                    dense.len(),
+                    dim
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let (Some(indices), Some(values)) = (&vd.sparse_indices, &vd.sparse_values) else {
+        return Err(err(format!(
+            "Vector '{}' field '{}' requires sparse_indices and sparse_values",
+            vd.vector_name, vd.field
+        )));
+    };
+    if indices.is_empty() || values.is_empty() {
+        return Err(err(format!(
+            "Vector '{}' field '{}' requires sparse_indices and sparse_values",
+            vd.vector_name, vd.field
+        )));
+    }
+    if indices.len() != values.len() {
+        return Err(err(format!(
+            "Vector '{}' field '{}': sparse_indices and sparse_values length mismatch",
+            vd.vector_name, vd.field
+        )));
+    }
+    if indices.len() > config.top_k as usize {
+        return Err(err(format!(
+            "Vector '{}' field '{}' has {} entries, max allowed: {}",
+            vd.vector_name,
+            vd.field,
+            indices.len(),
+            config.top_k
+        )));
     }
     Ok(())
 }

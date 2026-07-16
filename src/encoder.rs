@@ -22,16 +22,19 @@ use crate::common::{
 };
 use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
-    CollectionConfigInternal, Document, DocumentWithVectors, ModelValidationResponse,
+    CollectionConfigInternal, Document, ModelValidationResponse,
     ModelValidationResult, SearchQuery, SearchQuerySettings, SearchResult, VectorConfigInternal,
     VectorSearchOption,
 };
 
 fn needs_revectorization(
     incoming: &Document,
-    existing: &DocumentWithVectors,
+    existing: &Document,
     collection_config: &CollectionConfigInternal,
 ) -> bool {
+    if incoming.vectors.is_some() {
+        return true;
+    }
     if incoming.custom_vectors.is_some() {
         return true;
     }
@@ -1361,8 +1364,10 @@ pub(crate) async fn document_upsert_bulk_internal(
 
     // Batch fetch existing documents.
     let all_ids: Vec<&str> = documents.iter().map(|d| d.id.as_str()).collect();
-    let existing_results = db.get_documents(collection_name, &all_ids, true).await?;
-    let existing_map: HashMap<&str, &DocumentWithVectors> = all_ids
+    let existing_results = db
+        .get_documents(collection_name, &all_ids, true, false, None)
+        .await?;
+    let existing_map: HashMap<&str, &Document> = all_ids
         .iter()
         .zip(existing_results.iter())
         .filter_map(|(id, opt)| opt.as_ref().map(|doc| (*id, doc)))
@@ -1541,18 +1546,18 @@ pub async fn document_delete_sync(
         .map_err(|e| UpsertSyncError::Db(DbError::Config(e)))?;
 
     let existing = db
-        .get_documents(collection_name, &[document_id], true)
+        .get_documents(collection_name, &[document_id], true, false, None)
         .await?
         .into_iter()
         .next()
         .flatten();
 
-    let doc_with_vectors = match existing {
+    let existing_doc = match existing {
         Some(d) => d,
         None => return Ok(vec![]),
     };
 
-    if request_timestamp <= doc_with_vectors.timestamp {
+    if request_timestamp <= existing_doc.timestamp {
         return Ok(vec![document_id.to_string()]);
     }
 
@@ -1563,7 +1568,7 @@ pub async fn document_delete_sync(
     }
 
     let mut updates: HashMap<String, TokenLengthUpdate> = HashMap::new();
-    for (field_vector_name, &token_length) in &doc_with_vectors.token_lengths {
+    for (field_vector_name, &token_length) in &existing_doc.token_lengths {
         updates.insert(field_vector_name.clone(), TokenLengthUpdate {
             new_doc_count: -1,
             new_sum_token_lengths: -(token_length as i64),

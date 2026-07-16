@@ -546,6 +546,10 @@ pub struct Document {
     pub custom_vectors: Option<Vec<CustomDocumentVector>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined: Option<HashMap<String, Vec<Document>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<Vec<VectorData>>,
+    #[serde(default, skip)]
+    pub token_lengths: HashMap<String, usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -573,51 +577,6 @@ pub struct VectorData {
     pub sparse_indices: Option<Vec<u32>>,
     #[serde(default)]
     pub sparse_values: Option<Vec<f32>>,
-}
-
-// ---------------------------------------------------------------------------
-// DocumentWithVectors — Document + pre-computed vectors + token lengths.
-// Mirrors document.py DocumentWithVectors exactly.
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentWithVectors {
-    // All Document fields (flattened)
-    pub id: String,
-    pub timestamp: DateTime<Utc>,
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub content: Option<String>,
-    #[serde(default)]
-    pub metadata: Option<HashMap<String, Value>>,
-    #[serde(default)]
-    pub custom_vectors: Option<Vec<CustomDocumentVector>>,
-    // Internal fields
-    #[serde(default)]
-    pub vectors: Vec<VectorData>,
-    #[serde(default)]
-    pub token_lengths: HashMap<String, usize>,
-}
-
-impl From<DocumentWithVectors> for Document {
-    fn from(d: DocumentWithVectors) -> Self {
-        Document {
-            id: d.id,
-            timestamp: d.timestamp,
-            tags: d.tags,
-            name: d.name,
-            description: d.description,
-            content: d.content,
-            metadata: d.metadata,
-            custom_vectors: d.custom_vectors,
-            joined: None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +869,8 @@ pub struct DocumentFetchRequest {
     pub document_tags_match_all: bool,
     #[serde(default, deserialize_with = "crate::join_parser::deserialize_join_field")]
     pub join: Option<crate::join_parser::JoinField>,
+    #[serde(default)]
+    pub with_vectors: bool,
 }
 
 fn default_fetch_page_size() -> u32 {

@@ -35,8 +35,7 @@ use crate::functions::{
 };
 use crate::models::{
     CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse,
-    DocumentWithVectors, MetadataFilter, MetadataIndex,
-    SearchQueryWithVectors, SearchResult, VectorScore,
+    MetadataFilter, MetadataIndex, SearchQueryWithVectors, SearchResult, VectorData, VectorScore,
 };
 
 const QDRANT_GRPC_CHANNEL_POOL_SIZE: usize = 20;
@@ -552,7 +551,7 @@ impl QdrantDb {
     // add_documents
     //
     // Mirrors QdrantDatabase.add_documents exactly — accepts pre-computed
-    // DocumentWithVectors (vectorization already done upstream).
+    // Mirrors QdrantDatabase.add_documents — pre-computed vectors on Document.
     // Converts dense/sparse VectorData → Qdrant named vectors and upserts.
     // Stats accumulation is the encoder layer's responsibility.
     // -----------------------------------------------------------------------
@@ -560,16 +559,15 @@ impl QdrantDb {
     pub async fn add_documents(
         &self,
         collection_name: &str,
-        documents_with_vectors: &[DocumentWithVectors],
+        documents_with_vectors: &[Document],
         store_content: bool,
     ) -> Result<(), DbError> {
         let mut points: Vec<PointStruct> = Vec::with_capacity(documents_with_vectors.len());
 
         for doc_with_vectors in documents_with_vectors {
-            // Convert VectorData → Qdrant named vector map — mirrors Python lines 426-437.
             let mut qdrant_vectors: HashMap<String, qdrant_client::qdrant::Vector> =
                 HashMap::new();
-            for vector_data in &doc_with_vectors.vectors {
+            for vector_data in doc_with_vectors.vectors.as_deref().unwrap_or(&[]) {
                 let field_vector_name =
                     format!("{}_{}", vector_data.field, vector_data.vector_name);
 
@@ -642,13 +640,88 @@ impl QdrantDb {
         Ok(())
     }
 
+    fn document_from_payload(
+        payload: &HashMap<String, qdrant_client::qdrant::Value>,
+    ) -> Result<Document, DbError> {
+        let payload_json = serde_json::Value::Object(
+            payload
+                .iter()
+                .map(|(k, v)| (k.clone(), qdrant_val_to_json(v)))
+                .collect(),
+        );
+        serde_json::from_value(payload_json)
+            .map_err(|e| DbError::Config(format!("Document deserialization error: {e}")))
+    }
+
+    fn vectors_from_point_vectors(
+        point_vectors: &qdrant_client::qdrant::VectorsOutput,
+        collection_config: &CollectionConfigInternal,
+    ) -> Result<Vec<VectorData>, DbError> {
+        use qdrant_client::qdrant::vector_output::Vector as VectorOutputVariant;
+        use qdrant_client::qdrant::vectors_output::VectorsOptions;
+
+        let named = match point_vectors.vectors_options.as_ref() {
+            Some(VectorsOptions::Vectors(nv)) => &nv.vectors,
+            _ => {
+                return Err(DbError::Config(
+                    "Point has no named vectors".into(),
+                ));
+            }
+        };
+
+        let mut vectors = Vec::new();
+        for vector in &collection_config.vectors {
+            for field in &vector.index_fields {
+                let field_vector_name = format!("{field}_{}", vector.name);
+                let raw = named.get(&field_vector_name).ok_or_else(|| {
+                    DbError::Config(format!("Missing stored vector '{field_vector_name}'"))
+                })?;
+                if vector.vector_type.is_dense() {
+                    let d = match raw.vector.as_ref() {
+                        Some(VectorOutputVariant::Dense(d)) => d,
+                        _ => {
+                            return Err(DbError::Config(format!(
+                                "Stored vector '{field_vector_name}' is not dense"
+                            )));
+                        }
+                    };
+                    vectors.push(VectorData {
+                        vector_name: vector.name.clone(),
+                        field: *field,
+                        vector_type: vector.vector_type.clone(),
+                        dense_vector: Some(d.data.clone()),
+                        sparse_indices: None,
+                        sparse_values: None,
+                    });
+                } else {
+                    let s = match raw.vector.as_ref() {
+                        Some(VectorOutputVariant::Sparse(s)) => s,
+                        _ => {
+                            return Err(DbError::Config(format!(
+                                "Stored vector '{field_vector_name}' is not sparse"
+                            )));
+                        }
+                    };
+                    vectors.push(VectorData {
+                        vector_name: vector.name.clone(),
+                        field: *field,
+                        vector_type: vector.vector_type.clone(),
+                        dense_vector: None,
+                        sparse_indices: Some(s.indices.clone()),
+                        sparse_values: Some(s.values.clone()),
+                    });
+                }
+            }
+        }
+        Ok(vectors)
+    }
+
     // -----------------------------------------------------------------------
     // get_documents
     //
     // Mirrors QdrantDatabase.get_documents exactly.
-    // Returns one Option<DocumentWithVectors> per input id, in the same order.
+    // Returns one Option<Document> per input id, in the same order.
     // None for missing documents when suppress_not_found=true; error otherwise.
-    // vectors is always empty (payload-only retrieval, matching Python).
     // -----------------------------------------------------------------------
 
     pub async fn get_documents(
@@ -656,21 +729,22 @@ impl QdrantDb {
         collection_name: &str,
         document_ids: &[&str],
         suppress_not_found: bool,
-    ) -> Result<Vec<Option<DocumentWithVectors>>, DbError> {
+        with_vectors: bool,
+        collection_config: Option<&CollectionConfigInternal>,
+    ) -> Result<Vec<Option<Document>>, DbError> {
         let point_ids: Vec<PointId> = document_ids
             .iter()
             .map(|id| string_to_uuid(id).to_string().into())
             .collect();
 
-        let result = self
-            .client
-            .get_points(
-                GetPointsBuilder::new(collection_name, point_ids).with_payload(true),
-            )
-            .await?;
+        let mut builder =
+            GetPointsBuilder::new(collection_name, point_ids).with_payload(true);
+        if with_vectors {
+            builder = builder.with_vectors(true);
+        }
+        let result = self.client.get_points(builder).await?;
 
-        // Build uuid-string → DocumentWithVectors map.
-        let mut doc_map: HashMap<String, DocumentWithVectors> = HashMap::new();
+        let mut doc_map: HashMap<String, Document> = HashMap::new();
         for point in result.result {
             let uuid_str = match &point.id {
                 Some(pid) => match &pid.point_id_options {
@@ -680,17 +754,22 @@ impl QdrantDb {
                 None => continue,
             };
 
-            let payload_json = serde_json::Value::Object(
-                point.payload.iter().map(|(k, v)| (k.clone(), qdrant_val_to_json(v))).collect(),
-            );
-            let mut doc: DocumentWithVectors = serde_json::from_value(payload_json)
-                .map_err(|e| DbError::Config(format!("Document deserialization error: {e}")))?;
-            doc.vectors = vec![];
+            let mut doc = Self::document_from_payload(&point.payload)?;
+            if with_vectors {
+                let point_vectors = point.vectors.as_ref().ok_or_else(|| {
+                    DbError::Config(format!("Document {} has no vectors", doc.id))
+                })?;
+                let cfg = collection_config.ok_or_else(|| {
+                    DbError::Config(
+                        "collection_config is required when with_vectors is true".into(),
+                    )
+                })?;
+                doc.vectors = Some(Self::vectors_from_point_vectors(point_vectors, cfg)?);
+            }
             doc_map.insert(uuid_str, doc);
         }
 
-        // Re-order by input order; error on missing if not suppressed.
-        let mut out: Vec<Option<DocumentWithVectors>> = Vec::with_capacity(document_ids.len());
+        let mut out: Vec<Option<Document>> = Vec::with_capacity(document_ids.len());
         let mut missing: Vec<&str> = vec![];
         for id in document_ids {
             let uuid_str = string_to_uuid(id).to_string();
@@ -983,7 +1062,7 @@ impl QdrantDb {
         let mut builder = ScrollPointsBuilder::new(collection_name)
             .limit(request.page_size)
             .with_payload(true)
-            .with_vectors(false);
+            .with_vectors(request.with_vectors);
         if let Some(f) = scroll_filter {
             builder = builder.filter(f);
         }
@@ -996,14 +1075,20 @@ impl QdrantDb {
         let documents: Vec<Document> = response
             .result
             .iter()
-            .map(|point| {
-                let payload_json = serde_json::Value::Object(
-                    point.payload.iter().map(|(k, v)| (k.clone(), qdrant_val_to_json(v))).collect(),
-                );
-                serde_json::from_value(payload_json)
-                    .map_err(|e| DbError::Config(format!("Document deserialization error: {e}")))
+            .map(|point| -> Result<Document, DbError> {
+                let mut doc = Self::document_from_payload(&point.payload)?;
+                if request.with_vectors {
+                    let point_vectors = point.vectors.as_ref().ok_or_else(|| {
+                        DbError::Config(format!("Document {} has no vectors", doc.id))
+                    })?;
+                    doc.vectors = Some(Self::vectors_from_point_vectors(
+                        point_vectors,
+                        collection_config,
+                    )?);
+                }
+                Ok(doc)
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<Document>, DbError>>()?;
 
         let after = response.next_page_offset.map(|pid| match pid.point_id_options {
             Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(u)) => u,

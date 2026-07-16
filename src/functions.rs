@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::common::MAX_METADATA_VALUE_LENGTH;
-use crate::models::{Document, DocumentWithVectors, SearchResult, VectorScore};
+use crate::models::{Document, SearchResult, VectorScore};
 use crate::qdrant::DbError;
 
 // ---------------------------------------------------------------------------
@@ -236,13 +236,14 @@ fn validate_and_clone_meta_inner(
 }
 
 pub fn doc_to_payload(
-    doc: &DocumentWithVectors,
+    doc: &Document,
     store_content: bool,
 ) -> Result<serde_json::Map<String, serde_json::Value>, DbError> {
     let mut val = serde_json::to_value(doc)
         .map_err(|e| DbError::Config(format!("Serialization error: {e}")))?;
     if let serde_json::Value::Object(ref mut map) = val {
         map.remove("vectors");
+        map.remove("token_lengths");
         map.remove("custom_vectors");
         if !store_content {
             map.remove("content");

@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::encoder::{get_collection_info_cached, validate_metadata_filter, CollectionConfigCache, SearchError};
 use crate::join_parser::{JoinField, JoinRefKind, JoinSideRef, JoinSpec};
-use crate::models::{CollectionConfigInternal, Document, DocumentWithVectors, MetadataFilter, SearchResult};
+use crate::models::{CollectionConfigInternal, Document, MetadataFilter, SearchResult};
 use crate::qdrant::{DbError, QdrantDb};
 
 trait JoinParent {
@@ -174,13 +174,12 @@ async fn fetch_children_for_join(
             .collect();
         let id_refs: Vec<&str> = owned_ids.iter().map(String::as_str).collect();
         let fetched = db
-            .get_documents(real_child, &id_refs, true)
+            .get_documents(real_child, &id_refs, true, false, None)
             .await
             .map_err(SearchError::Db)?;
 
         let mut docs = Vec::new();
-        for dwv in fetched.into_iter().flatten() {
-            let doc = document_from_with_vectors(&dwv);
+        for doc in fetched.into_iter().flatten() {
             if let Some(ref filter) = spec.metadata_filter {
                 if !document_matches_metadata_filter(&doc, filter) {
                     continue;
@@ -241,10 +240,6 @@ fn child_join_value(doc: &Document, side: &JoinSideRef) -> Option<Value> {
 
 fn join_value_key(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
-}
-
-fn document_from_with_vectors(dwv: &DocumentWithVectors) -> Document {
-    Document::from(dwv.clone())
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
