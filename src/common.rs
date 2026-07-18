@@ -393,5 +393,13 @@ pub fn qdrant_client_url(connection_string: &str) -> String {
     }
 }
 
+/// Optional Qdrant API key from `AMGIX_QDRANT_TOKEN` (unset or empty → `None`).
+pub fn qdrant_api_key() -> Option<String> {
+    match std::env::var("AMGIX_QDRANT_TOKEN") {
+        Ok(token) if !token.is_empty() => Some(token),
+        _ => None,
+    }
+}
+
 /// Short product label from DB URL scheme — mirrors `amgix-server` `_database_kind_label`.
 pub const DATABASE_KIND: &str = "Qdrant";

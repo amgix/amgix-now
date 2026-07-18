@@ -110,6 +110,9 @@ impl QdrantDb {
         let mut builder = Qdrant::from_url(url)
             .skip_compatibility_check()
             .timeout(QDRANT_GRPC_TIMEOUT);
+        if let Some(api_key) = crate::common::qdrant_api_key() {
+            builder = builder.api_key(api_key);
+        }
         builder.set_pool_size(QDRANT_GRPC_CHANNEL_POOL_SIZE);
         let client = builder.build()?;
         Ok(QdrantDb {
