@@ -366,6 +366,12 @@ impl DenseModelCache {
             return Ok(existing);
         }
         cache.insert(key, (Arc::clone(&handle), Instant::now()));
+        tracing::info!(
+            model = %model_id,
+            revision = revision.as_deref().unwrap_or("(default)"),
+            kind = "dense",
+            "loaded model"
+        );
         Ok(handle)
     }
 
@@ -456,6 +462,12 @@ impl SparseModelCache {
             return Ok(existing);
         }
         cache.insert(key, (Arc::clone(&arc), Instant::now()));
+        tracing::info!(
+            model = %model_id,
+            revision = revision.as_deref().unwrap_or("(default)"),
+            kind = "sparse",
+            "loaded model"
+        );
         Ok(arc)
     }
 
