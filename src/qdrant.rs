@@ -27,6 +27,7 @@ use qdrant_client::Qdrant;
 use crate::common::{
     resolve_skippable_fields, string_to_uuid, sys_collection_name, DenseDistance,
     SearchExcludeField, MAX_DATABASE_WAIT_SECONDS, search_prefetch_limit,
+    DEFAULT_FACET_MAX_VALUES, DEFAULT_FACET_PREFETCH_MULTIPLIER, MIN_FACET_PREFETCH,
 };
 use tokio::time::sleep;
 use crate::functions::{
@@ -35,8 +36,9 @@ use crate::functions::{
 };
 use crate::models::{
     CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse,
-    MetadataFilter, MetadataIndex, SearchQueryWithVectors, SearchResult, VectorData, VectorScore,
+    MetadataFilter, MetadataIndex, SearchOutcome, SearchQueryWithVectors, SearchResult, VectorData, VectorScore,
 };
+use crate::search_facet::compute_facet_counts;
 
 const QDRANT_GRPC_CHANNEL_POOL_SIZE: usize = 20;
 /// Tonic request deadline for all Qdrant gRPC calls on this client (replaces `qdrant-client`'s 5s default).
@@ -846,7 +848,7 @@ impl QdrantDb {
         query: &SearchQueryWithVectors,
         collection_config: &CollectionConfigInternal,
         required_fields: &std::collections::HashSet<SearchExcludeField>,
-    ) -> Result<Vec<SearchResult>, DbError> {
+    ) -> Result<SearchOutcome, DbError> {
         if query.settings.group_field.is_some() {
             return self
                 .search_grouped(collection_name, query, collection_config, required_fields)
@@ -857,7 +859,7 @@ impl QdrantDb {
             .execute_search_arms(collection_name, query, collection_config, required_fields)
             .await?
         else {
-            return Ok(vec![]);
+            return Ok(SearchOutcome::new(vec![]));
         };
 
         let fused = fuse_arms(
@@ -867,7 +869,13 @@ impl QdrantDb {
             &arms.arm_weights,
             query.settings.limit as usize,
         );
-        build_search_results(&fused, &arms.point_lookup, &arms.raw_scores_map, query.settings.raw_scores)
+        build_search_outcome(
+            &fused,
+            &arms.point_lookup,
+            &arms.raw_scores_map,
+            query,
+            collection_config,
+        )
     }
 
     /// Recursive grouped search — mirrors `amgix-server` `qdrant.py` `_search_grouped`.
@@ -883,7 +891,7 @@ impl QdrantDb {
         query: &SearchQueryWithVectors,
         collection_config: &CollectionConfigInternal,
         required_fields: &std::collections::HashSet<SearchExcludeField>,
-    ) -> Result<Vec<SearchResult>, DbError> {
+    ) -> Result<SearchOutcome, DbError> {
         let group_field = query
             .settings
             .group_field
@@ -906,7 +914,7 @@ impl QdrantDb {
                 .execute_search_arms(collection_name, &current_query, collection_config, required_fields)
                 .await?
             else {
-                return Ok(vec![]);
+                return Ok(SearchOutcome::new(vec![]));
             };
 
             if fetch_round == 0 {
@@ -949,11 +957,12 @@ impl QdrantDb {
             let is_last_round = fetch_round + 1 >= max_fetches;
             let refetch_would_not_help = saturated_values.is_empty() && !null_saturated;
             if selected.len() >= limit || is_last_round || arms_exhausted || refetch_would_not_help {
-                return build_search_results(
+                return build_search_outcome(
                     &selected,
                     &point_lookup,
                     &raw_scores_map,
-                    query.settings.raw_scores,
+                    query,
+                    collection_config,
                 );
             }
 
@@ -1005,7 +1014,18 @@ impl QdrantDb {
             .map(|w| ((w.vector_name.clone(), w.field.to_string()), w.weight))
             .collect();
 
-        let prefetch_limit = search_prefetch_limit(query.settings.limit);
+        let mut prefetch_limit = search_prefetch_limit(query.settings.limit);
+        if query.settings.facets {
+            let mult = query
+                .settings
+                .facet_options
+                .as_ref()
+                .map(|o| o.prefetch_multiplier)
+                .unwrap_or(DEFAULT_FACET_PREFETCH_MULTIPLIER) as u64;
+            prefetch_limit = prefetch_limit
+                .max(MIN_FACET_PREFETCH)
+                .max(mult.saturating_mul(query.settings.limit as u64));
+        }
 
         let mut batch_requests: Vec<qdrant_client::qdrant::QueryPoints> = Vec::new();
         let mut batch_vector_names: Vec<String> = Vec::new();
@@ -1439,6 +1459,37 @@ fn build_search_results(
         }
     }
     Ok(results)
+}
+
+/// Build the search hits and, when faceting is enabled, facet counts over the
+/// candidate pool (`point_lookup`). Mirrors amgix-server `SearchOutcome`.
+fn build_search_outcome(
+    fused: &[(String, f64)],
+    point_lookup: &HashMap<String, qdrant_client::qdrant::ScoredPoint>,
+    raw_scores_map: &HashMap<String, Vec<VectorScore>>,
+    query: &SearchQueryWithVectors,
+    collection_config: &CollectionConfigInternal,
+) -> Result<SearchOutcome, DbError> {
+    let results = build_search_results(fused, point_lookup, raw_scores_map, query.settings.raw_scores)?;
+    let facet_counts = if query.settings.facets {
+        let max_values = query
+            .settings
+            .facet_options
+            .as_ref()
+            .map(|o| o.max_values as usize)
+            .unwrap_or(DEFAULT_FACET_MAX_VALUES as usize);
+        let indexed_fields: Vec<(String, String)> = collection_config
+            .metadata_indexes
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|idx| (idx.key.clone(), idx.value_type.clone()))
+            .collect();
+        Some(compute_facet_counts(point_lookup.values(), &indexed_fields, max_values))
+    } else {
+        None
+    };
+    Ok(SearchOutcome { results, facet_counts })
 }
 
 /// Merges one round's raw per-arm candidates into the accumulated per-arm lists,

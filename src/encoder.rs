@@ -23,7 +23,7 @@ use crate::common::{
 use crate::functions::normalize_document_metadata_inplace;
 use crate::models::{
     CollectionConfigInternal, Document, ModelValidationResponse,
-    ModelValidationResult, SearchQuery, SearchQuerySettings, SearchResult, VectorConfigInternal,
+    ModelValidationResult, SearchOutcome, SearchQuery, SearchQuerySettings, VectorConfigInternal,
     VectorSearchOption,
 };
 
@@ -836,7 +836,7 @@ impl UpsertIngress {
 struct SearchIngressJob {
     collection_name: String,
     query: SearchQuery,
-    reply: oneshot::Sender<Result<Vec<SearchResult>, SearchError>>,
+    reply: oneshot::Sender<Result<SearchOutcome, SearchError>>,
 }
 
 #[derive(Clone)]
@@ -912,7 +912,7 @@ impl SearchIngress {
         &self,
         collection_name: String,
         query: SearchQuery,
-    ) -> Result<Vec<SearchResult>, SearchError> {
+    ) -> Result<SearchOutcome, SearchError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .try_send(SearchIngressJob {
@@ -1022,6 +1022,8 @@ async fn run_search_bucket(
     };
     let mut required_fields = crate::search_join::required_fields_for_joins(&join_specs);
     required_fields.extend(crate::search_group::required_fields_for_group(&group_field));
+    let facets_enabled = bucket_jobs.first().map(|j| j.query.settings.facets).unwrap_or(false);
+    required_fields.extend(crate::search_facet::required_fields_for_facets(facets_enabled));
 
     let query_texts: Vec<String> =
         bucket_jobs.iter().map(|j| j.query.query.clone()).collect();
@@ -1112,22 +1114,22 @@ async fn run_search_bucket(
                 e => SearchError::Db(e),
             });
         let res = match res {
-            Ok(mut results) => {
+            Ok(mut outcome) => {
                 if !join_specs.is_empty() {
                     match crate::search_join::enrich_documents_with_parsed_joins(
                         db,
                         cache,
-                        &mut results,
+                        &mut outcome.results,
                         &join_specs,
                         j.query.settings.limit,
                     )
                     .await
                     {
-                        Ok(()) => Ok(results),
+                        Ok(()) => Ok(outcome),
                         Err(e) => Err(e),
                     }
                 } else {
-                    Ok(results)
+                    Ok(outcome)
                 }
             }
             Err(e) => Err(e),
@@ -1673,6 +1675,8 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
             group_field: None,
             group_max: 3,
             group_max_fetches: 2,
+            facets: false,
+            facet_options: None,
         },
     };
 

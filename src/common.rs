@@ -87,6 +87,13 @@ pub fn search_prefetch_limit(limit: u32) -> u64 {
     ((limit as f64 * SEARCH_PREFETCH_MULTIPLIER) as u64).max(SEARCH_PREFETCH_MIN)
 }
 
+// Faceting (mirrors constants.py).
+pub const DEFAULT_FACET_PREFETCH_MULTIPLIER: u32 = 2;
+pub const MAX_FACET_PREFETCH_MULTIPLIER: u32 = 10;
+pub const MIN_FACET_PREFETCH: u64 = 50;
+pub const DEFAULT_FACET_MAX_VALUES: u32 = 10;
+pub const MAX_FACET_MAX_VALUES: u32 = 100;
+
 /// Max sleep between database connection retries (seconds). Matches `MAX_DATABASE_WAIT_SECONDS` in Python.
 pub const MAX_DATABASE_WAIT_SECONDS: u64 = 30;
 

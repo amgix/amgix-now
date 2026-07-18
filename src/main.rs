@@ -12,6 +12,7 @@ mod models;
 mod qdrant;
 mod search_group;
 mod search_join;
+mod search_facet;
 mod validation;
 mod vectors;
 
@@ -53,7 +54,7 @@ use models::{
     parse_document_timestamp_for_api, BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
     CollectionExistsResponse, CollectionStatsResponse, Document, DocumentFetchRequest,
     DocumentStatus, DocumentStatusResponse, OkResponse, QueueInfo,
-    QueuedDocumentStatus, ReadyResponse, SearchQuery, SearchResponse,
+    QueuedDocumentStatus, ReadyResponse, SearchQuery,
     SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
@@ -1096,12 +1097,15 @@ async fn search(
         .search(real_collection_name.to_string(), query)
         .await
     {
-        Ok(results) => {
-            let response = SearchResponse {
-                results,
-                query_time_ms: t0.elapsed().as_secs_f64() * 1000.0,
-            };
-            let vals: Vec<Value> = response
+        Ok(outcome) => {
+            let facet_counts = outcome
+                .facet_counts
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Facet serialization error: {e}")))?
+                .unwrap_or(Value::Null);
+            let vals: Vec<Value> = outcome
                 .results
                 .into_iter()
                 .map(|r| {
@@ -1116,7 +1120,8 @@ async fn search(
                 .collect();
             Ok(Json(serde_json::json!({
                 "results": vals,
-                "query_time_ms": response.query_time_ms,
+                "facet_counts": facet_counts,
+                "query_time_ms": t0.elapsed().as_secs_f64() * 1000.0,
             })))
         }
         Err(SearchError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),

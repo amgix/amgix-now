@@ -17,7 +17,7 @@ use crate::common::{
     MAX_METADATA_KEY_LENGTH, MAX_METADATA_VALUE_LENGTH,
     MAX_MODEL_NAME_LENGTH,
     MAX_SEARCH_LIMIT, MAX_SEARCH_QUERY_LENGTH, MAX_TOP_K_VALUE, MAX_VECTOR_DIMENSIONS,
-    MAX_VECTOR_NAME_LENGTH,
+    MAX_VECTOR_NAME_LENGTH, MAX_FACET_PREFETCH_MULTIPLIER, MAX_FACET_MAX_VALUES,
 };
 use crate::models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal, CustomDocumentVector, Document,
@@ -921,6 +921,18 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
     }
     if q.settings.group_max_fetches < 1 {
         return Err(err("group_max_fetches: ensure this value is greater than or equal to 1"));
+    }
+    if let Some(ref opts) = q.settings.facet_options {
+        if opts.prefetch_multiplier < 1 || opts.prefetch_multiplier > MAX_FACET_PREFETCH_MULTIPLIER {
+            return Err(err(format!(
+                "facet_options.prefetch_multiplier: ensure this value is between 1 and {MAX_FACET_PREFETCH_MULTIPLIER}"
+            )));
+        }
+        if opts.max_values < 1 || opts.max_values > MAX_FACET_MAX_VALUES {
+            return Err(err(format!(
+                "facet_options.max_values: ensure this value is between 1 and {MAX_FACET_MAX_VALUES}"
+            )));
+        }
     }
     Ok(())
 }

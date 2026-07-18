@@ -37,14 +37,15 @@ pub fn flatten_doc_metadata(mut val: Value) -> Value {
     val
 }
 
-/// Remove excluded fields from a search hit's JSON object, recursing into
-/// `joined.<collection>[*]` so joined documents are stripped the same way.
+/// Null out excluded fields on a search hit's JSON object, recursing into
+/// `joined.<collection>[*]` so joined documents are nulled the same way.
+/// Fields are set to null rather than removed so the response shape stays stable.
 /// Mirrors document.py `apply_search_exclude`.
 pub fn apply_search_exclude(val: Value, exclude: &[crate::common::SearchExcludeField]) -> Value {
     match val {
         Value::Object(mut map) => {
             for field in exclude {
-                map.remove(field.as_str());
+                map.insert(field.as_str().to_string(), Value::Null);
             }
             if let Some(Value::Object(joined)) = map.get("joined") {
                 let stripped_joined: serde_json::Map<String, Value> = joined
@@ -774,6 +775,23 @@ fn default_group_max_fetches() -> u32 {
     2
 }
 
+fn default_facet_prefetch_multiplier() -> u32 {
+    crate::common::DEFAULT_FACET_PREFETCH_MULTIPLIER
+}
+
+fn default_facet_max_values() -> u32 {
+    crate::common::DEFAULT_FACET_MAX_VALUES
+}
+
+/// Faceting options for a search query. Mirrors FacetOptions in vector.py.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FacetOptions {
+    #[serde(default = "default_facet_prefetch_multiplier")]
+    pub prefetch_multiplier: u32,
+    #[serde(default = "default_facet_max_values")]
+    pub max_values: u32,
+}
+
 fn opt_f64_eq(a: &Option<f64>, b: &Option<f64>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -825,6 +843,10 @@ pub struct SearchQuerySettings {
     pub group_max: u32,
     #[serde(default = "default_group_max_fetches")]
     pub group_max_fetches: u32,
+    #[serde(default)]
+    pub facets: bool,
+    #[serde(default)]
+    pub facet_options: Option<FacetOptions>,
 }
 
 impl PartialEq for SearchQuerySettings {
@@ -843,6 +865,8 @@ impl PartialEq for SearchQuerySettings {
             && self.group_field == other.group_field
             && self.group_max == other.group_max
             && self.group_max_fetches == other.group_max_fetches
+            && self.facets == other.facets
+            && self.facet_options == other.facet_options
     }
 }
 
@@ -864,6 +888,8 @@ impl Hash for SearchQuerySettings {
         self.group_field.hash(state);
         self.group_max.hash(state);
         self.group_max_fetches.hash(state);
+        self.facets.hash(state);
+        self.facet_options.hash(state);
     }
 }
 
@@ -925,12 +951,28 @@ pub struct SearchResult {
     pub vector_scores: Vec<VectorScore>,
 }
 
+/// Internal search result bundling hits with optional facet counts. Mirrors
+/// `SearchOutcome` in amgix-server. `facet_counts` is `Some` only when the
+/// request enabled faceting.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub facet_counts: Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>>,
+}
+
+impl SearchOutcome {
+    pub fn new(results: Vec<SearchResult>) -> Self {
+        SearchOutcome { results, facet_counts: None }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SearchResponse
 // Mirrors amgix-server SearchResponse.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub query_time_ms: f64,
