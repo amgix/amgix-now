@@ -847,6 +847,137 @@ impl QdrantDb {
         collection_config: &CollectionConfigInternal,
         required_fields: &std::collections::HashSet<SearchExcludeField>,
     ) -> Result<Vec<SearchResult>, DbError> {
+        if query.settings.group_field.is_some() {
+            return self
+                .search_grouped(collection_name, query, collection_config, required_fields)
+                .await;
+        }
+
+        let Some(arms) = self
+            .execute_search_arms(collection_name, query, collection_config, required_fields)
+            .await?
+        else {
+            return Ok(vec![]);
+        };
+
+        let fused = fuse_arms(
+            query,
+            &arms.id_lists,
+            &arms.scored_lists,
+            &arms.arm_weights,
+            query.settings.limit as usize,
+        );
+        build_search_results(&fused, &arms.point_lookup, &arms.raw_scores_map, query.settings.raw_scores)
+    }
+
+    /// Recursive grouped search — mirrors `amgix-server` `qdrant.py` `_search_grouped`.
+    ///
+    /// Accumulates raw per-arm candidate lists across rounds (deduplicated by id within
+    /// each arm), re-fuses the *entire* accumulated pool every round, then re-applies the
+    /// group cap. Refetches (up to `group_max_fetches` rounds total) add an exclusion
+    /// filter for already-saturated `group_field` values, so later rounds surface fresh
+    /// candidates instead of the same saturated ones.
+    async fn search_grouped(
+        &self,
+        collection_name: &str,
+        query: &SearchQueryWithVectors,
+        collection_config: &CollectionConfigInternal,
+        required_fields: &std::collections::HashSet<SearchExcludeField>,
+    ) -> Result<Vec<SearchResult>, DbError> {
+        let group_field = query
+            .settings
+            .group_field
+            .clone()
+            .expect("search_grouped called without group_field");
+        let group_max = query.settings.group_max as usize;
+        let limit = query.settings.limit as usize;
+        let max_fetches = query.settings.group_max_fetches.max(1);
+
+        let mut current_query = query.clone();
+        let mut accumulated_id_lists: Vec<Vec<String>> = Vec::new();
+        let mut accumulated_scored_lists: Vec<Vec<(String, f64)>> = Vec::new();
+        let mut seen_per_arm: Vec<std::collections::HashSet<String>> = Vec::new();
+        let mut arm_weights: Vec<f64> = Vec::new();
+        let mut point_lookup: HashMap<String, qdrant_client::qdrant::ScoredPoint> = HashMap::new();
+        let mut raw_scores_map: HashMap<String, Vec<VectorScore>> = HashMap::new();
+
+        for fetch_round in 0..max_fetches {
+            let Some(arms) = self
+                .execute_search_arms(collection_name, &current_query, collection_config, required_fields)
+                .await?
+            else {
+                return Ok(vec![]);
+            };
+
+            if fetch_round == 0 {
+                arm_weights = arms.arm_weights;
+            }
+
+            // If every arm returned fewer candidates than it asked for, Qdrant already
+            // returned everything it has for that arm — no refetch (with any filter) can
+            // surface more raw candidates.
+            let arms_exhausted = arms
+                .id_lists
+                .iter()
+                .all(|ids| (ids.len() as u64) < arms.prefetch_limit);
+
+            merge_search_arms(
+                &mut accumulated_id_lists,
+                &mut accumulated_scored_lists,
+                &mut seen_per_arm,
+                &arms.id_lists,
+                &arms.scored_lists,
+            );
+            point_lookup.extend(arms.point_lookup);
+            for (id, scores) in arms.raw_scores_map {
+                raw_scores_map.entry(id).or_insert(scores);
+            }
+
+            // Fuse the *entire* accumulated pool (not just query.limit) so the group cap
+            // below can see every candidate gathered so far, not only the pre-cap top-N.
+            let pool_size = point_lookup.len().max(1);
+            let fused = fuse_arms(query, &accumulated_id_lists, &accumulated_scored_lists, &arm_weights, pool_size);
+
+            let group_value_fn = |id: &str| {
+                point_lookup
+                    .get(id)
+                    .and_then(|point| group_value_from_point(point, &group_field))
+            };
+            let (selected, saturated_values, null_saturated, _pool_exhausted) =
+                crate::search_group::apply_group_cap(&fused, group_value_fn, group_max, limit);
+
+            let is_last_round = fetch_round + 1 >= max_fetches;
+            let refetch_would_not_help = saturated_values.is_empty() && !null_saturated;
+            if selected.len() >= limit || is_last_round || arms_exhausted || refetch_would_not_help {
+                return build_search_results(
+                    &selected,
+                    &point_lookup,
+                    &raw_scores_map,
+                    query.settings.raw_scores,
+                );
+            }
+
+            current_query.settings.metadata_filter = crate::search_group::build_group_exclusion_filter(
+                current_query.settings.metadata_filter.clone(),
+                &group_field,
+                &saturated_values,
+                null_saturated,
+            );
+        }
+
+        unreachable!("loop always returns on its last iteration")
+    }
+
+    /// Runs one round of stage-1 vector arm execution: builds the filter, issues the
+    /// batched Qdrant query per vector arm, and collects raw per-arm candidate data
+    /// (ranked ids, scored pairs, point payloads, raw per-vector scores). Does not fuse.
+    async fn execute_search_arms(
+        &self,
+        collection_name: &str,
+        query: &SearchQueryWithVectors,
+        collection_config: &CollectionConfigInternal,
+        required_fields: &std::collections::HashSet<SearchExcludeField>,
+    ) -> Result<Option<SearchArms>, DbError> {
         let final_filter = build_search_filter(query, collection_config)?;
 
         // Payload fields to fetch: id/timestamp always; the rest unless the caller
@@ -937,7 +1068,7 @@ impl QdrantDb {
         }
 
         if batch_requests.is_empty() {
-            return Ok(vec![]);
+            return Ok(None);
         }
 
         let batch_response = self
@@ -989,38 +1120,7 @@ impl QdrantDb {
             scored_lists.push(scored_arm);
         }
 
-        // Fuse — mirrors Python lines 691-705.
-        let fused = if query.settings.fusion_mode == "linear" {
-            linear_weighted_score_fuse(
-                &scored_lists,
-                &arm_weights,
-                query.settings.limit as usize,
-                query.settings.score_threshold,
-            )
-        } else {
-            rrf_fuse(
-                &id_lists,
-                &arm_weights,
-                query.settings.limit as usize,
-                query.settings.score_threshold,
-                2,
-            )
-        };
-
-        // Convert fused results to SearchResult — mirrors Python lines 711-719.
-        let mut results: Vec<SearchResult> = Vec::with_capacity(fused.len());
-        for (item_id, fused_score) in fused {
-            if let Some(point) = point_lookup.get(&item_id) {
-                let vector_scores = if query.settings.raw_scores {
-                    raw_scores_map.get(&item_id).cloned().unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                results.push(search_result_from_point(point, fused_score, vector_scores)?);
-            }
-        }
-
-        Ok(results)
+        Ok(Some(SearchArms { id_lists, scored_lists, point_lookup, raw_scores_map, arm_weights, prefetch_limit }))
     }
 
     // -----------------------------------------------------------------------
@@ -1289,6 +1389,99 @@ fn build_fetch_filter(
 }
 
 // ---------------------------------------------------------------------------
+// Search helpers — raw per-arm candidates, fusion, grouping, and result
+// conversion shared by `search` and `search_grouped`.
+// ---------------------------------------------------------------------------
+
+/// Raw per-arm candidate data produced by one round of `execute_search_arms`,
+/// before fusion.
+struct SearchArms {
+    id_lists: Vec<Vec<String>>,
+    scored_lists: Vec<Vec<(String, f64)>>,
+    point_lookup: HashMap<String, qdrant_client::qdrant::ScoredPoint>,
+    raw_scores_map: HashMap<String, Vec<VectorScore>>,
+    arm_weights: Vec<f64>,
+    /// Per-arm candidate cap requested from Qdrant this round (mirrors Python's
+    /// `prefetch_limit`), used by grouped search to detect when every arm has already
+    /// returned everything it has (see `arms_exhausted` in `search_grouped`).
+    prefetch_limit: u64,
+}
+
+fn fuse_arms(
+    query: &SearchQueryWithVectors,
+    id_lists: &[Vec<String>],
+    scored_lists: &[Vec<(String, f64)>],
+    arm_weights: &[f64],
+    limit: usize,
+) -> Vec<(String, f64)> {
+    if query.settings.fusion_mode == "linear" {
+        linear_weighted_score_fuse(scored_lists, arm_weights, limit, query.settings.score_threshold)
+    } else {
+        rrf_fuse(id_lists, arm_weights, limit, query.settings.score_threshold, 2)
+    }
+}
+
+fn build_search_results(
+    fused: &[(String, f64)],
+    point_lookup: &HashMap<String, qdrant_client::qdrant::ScoredPoint>,
+    raw_scores_map: &HashMap<String, Vec<VectorScore>>,
+    raw_scores: bool,
+) -> Result<Vec<SearchResult>, DbError> {
+    let mut results: Vec<SearchResult> = Vec::with_capacity(fused.len());
+    for (item_id, fused_score) in fused {
+        if let Some(point) = point_lookup.get(item_id) {
+            let vector_scores = if raw_scores {
+                raw_scores_map.get(item_id).cloned().unwrap_or_default()
+            } else {
+                vec![]
+            };
+            results.push(search_result_from_point(point, *fused_score, vector_scores)?);
+        }
+    }
+    Ok(results)
+}
+
+/// Merges one round's raw per-arm candidates into the accumulated per-arm lists,
+/// deduplicating by id within each arm (first occurrence wins, preserving rank order).
+fn merge_search_arms(
+    accumulated_id_lists: &mut Vec<Vec<String>>,
+    accumulated_scored_lists: &mut Vec<Vec<(String, f64)>>,
+    seen_per_arm: &mut Vec<std::collections::HashSet<String>>,
+    new_id_lists: &[Vec<String>],
+    new_scored_lists: &[Vec<(String, f64)>],
+) {
+    if accumulated_id_lists.is_empty() {
+        *accumulated_id_lists = vec![Vec::new(); new_id_lists.len()];
+        *accumulated_scored_lists = vec![Vec::new(); new_scored_lists.len()];
+        *seen_per_arm = vec![std::collections::HashSet::new(); new_id_lists.len()];
+    }
+
+    for arm_idx in 0..new_id_lists.len() {
+        let seen = &mut seen_per_arm[arm_idx];
+        for (id, scored) in new_id_lists[arm_idx].iter().zip(new_scored_lists[arm_idx].iter()) {
+            if seen.insert(id.clone()) {
+                accumulated_id_lists[arm_idx].push(id.clone());
+                accumulated_scored_lists[arm_idx].push(scored.clone());
+            }
+        }
+    }
+}
+
+/// Reads `metadata.<group_field>` off a scored point's payload. Missing keys and
+/// explicit JSON nulls both map to `None` (the "null bucket").
+fn group_value_from_point(
+    point: &qdrant_client::qdrant::ScoredPoint,
+    group_field: &str,
+) -> Option<serde_json::Value> {
+    use qdrant_client::qdrant::value::Kind;
+    let metadata_val = point.payload.get("metadata")?;
+    let Some(Kind::StructValue(s)) = &metadata_val.kind else { return None };
+    let field_val = s.fields.get(group_field)?;
+    let json_val = qdrant_val_to_json(field_val);
+    if json_val.is_null() { None } else { Some(json_val) }
+}
+
+// ---------------------------------------------------------------------------
 // Search filter — mirrors _convert_metadata_filter_to_qdrant
 // ---------------------------------------------------------------------------
 
@@ -1414,7 +1607,9 @@ fn convert_metadata_node(
         let op = node.op.as_deref().unwrap_or("");
         let raw_value = node.value.as_ref();
 
-        let condition: Condition = if op == "eq" || op == "neq" {
+        let condition: Condition = if op == "is_null" {
+            qdrant_client::qdrant::IsEmptyCondition { key: field_path }.into()
+        } else if op == "eq" || op == "neq" {
             let match_value = match raw_value {
                 Some(serde_json::Value::String(s)) => {
                     qdrant_client::qdrant::r#match::MatchValue::Keyword(s.clone())

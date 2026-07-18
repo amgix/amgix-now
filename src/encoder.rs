@@ -995,6 +995,16 @@ async fn run_search_bucket(
         }
     }
 
+    let group_field = bucket_jobs.first().and_then(|j| j.query.settings.group_field.clone());
+    if let Some(ref field) = group_field {
+        if let Err(msg) = crate::search_group::validate_group_field(&collection_config, field) {
+            for j in bucket_jobs {
+                let _ = j.reply.send(Err(SearchError::InvalidFilter(msg.clone())));
+            }
+            return;
+        }
+    }
+
     // Parse the join expression once for the whole bucket (all jobs share identical
     // settings, including `join`) so it isn't re-parsed by resolve_skippable_fields
     // and enrich_documents_with_joins.
@@ -1010,7 +1020,8 @@ async fn run_search_bucket(
         },
         None => Vec::new(),
     };
-    let required_fields = crate::search_join::required_fields_for_joins(&join_specs);
+    let mut required_fields = crate::search_join::required_fields_for_joins(&join_specs);
+    required_fields.extend(crate::search_group::required_fields_for_group(&group_field));
 
     let query_texts: Vec<String> =
         bucket_jobs.iter().map(|j| j.query.query.clone()).collect();
@@ -1659,6 +1670,9 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
             fusion_mode: "rrf".to_string(),
             join: None,
             exclude: None,
+            group_field: None,
+            group_max: 3,
+            group_max_fetches: 2,
         },
     };
 
@@ -1812,6 +1826,10 @@ fn validate_filter_node(
 
         let op = filter.op.as_deref().unwrap_or("");
         let value = &filter.value;
+
+        if op == "is_null" {
+            return Ok(());
+        }
 
         match *expected_type {
             "string" => {

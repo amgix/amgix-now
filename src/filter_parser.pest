@@ -12,7 +12,11 @@ and_expr = { not_expr  ~ (AND ~ not_expr)* }
 not_expr = { NOT ~ not_expr | atom }
 atom     = { "(" ~ expr ~ ")" | comparison }
 
-comparison = { field ~ op ~ value }
+comparison = { is_not_null_comparison | is_null_comparison | value_comparison }
+
+value_comparison = { field ~ op ~ value }
+is_not_null_comparison = { field ~ IS ~ NOT ~ NULL_KW }
+is_null_comparison = { field ~ IS ~ NULL_KW }
 
 field = @{ ASCII_ALPHANUMERIC ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
 
@@ -35,3 +39,5 @@ null    = @{ ^"null" }
 AND = _{ ^"AND" }
 OR  = _{ ^"OR" }
 NOT = _{ ^"NOT" }
+IS      = _{ ^"IS" }
+NULL_KW = _{ ^"NULL" }

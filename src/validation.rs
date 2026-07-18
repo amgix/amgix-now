@@ -915,6 +915,13 @@ pub fn validate_search_query(q: &SearchQuery) -> VResult {
         }
     }
     validate_fusion_mode(&q.settings.fusion_mode)?;
+    // group_max ge=1, group_max_fetches ge=1
+    if q.settings.group_max < 1 {
+        return Err(err("group_max: ensure this value is greater than or equal to 1"));
+    }
+    if q.settings.group_max_fetches < 1 {
+        return Err(err("group_max_fetches: ensure this value is greater than or equal to 1"));
+    }
     Ok(())
 }
 

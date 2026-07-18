@@ -10,6 +10,7 @@ mod functions;
 mod join_parser;
 mod models;
 mod qdrant;
+mod search_group;
 mod search_join;
 mod validation;
 mod vectors;

@@ -766,6 +766,14 @@ fn default_fusion_mode() -> String {
     "rrf".to_string()
 }
 
+fn default_group_max() -> u32 {
+    3
+}
+
+fn default_group_max_fetches() -> u32 {
+    2
+}
+
 fn opt_f64_eq(a: &Option<f64>, b: &Option<f64>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -811,6 +819,12 @@ pub struct SearchQuerySettings {
     pub join: Option<crate::join_parser::JoinField>,
     #[serde(default)]
     pub exclude: Option<Vec<crate::common::SearchExcludeField>>,
+    #[serde(default)]
+    pub group_field: Option<String>,
+    #[serde(default = "default_group_max")]
+    pub group_max: u32,
+    #[serde(default = "default_group_max_fetches")]
+    pub group_max_fetches: u32,
 }
 
 impl PartialEq for SearchQuerySettings {
@@ -826,6 +840,9 @@ impl PartialEq for SearchQuerySettings {
             && self.fusion_mode == other.fusion_mode
             && self.join == other.join
             && self.exclude == other.exclude
+            && self.group_field == other.group_field
+            && self.group_max == other.group_max
+            && self.group_max_fetches == other.group_max_fetches
     }
 }
 
@@ -844,6 +861,9 @@ impl Hash for SearchQuerySettings {
         self.fusion_mode.hash(state);
         self.join.hash(state);
         self.exclude.hash(state);
+        self.group_field.hash(state);
+        self.group_max.hash(state);
+        self.group_max_fetches.hash(state);
     }
 }
 

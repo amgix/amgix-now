@@ -67,6 +67,10 @@ fn build_filter(pair: Pair<Rule>) -> Result<MetadataFilter, String> {
             build_filter(inner)
         }
         Rule::comparison => {
+            let inner = pair.into_inner().next().unwrap();
+            build_filter(inner)
+        }
+        Rule::value_comparison => {
             let mut inner = pair.into_inner();
             let field = inner.next().unwrap().as_str().to_string();
             let op_pair = inner.next().unwrap();
@@ -77,6 +81,25 @@ fn build_filter(pair: Pair<Rule>) -> Result<MetadataFilter, String> {
                 key: Some(field),
                 op: Some(op),
                 value: Some(value),
+                ..Default::default()
+            })
+        }
+        Rule::is_null_comparison => {
+            let field = pair.into_inner().next().unwrap().as_str().to_string();
+            Ok(MetadataFilter {
+                key: Some(field),
+                op: Some("is_null".to_string()),
+                ..Default::default()
+            })
+        }
+        Rule::is_not_null_comparison => {
+            let field = pair.into_inner().next().unwrap().as_str().to_string();
+            Ok(MetadataFilter {
+                not_: Some(Box::new(MetadataFilter {
+                    key: Some(field),
+                    op: Some("is_null".to_string()),
+                    ..Default::default()
+                })),
                 ..Default::default()
             })
         }
