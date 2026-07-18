@@ -25,8 +25,8 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 
 use crate::common::{
-    string_to_uuid, sys_collection_name, DenseDistance,
-    MAX_DATABASE_WAIT_SECONDS, search_prefetch_limit,
+    resolve_skippable_fields, string_to_uuid, sys_collection_name, DenseDistance,
+    SearchExcludeField, MAX_DATABASE_WAIT_SECONDS, search_prefetch_limit,
 };
 use tokio::time::sleep;
 use crate::functions::{
@@ -845,8 +845,26 @@ impl QdrantDb {
         collection_name: &str,
         query: &SearchQueryWithVectors,
         collection_config: &CollectionConfigInternal,
+        required_fields: &std::collections::HashSet<SearchExcludeField>,
     ) -> Result<Vec<SearchResult>, DbError> {
         let final_filter = build_search_filter(query, collection_config)?;
+
+        // Payload fields to fetch: id/timestamp always; the rest unless the caller
+        // excluded them (and they aren't required internally, e.g. for a
+        // metadata-keyed join).
+        let skippable = resolve_skippable_fields(&query.settings.exclude, required_fields);
+        let mut payload_fields = vec!["id".to_string(), "timestamp".to_string()];
+        for field in [
+            SearchExcludeField::Name,
+            SearchExcludeField::Description,
+            SearchExcludeField::Content,
+            SearchExcludeField::Metadata,
+            SearchExcludeField::Tags,
+        ] {
+            if !skippable.contains(&field) {
+                payload_fields.push(field.as_str().to_string());
+            }
+        }
 
         // weight_lookup: (vector_name, field) → weight — mirrors Python lines 585-586.
         let weight_lookup: HashMap<(String, String), f64> = query
@@ -897,16 +915,10 @@ impl QdrantDb {
                 })
             };
 
-            // Mirrors Python line 616: only fetch payload fields needed for SearchResult.
+            // Only fetch payload fields actually needed for the response (mirrors
+            // amgix-server qdrant.py search()).
             let payload_selector = PayloadIncludeSelector {
-                fields: vec![
-                    "id".to_string(),
-                    "timestamp".to_string(),
-                    "name".to_string(),
-                    "description".to_string(),
-                    "metadata".to_string(),
-                    "tags".to_string(),
-                ],
+                fields: payload_fields.clone(),
             };
 
             let mut qb = QueryPointsBuilder::new(collection_name)

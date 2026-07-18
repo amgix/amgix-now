@@ -37,6 +37,40 @@ pub fn flatten_doc_metadata(mut val: Value) -> Value {
     val
 }
 
+/// Remove excluded fields from a search hit's JSON object, recursing into
+/// `joined.<collection>[*]` so joined documents are stripped the same way.
+/// Mirrors document.py `apply_search_exclude`.
+pub fn apply_search_exclude(val: Value, exclude: &[crate::common::SearchExcludeField]) -> Value {
+    match val {
+        Value::Object(mut map) => {
+            for field in exclude {
+                map.remove(field.as_str());
+            }
+            if let Some(Value::Object(joined)) = map.get("joined") {
+                let stripped_joined: serde_json::Map<String, Value> = joined
+                    .iter()
+                    .map(|(coll, docs)| {
+                        let stripped_docs = match docs {
+                            Value::Array(items) => Value::Array(
+                                items
+                                    .iter()
+                                    .cloned()
+                                    .map(|d| apply_search_exclude(d, exclude))
+                                    .collect(),
+                            ),
+                            other => other.clone(),
+                        };
+                        (coll.clone(), stripped_docs)
+                    })
+                    .collect();
+                map.insert("joined".to_string(), Value::Object(stripped_joined));
+            }
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
 fn strip_null_json_fields(val: Value) -> Value {
     match val {
         Value::Object(map) => {
@@ -775,6 +809,8 @@ pub struct SearchQuerySettings {
     pub fusion_mode: String,
     #[serde(default, deserialize_with = "crate::join_parser::deserialize_join_field")]
     pub join: Option<crate::join_parser::JoinField>,
+    #[serde(default)]
+    pub exclude: Option<Vec<crate::common::SearchExcludeField>>,
 }
 
 impl PartialEq for SearchQuerySettings {
@@ -789,6 +825,7 @@ impl PartialEq for SearchQuerySettings {
             && self.raw_scores == other.raw_scores
             && self.fusion_mode == other.fusion_mode
             && self.join == other.join
+            && self.exclude == other.exclude
     }
 }
 
@@ -806,6 +843,7 @@ impl Hash for SearchQuerySettings {
         self.raw_scores.hash(state);
         self.fusion_mode.hash(state);
         self.join.hash(state);
+        self.exclude.hash(state);
     }
 }
 

@@ -851,6 +851,11 @@ pub fn normalize_search_query_python(q: &mut SearchQuery) {
             c.vector_name = c.vector_name.trim().to_string();
         }
     }
+    // @field_validator('exclude') — dedupe_exclude (preserve first-occurrence order)
+    if let Some(ref mut exclude) = q.settings.exclude {
+        let mut seen = std::collections::HashSet::new();
+        exclude.retain(|f| seen.insert(*f));
+    }
 }
 
 pub fn validate_search_query(q: &SearchQuery) -> VResult {

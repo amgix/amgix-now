@@ -280,6 +280,59 @@ impl std::fmt::Display for DocumentField {
 }
 
 // ---------------------------------------------------------------------------
+// SearchExcludeField — document fields that can be omitted from search results
+// via SearchQuery.exclude. Mirrors enums.py SearchExcludeField.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchExcludeField {
+    Name,
+    Description,
+    Content,
+    Tags,
+    Metadata,
+}
+
+impl SearchExcludeField {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchExcludeField::Name => "name",
+            SearchExcludeField::Description => "description",
+            SearchExcludeField::Content => "content",
+            SearchExcludeField::Tags => "tags",
+            SearchExcludeField::Metadata => "metadata",
+        }
+    }
+}
+
+impl std::fmt::Display for SearchExcludeField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Fields from `query.exclude` that are safe to skip fetching at the DB layer for this
+/// search, i.e. excluded by the caller AND not present in `required_fields`.
+///
+/// `required_fields` is computed once by the caller (see
+/// `search_join::required_fields_for_joins`) from the already-parsed join specs, so
+/// the join expression doesn't need to be parsed again here.
+pub fn resolve_skippable_fields(
+    exclude: &Option<Vec<SearchExcludeField>>,
+    required_fields: &std::collections::HashSet<SearchExcludeField>,
+) -> std::collections::HashSet<SearchExcludeField> {
+    match exclude {
+        None => std::collections::HashSet::new(),
+        Some(fields) => fields
+            .iter()
+            .copied()
+            .filter(|f| !required_fields.contains(f))
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Collection name helpers — mirrors functions.py
 // ---------------------------------------------------------------------------
 

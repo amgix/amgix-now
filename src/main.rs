@@ -1087,6 +1087,7 @@ async fn search(
     validate_collection_name(&collection_name).map_err(validation_error)?;
     validate_search_query(&query).map_err(validation_error)?;
     normalize_search_query_python(&mut query);
+    let exclude = query.settings.exclude.clone();
     let real_collection_name = get_real_collection_name(&collection_name);
     let t0 = std::time::Instant::now();
     match app
@@ -1103,9 +1104,13 @@ async fn search(
                 .results
                 .into_iter()
                 .map(|r| {
-                    serde_json::to_value(r)
+                    let v = serde_json::to_value(r)
                         .map(models::flatten_doc_metadata)
-                        .unwrap_or(Value::Null)
+                        .unwrap_or(Value::Null);
+                    match &exclude {
+                        Some(fields) => models::apply_search_exclude(v, fields),
+                        None => v,
+                    }
                 })
                 .collect();
             Ok(Json(serde_json::json!({

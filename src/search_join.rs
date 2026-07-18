@@ -1,11 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use crate::common::SearchExcludeField;
 use crate::encoder::{get_collection_info_cached, validate_metadata_filter, CollectionConfigCache, SearchError};
 use crate::join_parser::{JoinField, JoinRefKind, JoinSideRef, JoinSpec};
 use crate::models::{CollectionConfigInternal, Document, MetadataFilter, SearchResult};
 use crate::qdrant::{DbError, QdrantDb};
+
+/// Parse a join expression, wrapping syntax errors as `SearchError::InvalidFilter`.
+pub fn parse_join_field_validated(join: &JoinField) -> Result<Vec<JoinSpec>, SearchError> {
+    join.clone().into_specs().map_err(SearchError::InvalidFilter)
+}
+
+/// Fields that must be fetched for the parent document regardless of `exclude`,
+/// because a join needs them to compute the parent-side join value.
+///
+/// Currently the only such dependency is a parent ref that reads a value off the
+/// parent document's metadata (e.g. `collection[$.meta.foo=$$id]`).
+pub fn required_fields_for_joins(specs: &[JoinSpec]) -> HashSet<SearchExcludeField> {
+    let mut required = HashSet::new();
+    if specs
+        .iter()
+        .any(|spec| matches!(spec.parent_ref.kind, JoinRefKind::Meta(_)))
+    {
+        required.insert(SearchExcludeField::Metadata);
+    }
+    required
+}
 
 trait JoinParent {
     fn join_id(&self) -> &str;
@@ -48,13 +70,22 @@ pub async fn enrich_documents_with_joins<P: JoinParent>(
     join: &JoinField,
     limit: u32,
 ) -> Result<(), SearchError> {
-    let specs = join
-        .clone()
-        .into_specs()
-        .map_err(SearchError::InvalidFilter)?;
+    let specs = parse_join_field_validated(join)?;
+    enrich_documents_with_parsed_joins(db, cache, documents, &specs, limit).await
+}
 
+/// Same as [`enrich_documents_with_joins`], but takes already-parsed `JoinSpec`s so
+/// callers that also need the specs (e.g. to compute `required_fields_for_joins`)
+/// don't have to parse the join expression twice.
+pub async fn enrich_documents_with_parsed_joins<P: JoinParent>(
+    db: &QdrantDb,
+    cache: &CollectionConfigCache,
+    documents: &mut [P],
+    specs: &[JoinSpec],
+    limit: u32,
+) -> Result<(), SearchError> {
     for spec in specs {
-        enrich_with_spec(db, cache, documents, &spec, limit).await?;
+        enrich_with_spec(db, cache, documents, spec, limit).await?;
     }
     Ok(())
 }

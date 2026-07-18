@@ -995,6 +995,23 @@ async fn run_search_bucket(
         }
     }
 
+    // Parse the join expression once for the whole bucket (all jobs share identical
+    // settings, including `join`) so it isn't re-parsed by resolve_skippable_fields
+    // and enrich_documents_with_joins.
+    let join_specs = match bucket_jobs.first().and_then(|j| j.query.settings.join.as_ref()) {
+        Some(join) => match crate::search_join::parse_join_field_validated(join) {
+            Ok(specs) => specs,
+            Err(e) => {
+                for j in bucket_jobs {
+                    let _ = j.reply.send(Err(e.clone()));
+                }
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    let required_fields = crate::search_join::required_fields_for_joins(&join_specs);
+
     let query_texts: Vec<String> =
         bucket_jobs.iter().map(|j| j.query.query.clone()).collect();
     let settings0 = bucket_jobs[0].query.settings.clone();
@@ -1077,7 +1094,7 @@ async fn run_search_bucket(
 
     for (j, qv) in bucket_jobs.into_iter().zip(vectorized.into_iter()) {
         let res = db
-            .search(collection_name, &qv, &collection_config)
+            .search(collection_name, &qv, &collection_config, &required_fields)
             .await
             .map_err(|e| match e {
                 DbError::Config(m) => SearchError::InvalidFilter(m),
@@ -1085,12 +1102,12 @@ async fn run_search_bucket(
             });
         let res = match res {
             Ok(mut results) => {
-                if let Some(ref join) = j.query.settings.join {
-                    match crate::search_join::enrich_documents_with_joins(
+                if !join_specs.is_empty() {
+                    match crate::search_join::enrich_documents_with_parsed_joins(
                         db,
                         cache,
                         &mut results,
-                        join,
+                        &join_specs,
                         j.query.settings.limit,
                     )
                     .await
@@ -1641,6 +1658,7 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
             raw_scores: false,
             fusion_mode: "rrf".to_string(),
             join: None,
+            exclude: None,
         },
     };
 
