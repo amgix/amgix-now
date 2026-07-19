@@ -1,3 +1,4 @@
+mod auth;
 mod amgix;
 mod bunny_talk;
 mod lock_client;
@@ -65,7 +66,7 @@ use validation::{
 };
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     db: Arc<QdrantDb>,
     qdrant_version: String,
     #[allow(dead_code)]
@@ -80,6 +81,7 @@ struct AppState {
     doc_locks: LockBackend,
     bunny: Option<Arc<bunny_talk::BunnyTalk>>,
     metrics: Option<Arc<metrics::MetricsCollector>>,
+    auth: auth::ApiKeyAuthConfig,
 }
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
@@ -1408,6 +1410,9 @@ async fn main() {
     let (search_ingress, search_shutdown) =
         SearchIngress::new(Arc::clone(&db), collection_cache.clone(), Arc::clone(&search_pool), metrics_collector.clone());
 
+    let auth_config = auth::ApiKeyAuthConfig::load_from_env();
+    auth_config.log_startup();
+
     let state = AppState {
         db,
         qdrant_version,
@@ -1421,6 +1426,7 @@ async fn main() {
         doc_locks,
         bunny: bunny.clone(),
         metrics: metrics_collector,
+        auth: auth_config,
     };
 
     let app = Router::new()
@@ -1493,6 +1499,7 @@ async fn main() {
             "/v1/collections/{collection_name}/search",
             post(search),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), auth::api_auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), api_metrics_middleware))
         .layer(middleware::from_fn(log_failed_http_responses))
         .with_state(state);
