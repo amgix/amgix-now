@@ -26,9 +26,9 @@ tokio = { version = "1.52.2", features = ["rt-multi-thread", "macros", "net", "s
 unicode-segmentation = "1.13.2"
 uuid = { version = "1.23.1", features = ["v4", "v5"] }
 qdrant-client = "1.17.0"
-embed_anything = { version = "0.6.7", default-features = false, features = ["rustls-tls"] }
-candle-core = "=0.9.1"
-candle-transformers = "=0.9.1"
+embed_anything = { git = "https://github.com/amgix-dev/EmbedAnything.git", rev = "d7933c5476212c6adbe520a07037923f9db15c13", default-features = false, features = ["rustls-tls"] }
+candle-core = "=0.11.0"
+candle-transformers = "=0.11.0"
 tokenizers = { version = "=0.22.2", default-features = false }
 hf-hub = { version = "=0.4.3", default-features = false, features = ["ureq"] }
 lapin = { version = "4.10.0", default-features = false, features = ["rustls", "tokio"] }

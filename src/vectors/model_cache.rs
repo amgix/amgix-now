@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use embed_anything::embeddings::embed::TextEmbedder;
 use embed_anything::embeddings::local::bert::{BertEmbedder, SparseBertEmbedder};
+use embed_anything::embeddings::local::modernbert::ModernBertEmbedder;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use serde_json::Value;
 
@@ -211,6 +212,10 @@ fn read_hf_config_json(model_id: &str, revision: Option<&str>) -> Result<Value, 
         .map_err(|e| format!("Failed to parse config.json for '{model_id}': {e}"))
 }
 
+fn is_modern_bert_architecture(architecture: &str) -> bool {
+    matches!(architecture, "ModernBertModel" | "ModernBertForMaskedLM")
+}
+
 fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModelHandle, String> {
     let config = read_hf_config_json(model_id, revision)?;
     let architecture = config["architectures"]
@@ -225,14 +230,26 @@ fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModel
             model_id.to_string(),
             revision.map(|s| s.to_string()),
             None,
+            None,
         )
         .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
         Ok(DenseModelHandle::Bert { embedder, pooling })
+    } else if is_modern_bert_architecture(architecture) {
+        let pooling = dense_pooling_config(&config, model_id, revision);
+        let embedder = ModernBertEmbedder::new(
+            model_id.to_string(),
+            revision.map(|s| s.to_string()),
+            None,
+            None,
+        )
+        .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
+        Ok(DenseModelHandle::ModernBert { embedder, pooling })
     } else {
         let embedder = TextEmbedder::from_pretrained_hf(
             architecture,
             model_id,
             revision,
+            None,
             None,
             None,
         )
@@ -243,15 +260,40 @@ fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModel
 
 /// Dense model loaded once at model load time.
 ///
-/// BERT models use the optimized on-device candle pipeline (tokenize → tensor → forward →
-/// pool → normalize). All other architectures use `embed_anything`'s `TextEmbedder`, which
-/// handles model loading and inference generically based on `config.json`.
+/// BERT and ModernBERT models use the optimized on-device candle pipeline (tokenize → tensor →
+/// forward → pool → normalize). All other architectures use `embed_anything`'s `TextEmbedder`.
 pub enum DenseModelHandle {
     Bert {
         embedder: BertEmbedder,
         pooling: StPoolingConfig,
     },
+    ModernBert {
+        embedder: ModernBertEmbedder,
+        pooling: StPoolingConfig,
+    },
     Generic(TextEmbedder),
+}
+
+fn dense_pooling_config(hf_config: &Value, model_id: &str, revision: Option<&str>) -> StPoolingConfig {
+    if let Some(cfg) = try_load_st_pooling_config(model_id, revision) {
+        return cfg;
+    }
+    match hf_config.get("classifier_pooling").and_then(|v| v.as_str()) {
+        Some("cls") => StPoolingConfig::cls_only(),
+        Some("mean") => StPoolingConfig::mean_only(),
+        _ => StPoolingConfig::mean_only(),
+    }
+}
+
+fn try_load_st_pooling_config(model_id: &str, revision: Option<&str>) -> Option<StPoolingConfig> {
+    set_hf_home();
+    let api = ApiBuilder::new().with_progress(false).build().ok()?;
+    let repo = match revision {
+        Some(rev) => Repo::with_revision(model_id.to_string(), RepoType::Model, rev.to_string()),
+        None => Repo::new(model_id.to_string(), RepoType::Model),
+    };
+    let path = api.repo(repo).get(ST_POOLING_CONFIG_PATH).ok()?;
+    Some(load_st_pooling_config_from_path(&path))
 }
 
 fn load_st_pooling_config(model_id: &str, revision: Option<&str>) -> StPoolingConfig {

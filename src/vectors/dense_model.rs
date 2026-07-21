@@ -73,6 +73,9 @@ fn embed_dense_batch(
         DenseModelHandle::Bert { embedder, pooling } => {
             embed_dense_batch_bert(embedder, pooling, docs, normalize, model_id)
         }
+        DenseModelHandle::ModernBert { embedder, pooling } => {
+            embed_dense_batch_modernbert(embedder, pooling, docs, normalize, model_id)
+        }
         DenseModelHandle::Generic(embedder) => {
             embed_dense_batch_generic(embedder, docs, normalize, model_id)
         }
@@ -145,6 +148,76 @@ fn embed_dense_batch_bert(
         };
 
         // Copy to host; cast to F32 only if the output isn't already F32.
+        let pooled_f32 = if pooled.dtype() == DType::F32 {
+            pooled
+        } else {
+            pooled
+                .to_dtype(DType::F32)
+                .map_err(|e| format!("to_dtype(f32) failed: {e}"))?
+        };
+
+        drop(_gpu_guard);
+
+        let batch_vecs = pooled_f32
+            .to_vec2::<f32>()
+            .map_err(|e| format!("to_vec2 failed: {e}"))?;
+
+        results.extend(batch_vecs);
+    }
+
+    Ok(results)
+}
+
+fn embed_dense_batch_modernbert(
+    embedder: &embed_anything::embeddings::local::modernbert::ModernBertEmbedder,
+    pooling: &crate::vectors::st_pooling::StPoolingConfig,
+    docs: &[String],
+    normalize: bool,
+    model_id: &str,
+) -> Result<Vec<Vec<f32>>, String> {
+    let device = &embedder.device;
+    let mut results: Vec<Vec<f32>> = Vec::with_capacity(docs.len());
+
+    for chunk in docs.chunks(DENSE_MODEL_BATCH_SIZE) {
+        let chunk_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+        let batch = chunk_refs.len();
+
+        let tokens = embedder
+            .tokenizer
+            .encode_batch(chunk_refs, true)
+            .map_err(|e| format!("Tokenization failed for '{model_id}': {e}"))?;
+
+        let seq_len = tokens[0].get_ids().len();
+
+        let mut flat_ids: Vec<u32> = Vec::with_capacity(batch * seq_len);
+        let mut flat_mask: Vec<u32> = Vec::with_capacity(batch * seq_len);
+        for t in &tokens {
+            flat_ids.extend_from_slice(t.get_ids());
+            flat_mask.extend_from_slice(t.get_attention_mask());
+        }
+
+        let _gpu_guard = maybe_gpu_inference_permit();
+
+        let token_ids = Tensor::from_slice(&flat_ids, (batch, seq_len), device)
+            .map_err(|e| format!("token_ids tensor failed: {e}"))?;
+        let attention_mask = Tensor::from_slice(&flat_mask, (batch, seq_len), device)
+            .map_err(|e| format!("attention_mask tensor failed: {e}"))?;
+
+        let hidden = embedder
+            .model
+            .forward(&token_ids, &attention_mask)
+            .map_err(|e| format!("Model forward failed for '{model_id}': {e}"))?;
+
+        let pooled = pool_sentence_embeddings(&hidden, &attention_mask, pooling)
+            .map_err(|e| format!("Pooling failed for '{model_id}': {e}"))?;
+
+        let pooled = if normalize {
+            l2_normalize_tensor(&pooled)
+                .map_err(|e| format!("L2 normalize failed for '{model_id}': {e}"))?
+        } else {
+            pooled
+        };
+
         let pooled_f32 = if pooled.dtype() == DType::F32 {
             pooled
         } else {

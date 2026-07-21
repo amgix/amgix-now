@@ -29,6 +29,12 @@ impl StPoolingConfig {
         }
     }
 
+    pub fn cls_only() -> Self {
+        Self {
+            modes: vec![StPoolingMode::Cls],
+        }
+    }
+
     pub fn from_json_value(value: &serde_json::Value) -> Self {
         if let Some(mode) = value.get("pooling_mode") {
             if let Some(s) = mode.as_str() {

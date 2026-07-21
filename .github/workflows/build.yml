@@ -90,7 +90,7 @@ jobs:
           "AMGIX_VERSION=$versionNoV" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: TheMrMilchmann/setup-msvc-dev@v1
         with:
           vsversion: '2022'
 
@@ -334,7 +334,6 @@ jobs:
           path: dist
           merge-multiple: true
           pattern: amgix-now-*
-          ignore-unmatched-pattern: true
           skip-decompress: true
 
       - uses: softprops/action-gh-release@v3
