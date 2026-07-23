@@ -4,7 +4,6 @@
 //! Call `.validate()` explicitly at the handler boundary only.
 //! Internal types are never passed through these functions.
 
-use chrono::DateTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
@@ -464,8 +463,7 @@ fn validate_meta_value_type(key: &str, type_str: &str, val: &Value) -> VResult {
         }
         "datetime" => match val.as_str() {
             Some(s) => {
-                let normalized = s.replace('Z', "+00:00");
-                if DateTime::parse_from_rfc3339(&normalized).is_ok() {
+                if crate::datetime_parse::is_valid_datetime_string(s) {
                     Ok(())
                 } else {
                     Err(err(format!(

@@ -1789,7 +1789,7 @@ fn metadata_value_matches_index_type(value: &serde_json::Value, expected_type: &
         "boolean" => value.is_boolean(),
         "datetime" => value
             .as_str()
-            .map(|s| chrono::DateTime::parse_from_rfc3339(&s.replace('Z', "+00:00")).is_ok())
+            .map(crate::datetime_parse::is_valid_datetime_string)
             .unwrap_or(false),
         _ => false,
     }
@@ -1809,12 +1809,7 @@ impl std::fmt::Display for MetadataFilterError {
 }
 
 fn is_iso_datetime_string(s: &str) -> bool {
-    // Mirrors Python: datetime.fromisoformat(value.replace("Z", "+00:00"))
-    let normalized = s.replace('Z', "+00:00");
-    chrono::DateTime::parse_from_rfc3339(&normalized).is_ok()
-        || chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
-        || chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S").is_ok()
-        || chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d").is_ok()
+    crate::datetime_parse::is_valid_datetime_string(s)
 }
 
 fn validate_filter_node(

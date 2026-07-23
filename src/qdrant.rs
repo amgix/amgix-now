@@ -1540,27 +1540,12 @@ fn group_value_from_point(
 // ---------------------------------------------------------------------------
 
 fn parse_datetime_for_filter(s: &str) -> Result<Timestamp, DbError> {
-    let normalized = s.replace('Z', "+00:00");
-    // RFC3339 / ISO 8601 with timezone
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
-        return Ok(Timestamp { seconds: dt.timestamp(), nanos: dt.timestamp_subsec_nanos() as i32 });
-    }
-    // Naive datetime with fractional seconds
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
-        return Ok(Timestamp { seconds: dt.and_utc().timestamp(), nanos: dt.and_utc().timestamp_subsec_nanos() as i32 });
-    }
-    // Naive datetime without fractional seconds
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S") {
-        return Ok(Timestamp { seconds: dt.and_utc().timestamp(), nanos: 0 });
-    }
-    // Date only — treat as start of day UTC
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        let dt = d.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        return Ok(Timestamp { seconds: dt.timestamp(), nanos: 0 });
-    }
-    Err(DbError::Config(format!(
-        "Invalid datetime value '{s}': expected ISO 8601 (e.g. '2021-05-01', '2021-05-01T00:00:00Z')"
-    )))
+    let dt = crate::datetime_parse::parse_datetime_as_utc(s)
+        .map_err(DbError::Config)?;
+    Ok(Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    })
 }
 
 fn build_search_filter(

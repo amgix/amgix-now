@@ -197,8 +197,7 @@ fn validate_and_clone_meta_inner(
         }
         "datetime" => match val.as_str() {
             Some(s) => {
-                let normalized = s.replace('Z', "+00:00");
-                if chrono::DateTime::parse_from_rfc3339(&normalized).is_ok() {
+                if crate::datetime_parse::is_valid_datetime_string(s) {
                     Ok(serde_json::Value::String(s.to_string()))
                 } else {
                     Err(format!(

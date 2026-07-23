@@ -4,6 +4,7 @@ mod bunny_talk;
 mod lock_client;
 mod metrics;
 mod common;
+mod datetime_parse;
 mod platform;
 mod encoder;
 mod filter_parser;
@@ -51,8 +52,9 @@ use encoder::{
     validate_models, CollectionConfigCache, LockBackend, NamedLocks, SearchError, SearchIngress,
     StatsUpdateBatcher, UpsertIngress, UpsertSyncError,
 };
+use datetime_parse::parse_utc_datetime;
 use models::{
-    parse_document_timestamp_for_api, BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
+    BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
     CollectionExistsResponse, CollectionStatsResponse, Document, DocumentFetchRequest,
     DocumentStatus, DocumentStatusResponse, OkResponse, QueueInfo,
     QueuedDocumentStatus, ReadyResponse, SearchQuery,
@@ -970,7 +972,7 @@ async fn delete_document(
     Query(query): Query<DeleteDocumentQuery>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
     validate_collection_name(&collection_name).map_err(validation_error)?;
-    let request_timestamp = parse_document_timestamp_for_api(&query.request_timestamp).map_err(|_| {
+    let request_timestamp = parse_utc_datetime(&query.request_timestamp).map_err(|_| {
         query_validation_error(
             "request_timestamp",
             format!(
