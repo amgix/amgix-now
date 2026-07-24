@@ -60,12 +60,13 @@ COPY build/supervisord-now.conf /etc/supervisor/conf.d/amgix-now.conf
 COPY build/config.yaml /app/config.yaml
 
 RUN chmod +x /app/amgix-now /app/prefix-log-exec.sh /app/entrypoint.sh \
-    && mkdir -p /data/qdrant \
-    && chmod 755 /data /data/qdrant
+    && mkdir -p /data/qdrant /data/amgix/cache \
+    && chmod 755 /data /data/qdrant /data/amgix/cache
 
 # Default: talk to embedded Qdrant gRPC (paths/ports: config.yaml + Qdrant defaults)
 ENV AMGIX_DEFAULT_DATABASE_URL=qdrant://localhost:6334 \
-    AMGIX_DATABASE_URL=qdrant://localhost:6334
+    AMGIX_DATABASE_URL=qdrant://localhost:6334 \
+    AMGIX_CACHE_DIR=/data/amgix/cache
 
 ARG AMGIX_VERSION=${AMGIX_VERSION:-0.1.0-dev}
 ENV AMGIX_VERSION=${AMGIX_VERSION}
