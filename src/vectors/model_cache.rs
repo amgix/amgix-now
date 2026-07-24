@@ -321,7 +321,20 @@ fn load_st_pooling_config_from_path(path: &Path) -> StPoolingConfig {
     StPoolingConfig::from_json_value(&value)
 }
 
+type ModelKey = (String, Option<String>);
 type DenseModelEntry = (Arc<DenseModelHandle>, Instant);
+
+enum InFlightState<V> {
+    Loading,
+    Ready(Result<Arc<V>, String>),
+}
+
+struct InFlightEntry<V> {
+    state: Mutex<InFlightState<V>>,
+    cvar: Condvar,
+}
+
+type InFlight<V> = Mutex<HashMap<ModelKey, Arc<InFlightEntry<V>>>>;
 
 fn bump_cache_hit<K, V>(cache: &mut HashMap<K, (Arc<V>, Instant)>, key: &K) -> Option<Arc<V>>
 where
@@ -351,8 +364,113 @@ where
     }
 }
 
+fn cache_hit<V>(
+    inner: &RwLock<HashMap<ModelKey, (Arc<V>, Instant)>>,
+    key: &ModelKey,
+) -> Option<Arc<V>> {
+    if !inner.read().unwrap().contains_key(key) {
+        return None;
+    }
+    let mut cache = inner.write().unwrap();
+    bump_cache_hit(&mut cache, key)
+}
+
+fn insert_loaded<V>(
+    inner: &RwLock<HashMap<ModelKey, (Arc<V>, Instant)>>,
+    inflight: &InFlight<V>,
+    max_size: usize,
+    key: ModelKey,
+    loaded: Arc<V>,
+) -> Arc<V>
+where
+    V: Send + Sync + 'static,
+{
+    let mut cache = inner.write().unwrap();
+    if let Some(existing) = bump_cache_hit(&mut cache, &key) {
+        inflight.lock().unwrap().remove(&key);
+        return existing;
+    }
+    evict_lru_if_full(&mut cache, max_size);
+    cache.insert(key.clone(), (Arc::clone(&loaded), Instant::now()));
+    inflight.lock().unwrap().remove(&key);
+    loaded
+}
+
+fn wait_for_inflight_load<V, F>(
+    entry: &InFlightEntry<V>,
+    is_owner: bool,
+    load: F,
+) -> Result<Arc<V>, String>
+where
+    V: Send + Sync + 'static,
+    F: FnOnce() -> Result<Arc<V>, String>,
+{
+    let mut guard = entry.state.lock().unwrap();
+    loop {
+        match &*guard {
+            InFlightState::Ready(Ok(handle)) => return Ok(Arc::clone(handle)),
+            InFlightState::Ready(Err(error)) => return Err(error.clone()),
+            InFlightState::Loading => {
+                if is_owner {
+                    let result = load();
+                    *guard = InFlightState::Ready(result.clone());
+                    entry.cvar.notify_all();
+                    return result;
+                }
+                guard = entry.cvar.wait(guard).unwrap();
+            }
+        }
+    }
+}
+
+fn load_with_inflight<V, F>(
+    inner: &RwLock<HashMap<ModelKey, (Arc<V>, Instant)>>,
+    inflight: &InFlight<V>,
+    max_size: usize,
+    key: ModelKey,
+    load: F,
+) -> Result<Arc<V>, String>
+where
+    V: Send + Sync + 'static,
+    F: FnOnce() -> Result<Arc<V>, String>,
+{
+    if let Some(handle) = cache_hit(inner, &key) {
+        return Ok(handle);
+    }
+
+    let (entry, is_owner) = {
+        let mut loads = inflight.lock().unwrap();
+        if let Some(existing) = loads.get(&key) {
+            (Arc::clone(existing), false)
+        } else {
+            let entry = Arc::new(InFlightEntry {
+                state: Mutex::new(InFlightState::Loading),
+                cvar: Condvar::new(),
+            });
+            loads.insert(key.clone(), Arc::clone(&entry));
+            (entry, true)
+        }
+    };
+
+    if let Some(handle) = cache_hit(inner, &key) {
+        inflight.lock().unwrap().remove(&key);
+        return Ok(handle);
+    }
+
+    let loaded = match wait_for_inflight_load(&entry, is_owner, load) {
+        Ok(handle) => handle,
+        Err(error) => {
+            inflight.lock().unwrap().remove(&key);
+            return Err(error);
+        }
+    };
+
+    Ok(insert_loaded(inner, inflight, max_size, key, loaded))
+}
+
 pub struct DenseModelCache {
-    inner: RwLock<HashMap<(String, Option<String>), DenseModelEntry>>,
+    inner: RwLock<HashMap<ModelKey, DenseModelEntry>>,
+    inflight: InFlight<DenseModelHandle>,
     max_size: usize,
 }
 
@@ -360,6 +478,7 @@ impl DenseModelCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             max_size: model_cache_size(),
         }
     }
@@ -372,11 +491,8 @@ impl DenseModelCache {
     ) -> Result<Arc<DenseModelHandle>, String> {
         let key = (model_id.to_string(), revision.map(|s| s.to_string()));
 
-        if self.inner.read().unwrap().contains_key(&key) {
-            let mut cache = self.inner.write().unwrap();
-            if let Some(handle) = bump_cache_hit(&mut cache, &key) {
-                return Ok(handle);
-            }
+        if let Some(handle) = cache_hit(&self.inner, &key) {
+            return Ok(handle);
         }
 
         if let Some(orgs) = trusted_organizations {
@@ -393,28 +509,19 @@ impl DenseModelCache {
             }
         }
 
-        {
-            let mut cache = self.inner.write().unwrap();
-            if let Some(handle) = bump_cache_hit(&mut cache, &key) {
-                return Ok(handle);
-            }
-            evict_lru_if_full(&mut cache, self.max_size);
-        }
-
-        set_hf_home();
-        let handle = Arc::new(load_dense_model(model_id, revision)?);
-        let mut cache = self.inner.write().unwrap();
-        if let Some(existing) = bump_cache_hit(&mut cache, &key) {
-            return Ok(existing);
-        }
-        cache.insert(key, (Arc::clone(&handle), Instant::now()));
-        tracing::info!(
-            model = %model_id,
-            revision = revision.as_deref().unwrap_or("(default)"),
-            kind = "dense",
-            "loaded model"
-        );
-        Ok(handle)
+        let model_id = model_id.to_string();
+        let revision = revision.map(|s| s.to_string());
+        load_with_inflight(&self.inner, &self.inflight, self.max_size, key, || {
+            set_hf_home();
+            let handle = Arc::new(load_dense_model(&model_id, revision.as_deref())?);
+            tracing::info!(
+                model = %model_id,
+                revision = revision.as_deref().unwrap_or("(default)"),
+                kind = "dense",
+                "loaded model"
+            );
+            Ok(handle)
+        })
     }
 
     /// Returns cache entries as `(type_str, model, revision, last_used_at)`.
@@ -441,7 +548,8 @@ impl DenseModelCache {
 type SparseModelEntry = (Arc<SparseBertEmbedder>, Instant);
 
 pub struct SparseModelCache {
-    inner: RwLock<HashMap<(String, Option<String>), SparseModelEntry>>,
+    inner: RwLock<HashMap<ModelKey, SparseModelEntry>>,
+    inflight: InFlight<SparseBertEmbedder>,
     max_size: usize,
 }
 
@@ -449,6 +557,7 @@ impl SparseModelCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             max_size: model_cache_size(),
         }
     }
@@ -461,11 +570,8 @@ impl SparseModelCache {
     ) -> Result<Arc<SparseBertEmbedder>, String> {
         let key = (model_id.to_string(), revision.map(|s| s.to_string()));
 
-        if self.inner.read().unwrap().contains_key(&key) {
-            let mut cache = self.inner.write().unwrap();
-            if let Some(model) = bump_cache_hit(&mut cache, &key) {
-                return Ok(model);
-            }
+        if let Some(model) = cache_hit(&self.inner, &key) {
+            return Ok(model);
         }
 
         if let Some(orgs) = trusted_organizations {
@@ -482,35 +588,26 @@ impl SparseModelCache {
             }
         }
 
-        {
-            let mut cache = self.inner.write().unwrap();
-            if let Some(model) = bump_cache_hit(&mut cache, &key) {
-                return Ok(model);
-            }
-            evict_lru_if_full(&mut cache, self.max_size);
-        }
-
-        set_hf_home();
-        let embedder = SparseBertEmbedder::new(
-            model_id.to_string(),
-            revision.map(|s| s.to_string()),
-            None,
-        )
-        .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
-
-        let arc = Arc::new(embedder);
-        let mut cache = self.inner.write().unwrap();
-        if let Some(existing) = bump_cache_hit(&mut cache, &key) {
-            return Ok(existing);
-        }
-        cache.insert(key, (Arc::clone(&arc), Instant::now()));
-        tracing::info!(
-            model = %model_id,
-            revision = revision.as_deref().unwrap_or("(default)"),
-            kind = "sparse",
-            "loaded model"
-        );
-        Ok(arc)
+        let model_id = model_id.to_string();
+        let revision = revision.map(|s| s.to_string());
+        load_with_inflight(&self.inner, &self.inflight, self.max_size, key, || {
+            set_hf_home();
+            let embedder = Arc::new(
+                SparseBertEmbedder::new(
+                    model_id.clone(),
+                    revision.clone(),
+                    None,
+                )
+                .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?,
+            );
+            tracing::info!(
+                model = %model_id,
+                revision = revision.as_deref().unwrap_or("(default)"),
+                kind = "sparse",
+                "loaded model"
+            );
+            Ok(embedder)
+        })
     }
 
     /// Returns cache entries as `(type_str, model, revision, last_used_at)`.
