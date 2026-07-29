@@ -13,13 +13,13 @@ use std::time::Duration;
 use qdrant_client::qdrant::{
     points_selector::PointsSelectorOneOf,
     points_update_operation::{Operation, OverwritePayload},
-    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DatetimeRange,
-    DeletePointsBuilder, Distance, FieldCondition, FieldType, Filter, GetPointsBuilder,
-    Match, PointId, PointStruct, PointsIdsList, PointsSelector, PointsUpdateOperation,
-    QueryBatchPointsBuilder, QueryPointsBuilder, Range,
-    RepeatedStrings, SparseIndexConfig, SparseVector, SparseVectorConfig,
-    SparseVectorParams, ScrollPointsBuilder, Timestamp, UpdateBatchPointsBuilder, UpsertPointsBuilder,
-    VectorInput, VectorParams, VectorParamsMap, VectorsConfig, Modifier, Query,
+    r#match, Condition, CountPointsBuilder, CreateCollectionBuilder,
+    CreateFieldIndexCollectionBuilder, DatetimeRange, DeletePointsBuilder, Distance,
+    FieldCondition, FieldType, Filter, GetPointsBuilder, Match, PointId, PointStruct,
+    PointsIdsList, PointsSelector, PointsUpdateOperation, QueryBatchPointsBuilder, QueryPointsBuilder,
+    Range, RepeatedStrings, SetPayloadPointsBuilder, SparseIndexConfig, SparseVector,
+    SparseVectorConfig, SparseVectorParams, ScrollPointsBuilder, Timestamp, UpdateBatchPointsBuilder,
+    UpsertPointsBuilder, VectorInput, VectorParams, VectorParamsMap, VectorsConfig, Modifier, Query,
     PayloadIncludeSelector,
 };
 use qdrant_client::Qdrant;
@@ -35,8 +35,10 @@ use crate::functions::{
     rrf_fuse, scored_point_id, search_result_from_point, split_first_underscore,
 };
 use crate::models::{
-    CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse,
-    MetadataFilter, MetadataIndex, SearchOutcome, SearchQueryWithVectors, SearchResult, VectorData, VectorScore,
+    CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse, DocumentStatus,
+    DocumentStatusResponse, MetadataFilter, MetadataIndex, QueueDocument, QueueInfo,
+    QueueOperationType, QueuedDocumentStatus, SearchOutcome, SearchQueryWithVectors, SearchResult,
+    VectorData, VectorScore,
 };
 use crate::search_facet::compute_facet_counts;
 
@@ -95,6 +97,7 @@ pub struct QdrantDb {
     pub client: Qdrant,
     pub meta_collection: String,
     pub metrics_collection: String,
+    pub queue_collection: String,
     /// When true, upserts/deletes pass Qdrant `wait=true` so the API returns after data is visible.
     sync_db_writes: bool,
 }
@@ -103,7 +106,7 @@ impl QdrantDb {
     /// `url` is passed to [`Qdrant::from_url`](qdrant_client::Qdrant::from_url): gRPC URI, e.g.
     /// `http://localhost:6334` (not Qdrant REST on 6333).
     /// `sync_db_writes`: maps to Qdrant [`UpsertPoints`](qdrant_client::Qdrant::upsert_points) /
-    /// [`delete_points`](qdrant_client::Qdrant::delete_points) `wait` (`AMGIX_NOW_SYNC_DB_WRITES`).
+    /// [`delete_points`](qdrant_client::Qdrant::delete_points) `wait`.
     pub fn new(url: &str, sync_db_writes: bool) -> Result<Self, DbError> {
         // `qdrant-client`'s default `check_compatibility` runs `health_check` inside `build()` before
         // we can `wait_connected`, printing to stdout when Qdrant is still starting; we defer checks.
@@ -119,6 +122,7 @@ impl QdrantDb {
             client,
             meta_collection: sys_collection_name("meta"),
             metrics_collection: sys_collection_name("metrics"),
+            queue_collection: sys_collection_name("queue"),
             sync_db_writes,
         })
     }
@@ -136,6 +140,7 @@ impl QdrantDb {
     pub async fn configure(&self) -> Result<(), DbError> {
         self.configure_meta_collection().await?;
         self.configure_metrics_collection().await?;
+        self.configure_queue_collection().await?;
         Ok(())
     }
 
@@ -199,6 +204,77 @@ impl QdrantDb {
                     .create_field_index(
                         CreateFieldIndexCollectionBuilder::new(
                             &self.metrics_collection,
+                            field,
+                            field_type,
+                        )
+                        .wait(true),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn configure_queue_collection(&self) -> Result<(), DbError> {
+        if !self.client.collection_exists(&self.queue_collection).await? {
+            tracing::info!("Creating system queue collection");
+            let vectors_config = VectorsConfig {
+                config: Some(qdrant_client::qdrant::vectors_config::Config::ParamsMap(
+                    VectorParamsMap {
+                        map: HashMap::from([(
+                            "dummy".to_string(),
+                            VectorParams {
+                                size: 1,
+                                distance: Distance::Dot as i32,
+                                ..Default::default()
+                            },
+                        )]),
+                    },
+                )),
+            };
+            self.client
+                .create_collection(
+                    CreateCollectionBuilder::new(&self.queue_collection)
+                        .vectors_config(vectors_config),
+                )
+                .await?;
+
+            for (field, field_type) in [
+                ("collection_name", FieldType::Keyword),
+                ("doc_id", FieldType::Keyword),
+                ("status", FieldType::Keyword),
+                ("timestamp", FieldType::Datetime),
+            ] {
+                self.client
+                    .create_field_index(
+                        CreateFieldIndexCollectionBuilder::new(
+                            &self.queue_collection,
+                            field,
+                            field_type,
+                        )
+                        .wait(true),
+                    )
+                    .await?;
+            }
+        }
+
+        let info = self.client.collection_info(&self.queue_collection).await?;
+        let payload_schema = info
+            .result
+            .map(|r| r.payload_schema)
+            .unwrap_or_default();
+
+        for (field, field_type) in [
+            ("op_type", FieldType::Keyword),
+            ("doc_timestamp", FieldType::Datetime),
+            ("created_at", FieldType::Datetime),
+            ("try_count", FieldType::Integer),
+        ] {
+            if !payload_schema.contains_key(field) {
+                self.client
+                    .create_field_index(
+                        CreateFieldIndexCollectionBuilder::new(
+                            &self.queue_collection,
                             field,
                             field_type,
                         )
@@ -394,6 +470,8 @@ impl QdrantDb {
             )
             .await?;
 
+        self.delete_from_queue_by_collection(collection_name).await?;
+
         Ok(true)
     }
 
@@ -415,7 +493,486 @@ impl QdrantDb {
             )
             .await?;
 
+        self.delete_from_queue_by_collection(collection_name).await?;
+
         Ok(true)
+    }
+
+    // -----------------------------------------------------------------------
+    // Queue collection — mirrors qdrant.py queue methods
+    // -----------------------------------------------------------------------
+
+    fn keyword_match(value: &str) -> Match {
+        Match {
+            match_value: Some(r#match::MatchValue::Keyword(value.to_string())),
+        }
+    }
+
+    fn queue_doc_from_payload(
+        payload: &std::collections::HashMap<String, qdrant_client::qdrant::Value>,
+    ) -> Result<QueueDocument, DbError> {
+        let json_map: serde_json::Map<String, serde_json::Value> = payload
+            .iter()
+            .map(|(k, v)| (k.clone(), qdrant_val_to_json(v)))
+            .collect();
+        serde_json::from_value(serde_json::Value::Object(json_map))
+            .map_err(|e| DbError::Config(format!("Queue document deserialize error: {e}")))
+    }
+
+    pub async fn add_to_queue(
+        &self,
+        collection_name: &str,
+        collection_id: &str,
+        documents: &[Document],
+        op_type: QueueOperationType,
+        request_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<String>, DbError> {
+        let current_time = chrono::Utc::now();
+        let mut points = Vec::with_capacity(documents.len());
+        let mut queue_ids = Vec::with_capacity(documents.len());
+
+        for document in documents {
+            let queue_id = uuid::Uuid::new_v4().to_string();
+            queue_ids.push(queue_id.clone());
+            let doc_timestamp = if op_type == QueueOperationType::Delete {
+                request_timestamp.ok_or_else(|| {
+                    DbError::Config("request_timestamp required for delete queue entries".into())
+                })?
+            } else {
+                document.timestamp
+            };
+            let queue_doc = QueueDocument {
+                queue_id: queue_id.clone(),
+                collection_name: collection_name.to_string(),
+                collection_id: collection_id.to_string(),
+                doc_id: document.id.clone(),
+                op_type,
+                doc_timestamp,
+                status: QueuedDocumentStatus::Queued,
+                info: None,
+                document: Some(document.clone()),
+                created_at: current_time,
+                timestamp: current_time,
+                try_count: 0,
+            };
+            let payload: serde_json::Map<String, serde_json::Value> =
+                serde_json::to_value(&queue_doc)
+                    .map_err(|e| DbError::Config(format!("Queue document serialize error: {e}")))?
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| DbError::Config("Queue document must serialize to object".into()))?;
+            let dummy_vectors: HashMap<String, Vec<f32>> =
+                HashMap::from([("dummy".to_string(), vec![0.0_f32])]);
+            points.push(PointStruct::new(queue_id, dummy_vectors, payload));
+        }
+
+        self.client
+            .upsert_points(
+                UpsertPointsBuilder::new(&self.queue_collection, points).wait(self.sync_db_writes),
+            )
+            .await?;
+
+        Ok(queue_ids)
+    }
+
+    pub async fn get_from_queue(
+        &self,
+        queue_ids: &[String],
+        suppress_not_found: bool,
+    ) -> Result<Vec<QueueDocument>, DbError> {
+        if queue_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let ids: Vec<PointId> = queue_ids.iter().map(|id| id.clone().into()).collect();
+        let result = self
+            .client
+            .get_points(
+                GetPointsBuilder::new(&self.queue_collection, ids).with_payload(true),
+            )
+            .await?;
+
+        if result.result.len() != queue_ids.len() && !suppress_not_found {
+            let found: std::collections::HashSet<String> = result
+                .result
+                .iter()
+                .filter_map(|p| match &p.id {
+                    Some(PointId {
+                        point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(u)),
+                    }) => Some(u.clone()),
+                    _ => None,
+                })
+                .collect();
+            let missing: Vec<_> = queue_ids.iter().filter(|id| !found.contains(*id)).cloned().collect();
+            return Err(DbError::NotFound(format!(
+                "Queue documents not found for queue_ids: {}",
+                missing.join(", ")
+            )));
+        }
+
+        result
+            .result
+            .iter()
+            .map(|p| Self::queue_doc_from_payload(&p.payload))
+            .collect()
+    }
+
+    pub async fn delete_from_queue(&self, queue_ids: &[String]) -> Result<(), DbError> {
+        if queue_ids.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<PointId> = queue_ids.iter().map(|id| id.clone().into()).collect();
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.queue_collection)
+                    .points(ids)
+                    .wait(self.sync_db_writes),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_from_queue_by_collection(&self, collection_name: &str) -> Result<(), DbError> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.queue_collection)
+                    .points(Filter {
+                        must: vec![FieldCondition {
+                            key: "collection_name".into(),
+                            r#match: Some(Self::keyword_match(collection_name)),
+                            ..Default::default()
+                        }
+                        .into()],
+                        ..Default::default()
+                    })
+                    .wait(true),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_upserts_from_queue(
+        &self,
+        collection_name: &str,
+        doc_id: &str,
+        before_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DbError> {
+        let mut dr = DatetimeRange::default();
+        dr.lte = Some(Timestamp {
+            seconds: before_timestamp.timestamp(),
+            nanos: before_timestamp.timestamp_subsec_nanos() as i32,
+        });
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.queue_collection)
+                    .points(Filter {
+                        must: vec![
+                            FieldCondition {
+                                key: "collection_name".into(),
+                                r#match: Some(Self::keyword_match(collection_name)),
+                                ..Default::default()
+                            }
+                            .into(),
+                            FieldCondition {
+                                key: "doc_id".into(),
+                                r#match: Some(Self::keyword_match(doc_id)),
+                                ..Default::default()
+                            }
+                            .into(),
+                            FieldCondition {
+                                key: "op_type".into(),
+                                r#match: Some(Self::keyword_match("upsert")),
+                                ..Default::default()
+                            }
+                            .into(),
+                            FieldCondition {
+                                key: "doc_timestamp".into(),
+                                datetime_range: Some(dr),
+                                ..Default::default()
+                            }
+                            .into(),
+                        ],
+                        ..Default::default()
+                    })
+                    .wait(self.sync_db_writes),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_queue_status(
+        &self,
+        queue_id_try_counts: &[(String, u32)],
+        status: QueuedDocumentStatus,
+        info: &str,
+    ) -> Result<(), DbError> {
+        if queue_id_try_counts.is_empty() {
+            return Ok(());
+        }
+        let mut groups: HashMap<u32, Vec<String>> = HashMap::new();
+        for (queue_id, try_count) in queue_id_try_counts {
+            groups.entry(*try_count).or_default().push(queue_id.clone());
+        }
+        let now = chrono::Utc::now();
+        let status_str = serde_json::to_value(status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+
+        for (try_count, ids) in groups {
+            let mut payload = serde_json::Map::new();
+            payload.insert("status".into(), serde_json::json!(status_str));
+            payload.insert("timestamp".into(), serde_json::json!(now));
+            payload.insert("try_count".into(), serde_json::json!(try_count));
+            payload.insert("info".into(), serde_json::json!(info));
+            let payload = qdrant_client::Payload::try_from(serde_json::Value::Object(payload))
+                .map_err(|e| DbError::Config(format!("Invalid queue status payload: {e}")))?;
+            let point_ids: Vec<PointId> = ids.into_iter().map(|id| id.into()).collect();
+            self.client
+                .set_payload(
+                    SetPayloadPointsBuilder::new(&self.queue_collection, payload)
+                        .points_selector(PointsIdsList { ids: point_ids })
+                        .wait(self.sync_db_writes),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn pending_status_condition() -> Condition {
+        FieldCondition {
+            key: "status".into(),
+            r#match: Some(Match {
+                match_value: Some(r#match::MatchValue::Keywords(RepeatedStrings {
+                    strings: vec!["queued".into(), "requeued".into()],
+                })),
+            }),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// Scroll pending entries with optional `try_count` match, oldest `created_at` first.
+    async fn scroll_pending_queue_phase(
+        &self,
+        limit: u64,
+        try_count_zero: bool,
+    ) -> Result<Vec<QueueDocument>, DbError> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let mut must = vec![Self::pending_status_condition()];
+        if try_count_zero {
+            must.push(
+                FieldCondition {
+                    key: "try_count".into(),
+                    r#match: Some(Match {
+                        match_value: Some(r#match::MatchValue::Integer(0)),
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            must.push(
+                FieldCondition {
+                    key: "try_count".into(),
+                    range: Some(Range {
+                        gt: Some(0.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        let result = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.queue_collection)
+                    .filter(Filter {
+                        must,
+                        ..Default::default()
+                    })
+                    .limit(limit as u32)
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .order_by("created_at"),
+            )
+            .await?;
+
+        result
+            .result
+            .iter()
+            .map(|p| Self::queue_doc_from_payload(&p.payload))
+            .collect()
+    }
+
+    /// Two-phase claim: prefer never-tried (`try_count == 0`) oldest-first, then fill with retries.
+    /// Avoids head-of-line blocking behind requeued rows waiting on backoff.
+    pub async fn claim_pending_queue(&self, limit: u64) -> Result<Vec<QueueDocument>, DbError> {
+        let mut out = self.scroll_pending_queue_phase(limit, true).await?;
+        if (out.len() as u64) < limit {
+            let more = self
+                .scroll_pending_queue_phase(limit - out.len() as u64, false)
+                .await?;
+            out.extend(more);
+        }
+        Ok(out)
+    }
+
+    pub async fn get_queue_entries(
+        &self,
+        collection_name: &str,
+        doc_id: Option<&str>,
+    ) -> Result<Vec<QueueDocument>, DbError> {
+        let mut must = vec![FieldCondition {
+            key: "collection_name".into(),
+            r#match: Some(Self::keyword_match(collection_name)),
+            ..Default::default()
+        }
+        .into()];
+        if let Some(doc_id) = doc_id {
+            must.push(
+                FieldCondition {
+                    key: "doc_id".into(),
+                    r#match: Some(Self::keyword_match(doc_id)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        let result = self
+            .client
+            .scroll(
+                ScrollPointsBuilder::new(&self.queue_collection)
+                    .filter(Filter {
+                        must,
+                        ..Default::default()
+                    })
+                    .with_payload(true)
+                    .with_vectors(false)
+                    .order_by("timestamp"),
+            )
+            .await?;
+
+        result
+            .result
+            .iter()
+            .map(|p| Self::queue_doc_from_payload(&p.payload))
+            .collect()
+    }
+
+    pub async fn get_queue_info(&self, collection_name: &str) -> Result<QueueInfo, DbError> {
+        let statuses = [
+            QueuedDocumentStatus::Queued,
+            QueuedDocumentStatus::Requeued,
+            QueuedDocumentStatus::Failed,
+        ];
+        let ops = [QueueOperationType::Upsert, QueueOperationType::Delete];
+        let mut counts = HashMap::new();
+
+        for status in statuses {
+            for op in ops {
+                let status_str = match status {
+                    QueuedDocumentStatus::Queued => "queued",
+                    QueuedDocumentStatus::Requeued => "requeued",
+                    QueuedDocumentStatus::Failed => "failed",
+                    QueuedDocumentStatus::Indexed => "indexed",
+                };
+                let op_str = match op {
+                    QueueOperationType::Upsert => "upsert",
+                    QueueOperationType::Delete => "delete",
+                };
+                let result = self
+                    .client
+                    .count(
+                        CountPointsBuilder::new(&self.queue_collection)
+                            .filter(Filter {
+                                must: vec![
+                                    FieldCondition {
+                                        key: "collection_name".into(),
+                                        r#match: Some(Self::keyword_match(collection_name)),
+                                        ..Default::default()
+                                    }
+                                    .into(),
+                                    FieldCondition {
+                                        key: "status".into(),
+                                        r#match: Some(Self::keyword_match(status_str)),
+                                        ..Default::default()
+                                    }
+                                    .into(),
+                                    FieldCondition {
+                                        key: "op_type".into(),
+                                        r#match: Some(Self::keyword_match(op_str)),
+                                        ..Default::default()
+                                    }
+                                    .into(),
+                                ],
+                                ..Default::default()
+                            })
+                            .exact(true),
+                    )
+                    .await?;
+                counts.insert((status, op), result.result.map(|r| r.count).unwrap_or(0) as i64);
+            }
+        }
+
+        let queued_upsert = *counts.get(&(QueuedDocumentStatus::Queued, QueueOperationType::Upsert)).unwrap_or(&0);
+        let queued_delete = *counts.get(&(QueuedDocumentStatus::Queued, QueueOperationType::Delete)).unwrap_or(&0);
+        let requeued_upsert = *counts.get(&(QueuedDocumentStatus::Requeued, QueueOperationType::Upsert)).unwrap_or(&0);
+        let requeued_delete = *counts.get(&(QueuedDocumentStatus::Requeued, QueueOperationType::Delete)).unwrap_or(&0);
+        let failed_upsert = *counts.get(&(QueuedDocumentStatus::Failed, QueueOperationType::Upsert)).unwrap_or(&0);
+        let failed_delete = *counts.get(&(QueuedDocumentStatus::Failed, QueueOperationType::Delete)).unwrap_or(&0);
+        Ok(QueueInfo {
+            queued_upsert,
+            queued_delete,
+            requeued_upsert,
+            requeued_delete,
+            failed_upsert,
+            failed_delete,
+            total: queued_upsert
+                + queued_delete
+                + requeued_upsert
+                + requeued_delete
+                + failed_upsert
+                + failed_delete,
+        })
+    }
+
+    pub async fn get_queue_statuses(
+        &self,
+        collection_name: &str,
+        doc_id: &str,
+    ) -> Result<DocumentStatusResponse, DbError> {
+        let mut statuses = Vec::new();
+
+        let docs = self
+            .get_documents(collection_name, &[doc_id], true, false, None)
+            .await?;
+        if let Some(Some(doc)) = docs.into_iter().next() {
+            statuses.push(DocumentStatus {
+                status: QueuedDocumentStatus::Indexed,
+                op_type: None,
+                info: None,
+                timestamp: doc.timestamp,
+                queue_id: None,
+                try_count: None,
+            });
+        }
+
+        for entry in self.get_queue_entries(collection_name, Some(doc_id)).await? {
+            statuses.push(DocumentStatus {
+                status: entry.status,
+                op_type: Some(entry.op_type),
+                info: entry.info,
+                timestamp: entry.timestamp,
+                queue_id: Some(entry.queue_id),
+                try_count: Some(entry.try_count),
+            });
+        }
+
+        statuses.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(DocumentStatusResponse { statuses })
     }
 
     // -----------------------------------------------------------------------

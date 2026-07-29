@@ -59,6 +59,17 @@ pub fn cache_base_dir() -> PathBuf {
 pub const APP_NAME: &str = "Amalgam Index";
 pub const APP_PREFIX: &str = "amgix";
 
+/// Maximum delivery attempts for queue messages (vectorization errors). Mirrors `constants.py`.
+pub const MAX_QUEUE_DELIVERY_ATTEMPTS: u32 = 4;
+/// Maximum retries for database errors before giving up. Mirrors `constants.py`.
+pub const MAX_DB_RETRIES: u32 = 200;
+/// Cap for queue retry backoff sleep (seconds). Mirrors encoder.py `_MAX_RETRY_SLEEP_SECONDS`.
+pub const MAX_RETRY_SLEEP_SECONDS: f64 = 20.0;
+/// How many queue rows the standalone poller reads per iteration.
+pub const QUEUE_POLLER_BATCH_SIZE: u64 = 32;
+/// Idle sleep when the standalone poller finds nothing eligible (ms).
+pub const QUEUE_POLLER_IDLE_MS: u64 = 1000;
+
 /// Product line label for `/v1/version` and `/v1/system/info` (formerly `AMGIX_VARIANT`).
 pub const AMGIX_VARIANT: &str = "Amgix-Now";
 

@@ -227,7 +227,7 @@ pub struct CollectionStatsResponse {
     pub queue: QueueInfo,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum QueuedDocumentStatus {
     Queued,
@@ -236,7 +236,7 @@ pub enum QueuedDocumentStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueOperationType {
     Upsert,
@@ -258,10 +258,30 @@ pub struct DocumentStatus {
     pub try_count: Option<u32>,
 }
 
-/// Mirrors `document.py` `DocumentStatusResponse`. In **amgix-now** only `indexed` appears (no queue).
+/// Mirrors `document.py` `DocumentStatusResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentStatusResponse {
     pub statuses: Vec<DocumentStatus>,
+}
+
+/// Mirrors `document.py` `QueueDocument` — payload stored in `amgix_sys_queue`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueDocument {
+    pub queue_id: String,
+    pub collection_name: String,
+    pub collection_id: String,
+    pub doc_id: String,
+    pub op_type: QueueOperationType,
+    pub doc_timestamp: DateTime<Utc>,
+    pub status: QueuedDocumentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<Document>,
+    pub created_at: DateTime<Utc>,
+    pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub try_count: u32,
 }
 
 // ---------------------------------------------------------------------------

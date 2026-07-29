@@ -17,6 +17,7 @@ mod search_join;
 mod search_facet;
 mod validation;
 mod vectors;
+mod queue_poller;
 
 use std::convert::Infallible;
 use std::io::Write;
@@ -48,7 +49,7 @@ use common::{
     AMGIX_VARIANT, AMGIX_VERSION, VectorType, DATABASE_KIND, MAX_DOCUMENT_FETCH_PAGE_SIZE,
 };
 use encoder::{
-    document_delete_sync, document_upsert_bulk, document_upsert_sync, validate_metadata_filter,
+    document_delete_sync, document_upsert_sync, validate_metadata_filter,
     validate_models, CollectionConfigCache, LockBackend, NamedLocks, SearchError, SearchIngress,
     StatsUpdateBatcher, UpsertIngress, UpsertSyncError,
 };
@@ -56,8 +57,8 @@ use datetime_parse::parse_utc_datetime;
 use models::{
     BulkUploadRequest, CollectionConfig, CollectionConfigInternal,
     CollectionExistsResponse, CollectionStatsResponse, Document, DocumentFetchRequest,
-    DocumentStatus, DocumentStatusResponse, OkResponse, QueueInfo,
-    QueuedDocumentStatus, ReadyResponse, SearchQuery,
+    DocumentStatusResponse, OkResponse, QueueInfo, QueueOperationType,
+    ReadyResponse, SearchQuery,
     SystemInfoResponse, VectorConfigInternal, VersionResponse,
 };
 use qdrant::{DbError, QdrantDb};
@@ -228,12 +229,77 @@ async fn not_implemented_amgix_now_metrics() -> impl IntoResponse {
     api_error(StatusCode::NOT_IMPLEMENTED, AMGIX_NOW_NOT_IMPLEMENTED_MSG)
 }
 
-/// `501` stubs for **`.../queue/...`** collection routes present in Python; validates `{collection_name}` like other handlers.
-async fn not_implemented_amgix_now_collection_queue(Path(collection_name): Path<String>) -> impl IntoResponse {
-    match validate_collection_name(&collection_name) {
-        Err(e) => validation_error(e).into_response(),
-        Ok(()) => api_error(StatusCode::NOT_IMPLEMENTED, AMGIX_NOW_NOT_IMPLEMENTED_MSG).into_response(),
+/// Enqueue documents and optionally publish to RabbitMQ (cluster). Mirrors `upload_documents_to_queue`.
+async fn upload_documents_to_queue(
+    app: &AppState,
+    collection_name: &str,
+    collection_id: &str,
+    documents: Vec<Document>,
+    op_type: QueueOperationType,
+    request_timestamp: Option<chrono::DateTime<Utc>>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let queue_ids = app
+        .db
+        .add_to_queue(
+            collection_name,
+            collection_id,
+            &documents,
+            op_type,
+            request_timestamp,
+        )
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to add documents to queue: {e}"),
+            )
+        })?;
+
+    if let Some(ref bunny) = app.bunny {
+        let talk_result = if documents.len() > 1 {
+            bunny
+                .talk(
+                    "documents-bulk",
+                    json!({ "queue_ids": queue_ids }),
+                    true,
+                    Some(json!({
+                        "collection": collection_name,
+                        "collection_id": collection_id,
+                        "queue_ids": queue_ids,
+                    })),
+                )
+                .await
+        } else {
+            bunny
+                .talk(
+                    "documents",
+                    json!({
+                        "queue_id": queue_ids[0],
+                        "collection_name": collection_name,
+                    }),
+                    true,
+                    Some(json!({
+                        "collection": collection_name,
+                        "collection_id": collection_id,
+                        "document_id": documents[0].id,
+                        "queue_id": queue_ids[0],
+                    })),
+                )
+                .await
+        };
+        if let Err(e) = talk_result {
+            tracing::error!("Failed to publish event to internal queue for queue_ids {queue_ids:?}: {e}");
+            if let Err(e2) = app.db.delete_from_queue(&queue_ids).await {
+                tracing::error!("Failed to delete records from queue: {e2}");
+            }
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to publish event to internal queue: {e}"),
+            ));
+        }
     }
+
+    Ok(())
 }
 
 /// Axum middleware — mirrors `ApiMetricsMiddleware` + `record_api_http_request` from `api_metrics.py`.
@@ -587,7 +653,6 @@ async fn collection_exists(
 }
 
 /// `GET /v1/collections/{collection_name}/stats` — mirrors Python `get_collection_stats`.
-/// `amgix-now` has no queue; `queue` is always all zeros.
 async fn get_collection_stats(
     State(app): State<AppState>,
     Path(collection_name): Path<String>,
@@ -618,10 +683,87 @@ async fn get_collection_stats(
         )
     })?;
 
+    let queue = app
+        .db
+        .get_queue_info(&real_collection_name)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get queue info: {e}"),
+            )
+        })?;
+
     Ok(Json(CollectionStatsResponse {
         doc_count: doc_count as i64,
-        queue: QueueInfo::empty(),
+        queue,
     }))
+}
+
+async fn get_queue_info(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+) -> Result<Json<QueueInfo>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    let real_collection_name = get_real_collection_name(&collection_name);
+    match app.db.get_collection_info_internal(&real_collection_name).await {
+        Ok(_) => {}
+        Err(DbError::NotFound(_)) => {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to check collection: {e}"),
+            ));
+        }
+    }
+    app.db
+        .get_queue_info(&real_collection_name)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get queue info: {e}"),
+            )
+        })
+}
+
+async fn delete_collection_queue(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    let real_collection_name = get_real_collection_name(&collection_name);
+    match app.db.get_collection_info_internal(&real_collection_name).await {
+        Ok(_) => {}
+        Err(DbError::NotFound(_)) => {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ));
+        }
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to check collection: {e}"),
+            ));
+        }
+    }
+    app.db
+        .delete_from_queue_by_collection(&real_collection_name)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to clear queue: {e}"),
+            )
+        })?;
+    Ok(Json(OkResponse::ok()))
 }
 
 /// `POST /v1/collections/{collection_name}/empty` — mirrors Python `empty_collection`.
@@ -666,16 +808,62 @@ async fn upsert_document(
         })?;
     validate_document_vectors(&collection_config, &document)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.0))?;
+    upload_documents_to_queue(
+        &app,
+        &real_collection_name,
+        &collection_config.collection_id,
+        vec![document],
+        QueueOperationType::Upsert,
+        None,
+    )
+    .await?;
+    Ok(Json(OkResponse::ok()))
+}
+
+async fn upsert_document_sync(
+    State(app): State<AppState>,
+    Path(collection_name): Path<String>,
+    payload: Result<Json<Document>, JsonRejection>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    let Json(mut document) = payload.map_err(|e| json_rejection_response(e))?;
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    normalize_document_python(&mut document);
+    validate_document(&document).map_err(validation_error)?;
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = app
+        .db
+        .get_collection_info_internal(&real_collection_name)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(_) => api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get collection config: {e}"),
+            ),
+        })?;
+    validate_document_vectors(&collection_config, &document)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.0))?;
     match document_upsert_sync(&app.upsert_ingress, &real_collection_name, document).await {
         Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
+        Err(UpsertSyncError::Validation(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
         Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
+        Err(UpsertSyncError::QueueCollectionMismatch(m)) => {
+            Err(api_error(StatusCode::BAD_REQUEST, m))
+        }
         Err(UpsertSyncError::IngressQueueFull(m)) => {
             Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
         }
         Err(UpsertSyncError::IngressWorkerExited(m)) => {
             Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
         }
+        Err(UpsertSyncError::QueueEntryGone) => Err(api_error(
+            StatusCode::CONFLICT,
+            "Queue entry already removed".to_string(),
+        )),
         Err(UpsertSyncError::Db(e)) => {
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
@@ -713,26 +901,16 @@ async fn upsert_documents_bulk(
             )
         })?;
     }
-    match document_upsert_bulk(
-        &app.upsert_ingress,
+    upload_documents_to_queue(
+        &app,
         &real_collection_name,
+        &collection_config.collection_id,
         request.documents,
+        QueueOperationType::Upsert,
+        None,
     )
-    .await
-    {
-        Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
-        Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
-        Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
-        Err(UpsertSyncError::IngressQueueFull(m)) => {
-            Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
-        }
-        Err(UpsertSyncError::IngressWorkerExited(m)) => {
-            Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
-        }
-        Err(UpsertSyncError::Db(e)) => {
-            Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
-        }
-    }
+    .await?;
+    Ok(Json(OkResponse::ok()))
 }
 
 /// `GET /v1/collections/{collection_name}/documents/export` — mirrors Python `export_documents`.
@@ -923,16 +1101,16 @@ async fn get_document(
 }
 
 /// `GET /v1/collections/{collection_name}/documents/{document_id}/status` — mirrors Python
-/// `get_document_status` / `get_queue_statuses`. No queue in **amgix-now**; only `indexed` when present.
+/// `get_document_status` / `get_queue_statuses`.
 async fn get_document_status(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
 ) -> Result<Json<DocumentStatusResponse>, (StatusCode, Json<Value>)> {
     validate_collection_name(&collection_name).map_err(validation_error)?;
     let real_collection_name = get_real_collection_name(&collection_name);
-    let rows = app
+    let response = app
         .db
-        .get_documents(&real_collection_name, &[document_id.as_str()], true, false, None)
+        .get_queue_statuses(&real_collection_name, &document_id)
         .await
         .map_err(|e| match e {
             DbError::Config(m) => api_error(StatusCode::BAD_REQUEST, m),
@@ -942,31 +1120,72 @@ async fn get_document_status(
             ),
         })?;
 
-    let doc_with = rows.into_iter().next().flatten();
-    let statuses = if let Some(doc) = doc_with {
-        vec![DocumentStatus {
-            status: QueuedDocumentStatus::Indexed,
-            op_type: None,
-            info: None,
-            timestamp: doc.timestamp,
-            queue_id: None,
-            try_count: None,
-        }]
-    } else {
-        vec![]
-    };
-
-    if statuses.is_empty() {
+    if response.statuses.is_empty() {
         return Err(api_error(
             StatusCode::NOT_FOUND,
             format!("Document {document_id} not found in collection {collection_name}"),
         ));
     }
 
-    Ok(Json(DocumentStatusResponse { statuses }))
+    Ok(Json(response))
 }
 
 async fn delete_document(
+    State(app): State<AppState>,
+    Path((collection_name, document_id)): Path<(String, String)>,
+    Query(query): Query<DeleteDocumentQuery>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<Value>)> {
+    validate_collection_name(&collection_name).map_err(validation_error)?;
+    let request_timestamp = parse_utc_datetime(&query.request_timestamp).map_err(|_| {
+        query_validation_error(
+            "request_timestamp",
+            format!(
+                "'request_timestamp' must include a UTC timezone (e.g. 2024-01-01T00:00:00Z). Got {}",
+                query.request_timestamp
+            ),
+        )
+    })?;
+    let real_collection_name = get_real_collection_name(&collection_name);
+    let collection_config = app
+        .db
+        .get_collection_info_internal(&real_collection_name)
+        .await
+        .map_err(|e| match e {
+            DbError::NotFound(_) => api_error(
+                StatusCode::NOT_FOUND,
+                format!("Collection '{collection_name}' not found"),
+            ),
+            e => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get collection config: {e}"),
+            ),
+        })?;
+    let document = Document {
+        id: document_id,
+        timestamp: request_timestamp,
+        tags: None,
+        name: Some("__delete__".into()),
+        description: None,
+        content: None,
+        metadata: None,
+        custom_vectors: None,
+        joined: None,
+        vectors: None,
+        token_lengths: Default::default(),
+    };
+    upload_documents_to_queue(
+        &app,
+        &real_collection_name,
+        &collection_config.collection_id,
+        vec![document],
+        QueueOperationType::Delete,
+        Some(request_timestamp),
+    )
+    .await?;
+    Ok(Json(OkResponse::ok()))
+}
+
+async fn delete_document_sync(
     State(app): State<AppState>,
     Path((collection_name, document_id)): Path<(String, String)>,
     Query(query): Query<DeleteDocumentQuery>,
@@ -990,18 +1209,27 @@ async fn delete_document(
         &real_collection_name,
         &document_id,
         request_timestamp,
+        None,
     )
     .await
     {
         Ok(skipped) => Ok(Json(OkResponse::ok_with_skipped(skipped))),
         Err(UpsertSyncError::NotFound(m)) => Err(api_error(StatusCode::NOT_FOUND, m)),
+        Err(UpsertSyncError::Validation(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
         Err(UpsertSyncError::Vectorization(m)) => Err(api_error(StatusCode::BAD_REQUEST, m)),
+        Err(UpsertSyncError::QueueCollectionMismatch(m)) => {
+            Err(api_error(StatusCode::BAD_REQUEST, m))
+        }
         Err(UpsertSyncError::IngressQueueFull(m)) => {
             Err(api_error(StatusCode::TOO_MANY_REQUESTS, m))
         }
         Err(UpsertSyncError::IngressWorkerExited(m)) => {
             Err(api_error(StatusCode::SERVICE_UNAVAILABLE, m))
         }
+        Err(UpsertSyncError::QueueEntryGone) => Err(api_error(
+            StatusCode::CONFLICT,
+            "Queue entry already removed".to_string(),
+        )),
         Err(UpsertSyncError::Db(e)) => {
             Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {e}")))
         }
@@ -1251,16 +1479,6 @@ fn amgix_now_listen_addr_from_env() -> String {
     std::env::var("AMGIX_NOW_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8235".into())
 }
 
-/// `AMGIX_NOW_SYNC_DB_WRITES`: `true` / `1` / `yes` (case-insensitive) → Qdrant `wait=true` on document upserts and deletes.
-fn amgix_now_sync_db_writes_from_env() -> bool {
-    std::env::var("AMGIX_NOW_SYNC_DB_WRITES").map_or(false, |s| {
-        matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes"
-        )
-    })
-}
-
 #[tokio::main]
 async fn main() {
     platform::init();
@@ -1287,8 +1505,8 @@ async fn main() {
         None
     };
 
-    // In cluster mode distributed locks require writes to be visible immediately.
-    let sync_db_writes = bunny.is_some() || amgix_now_sync_db_writes_from_env();
+    // Always wait on Qdrant writes so reads/queue drains see committed points.
+    let sync_db_writes = true;
 
     let lock_client = bunny
         .as_ref()
@@ -1416,20 +1634,31 @@ async fn main() {
     auth_config.log_startup();
 
     let state = AppState {
-        db,
+        db: Arc::clone(&db),
         qdrant_version,
         amgix_version,
         amgix_variant,
         amgix_version_display,
         collection_cache,
-        stats_batcher,
-        upsert_ingress,
+        stats_batcher: stats_batcher.clone(),
+        upsert_ingress: upsert_ingress.clone(),
         search_ingress,
-        doc_locks,
+        doc_locks: doc_locks.clone(),
         bunny: bunny.clone(),
-        metrics: metrics_collector,
+        metrics: metrics_collector.clone(),
         auth: auth_config,
     };
+
+    let mut queue_poller_shutdown = None;
+    if bunny.is_none() {
+        queue_poller_shutdown = Some(queue_poller::spawn_queue_poller(
+            Arc::clone(&db),
+            upsert_ingress,
+            stats_batcher,
+            doc_locks,
+            metrics_collector,
+        ));
+    }
 
     let app = Router::new()
         .route("/v1/version", get(version_endpoint))
@@ -1455,11 +1684,11 @@ async fn main() {
         )
         .route(
             "/v1/collections/{collection_name}/queue/info",
-            get(not_implemented_amgix_now_collection_queue),
+            get(get_queue_info),
         )
         .route(
             "/v1/collections/{collection_name}/queue",
-            delete(not_implemented_amgix_now_collection_queue),
+            delete(delete_collection_queue),
         )
         .route(
             "/v1/collections/{collection_name}/empty",
@@ -1471,7 +1700,7 @@ async fn main() {
         )
         .route(
             "/v1/collections/{collection_name}/documents/sync",
-            post(upsert_document),
+            post(upsert_document_sync),
         )
         .route(
             "/v1/collections/{collection_name}/documents/bulk",
@@ -1483,7 +1712,7 @@ async fn main() {
         )
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}/sync",
-            delete(delete_document),
+            delete(delete_document_sync),
         )
         .route(
             "/v1/collections/{collection_name}/documents/{document_id}/status",
@@ -1518,6 +1747,11 @@ async fn main() {
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await;
+
+    // Stop claiming new queue work and finish the current batch before closing upsert ingress.
+    if let Some(s) = queue_poller_shutdown {
+        s.shutdown_and_wait().await;
+    }
 
     upsert_shutdown.shutdown_and_wait().await;
 

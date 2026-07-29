@@ -572,11 +572,18 @@ async fn flush_stats_job_batch(
 pub enum UpsertSyncError {
     NotFound(String),
     Db(DbError),
+    /// Permanent document/metadata validation failure — queue rows fail immediately.
+    Validation(String),
     Vectorization(String),
+    /// Queue entry's `collection_id` no longer matches the live collection (recreated).
+    QueueCollectionMismatch(String),
     /// Bounded ingress channel has no buffer space (`try_send`) — clients should retry with backoff.
     IngressQueueFull(String),
     /// Reply channel dropped (typically ingress worker exited).
     IngressWorkerExited(String),
+    /// Queue row was already gone under the doc lock (e.g. concurrent delete). Not a failure —
+    /// poller must not ack/delete (row is already absent, or must remain for a later retry).
+    QueueEntryGone,
 }
 
 impl std::fmt::Display for UpsertSyncError {
@@ -584,17 +591,36 @@ impl std::fmt::Display for UpsertSyncError {
         match self {
             UpsertSyncError::NotFound(m) => write!(f, "{m}"),
             UpsertSyncError::Db(e) => write!(f, "{e}"),
+            UpsertSyncError::Validation(m) => write!(f, "{m}"),
             UpsertSyncError::Vectorization(m) => write!(f, "{m}"),
+            UpsertSyncError::QueueCollectionMismatch(m) => write!(f, "{m}"),
             UpsertSyncError::IngressQueueFull(m) => write!(f, "{m}"),
             UpsertSyncError::IngressWorkerExited(m) => write!(f, "{m}"),
+            UpsertSyncError::QueueEntryGone => write!(f, "queue entry already removed"),
         }
     }
+}
+
+/// Outcome of [`document_upsert_bulk_internal`].
+#[derive(Debug, Default)]
+pub(crate) struct BulkUpsertOutcome {
+    pub skipped: Vec<String>,
+    /// Doc ids whose queue rows were missing under lock — reply [`UpsertSyncError::QueueEntryGone`].
+    pub drained: Vec<String>,
 }
 
 impl From<DbError> for UpsertSyncError {
     fn from(e: DbError) -> Self {
         UpsertSyncError::Db(e)
     }
+}
+
+/// When set on a singles ingress job, re-verify the queue row under the doc lock and
+/// check `collection_id` before applying (mirrors amgix-server bulk upsert).
+#[derive(Debug, Clone)]
+pub struct QueueVerify {
+    pub queue_id: String,
+    pub collection_id: String,
 }
 
 struct BulkIngressJob {
@@ -607,6 +633,7 @@ struct SingleIngressJob {
     collection_name: String,
     document: Document,
     reply: Option<oneshot::Sender<Result<Vec<String>, UpsertSyncError>>>,
+    queue: Option<QueueVerify>,
 }
 
 fn send_single_ingress_reply(
@@ -652,9 +679,14 @@ fn replicate_upsert_sync_err(src: &UpsertSyncError) -> UpsertSyncError {
     match src {
         UpsertSyncError::NotFound(s) => UpsertSyncError::NotFound(s.clone()),
         UpsertSyncError::Db(e) => UpsertSyncError::Db(DbError::Config(e.to_string())),
+        UpsertSyncError::Validation(s) => UpsertSyncError::Validation(s.clone()),
         UpsertSyncError::Vectorization(s) => UpsertSyncError::Vectorization(s.clone()),
+        UpsertSyncError::QueueCollectionMismatch(s) => {
+            UpsertSyncError::QueueCollectionMismatch(s.clone())
+        }
         UpsertSyncError::IngressQueueFull(s) => UpsertSyncError::IngressQueueFull(s.clone()),
         UpsertSyncError::IngressWorkerExited(s) => UpsertSyncError::IngressWorkerExited(s.clone()),
+        UpsertSyncError::QueueEntryGone => UpsertSyncError::QueueEntryGone,
     }
 }
 
@@ -719,6 +751,7 @@ impl UpsertIngress {
                                             metrics.clone(),
                                             &collection_name,
                                             chunk,
+                                            &[],
                                         )
                                         .await
                                     });
@@ -728,7 +761,9 @@ impl UpsertIngress {
                                 let mut first_err: Option<UpsertSyncError> = None;
                                 while let Some(res) = chunk_set.join_next().await {
                                     match res {
-                                        Ok(Ok(skipped)) => all_skipped.extend(skipped),
+                                        Ok(Ok(outcome)) => {
+                                            all_skipped.extend(outcome.skipped);
+                                        }
                                         Ok(Err(e)) => {
                                             if first_err.is_none() {
                                                 first_err = Some(e);
@@ -1217,10 +1252,16 @@ async fn respond_single_microbatch_for_collection(
     for &wi in winner_idx_for_id.values() {
         uniq_winner_idx.insert(wi);
     }
-    let merged: Vec<Document> = uniq_winner_idx
-        .into_iter()
-        .map(|i| slots[i].document.clone())
-        .collect();
+    let mut merged: Vec<Document> = Vec::with_capacity(uniq_winner_idx.len());
+    let mut queue_verifies: Vec<Option<QueueVerify>> = Vec::with_capacity(uniq_winner_idx.len());
+    // Stable order: walk slots so parallel arrays stay aligned with winners.
+    for i in 0..n {
+        if !uniq_winner_idx.contains(&i) {
+            continue;
+        }
+        merged.push(slots[i].document.clone());
+        queue_verifies.push(slots[i].queue.clone());
+    }
 
     if merged.is_empty() {
         return;
@@ -1236,6 +1277,7 @@ async fn respond_single_microbatch_for_collection(
         metrics.clone(),
         collection_name,
         merged,
+        &queue_verifies,
     )
     .await;
     if let Some(ref m) = metrics {
@@ -1246,8 +1288,9 @@ async fn respond_single_microbatch_for_collection(
         }
     }
     match result {
-        Ok(skipped) => {
-            let skipped_set: HashSet<String> = skipped.into_iter().collect();
+        Ok(outcome) => {
+            let skipped_set: HashSet<String> = outcome.skipped.into_iter().collect();
+            let drained_set: HashSet<String> = outcome.drained.into_iter().collect();
             for idx in 0..n {
                 if answered[idx] {
                     continue;
@@ -1259,7 +1302,9 @@ async fn respond_single_microbatch_for_collection(
                 if win != idx {
                     continue;
                 }
-                if skipped_set.contains(&doc_id) {
+                if drained_set.contains(&doc_id) {
+                    send_single_ingress_reply(&mut slots[idx], Err(UpsertSyncError::QueueEntryGone));
+                } else if skipped_set.contains(&doc_id) {
                     send_single_ingress_reply(&mut slots[idx], Ok(vec![doc_id]));
                 } else {
                     send_single_ingress_reply(&mut slots[idx], Ok(vec![]));
@@ -1297,11 +1342,40 @@ pub async fn document_upsert_sync(
             collection_name: collection_name.to_string(),
             document,
             reply: Some(reply_tx),
+            queue: None,
         })
         .map_err(|_| {
             UpsertSyncError::IngressQueueFull(format!(
                 "Single-document ingress queue full (capacity {SINGLE_UPSERT_QUEUE_CAPACITY}); retry later.",
             ))
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| UpsertSyncError::IngressWorkerExited("Single-document ingress worker stopped.".into()))?
+}
+
+/// Like [`document_upsert_sync`], but **blocks** when the singles ingress is full.
+///
+/// Used by the standalone queue poller — internal backpressure must wait, not fail/requeue.
+/// When `queue` is set, the row is re-verified under the doc lock and `collection_id` is checked.
+pub async fn document_upsert_blocking(
+    ingress: &UpsertIngress,
+    collection_name: &str,
+    document: Document,
+    queue: Option<QueueVerify>,
+) -> Result<Vec<String>, UpsertSyncError> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ingress
+        .singles_tx
+        .send(SingleIngressJob {
+            collection_name: collection_name.to_string(),
+            document,
+            reply: Some(reply_tx),
+            queue,
+        })
+        .await
+        .map_err(|_| {
+            UpsertSyncError::IngressWorkerExited("Single-document ingress worker stopped.".into())
         })?;
     reply_rx
         .await
@@ -1343,7 +1417,13 @@ pub async fn document_upsert_bulk(
 // document_upsert_bulk_internal
 // ---------------------------------------------------------------------------
 
-/// Returns `Ok(skipped_ids)` — IDs of documents that were stale and not indexed.
+/// Returns `Ok(BulkUpsertOutcome)` — `skipped` are stale IDs; `drained` are IDs whose queue
+/// rows were gone under lock (callers must treat those as [`UpsertSyncError::QueueEntryGone`],
+/// not as successful apply).
+///
+/// When `queue_verifies` is non-empty, entries with `Some` are checked for `collection_id`
+/// match before locks, then re-fetched under the doc lock so concurrent deletes cannot
+/// resurrect drained queue rows.
 pub(crate) async fn document_upsert_bulk_internal(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
@@ -1352,12 +1432,13 @@ pub(crate) async fn document_upsert_bulk_internal(
     metrics: Option<Arc<MetricsCollector>>,
     collection_name: &str,
     documents: Vec<Document>,
-) -> Result<Vec<String>, UpsertSyncError> {
+    queue_verifies: &[Option<QueueVerify>],
+) -> Result<BulkUpsertOutcome, UpsertSyncError> {
     if documents.is_empty() {
-        return Ok(vec![]);
+        return Ok(BulkUpsertOutcome::default());
     }
 
-    let collection_config = match get_collection_info_for_write(db, cache, collection_name).await {
+    let mut collection_config = match get_collection_info_for_write(db, cache, collection_name).await {
         Ok(c) => c,
         Err(DbError::NotFound(_)) => {
             return Err(UpsertSyncError::NotFound(
@@ -1367,16 +1448,38 @@ pub(crate) async fn document_upsert_bulk_internal(
         Err(e) => return Err(UpsertSyncError::Db(e)),
     };
 
+    if let Some(expected_cid) = queue_verifies.iter().find_map(|q| q.as_ref()) {
+        if collection_config.collection_id != expected_cid.collection_id {
+            cache.invalidate(collection_name).await;
+            collection_config = match get_collection_info_for_write(db, cache, collection_name).await
+            {
+                Ok(c) => c,
+                Err(DbError::NotFound(_)) => {
+                    return Err(UpsertSyncError::NotFound(
+                        "Collection configuration not found".to_string(),
+                    ))
+                }
+                Err(e) => return Err(UpsertSyncError::Db(e)),
+            };
+            if collection_config.collection_id != expected_cid.collection_id {
+                return Err(UpsertSyncError::QueueCollectionMismatch(format!(
+                    "Collection configuration changed during processing. Documents were queued for collection_id {}, \
+                     but current collection has collection_id {}. Please re-upload the documents.",
+                    expected_cid.collection_id, collection_config.collection_id
+                )));
+            }
+        }
+    }
+
     // Normalize metadata first (unwrap legacy {value,type} form to flat values),
     // then validate types against collection indexes.
     let mut documents = documents;
     for doc in &mut documents {
-        normalize_document_metadata_inplace(doc)
-            .map_err(UpsertSyncError::Vectorization)?;
+        normalize_document_metadata_inplace(doc).map_err(UpsertSyncError::Validation)?;
     }
     for doc in &documents {
         validate_metadata_types(&collection_config, doc)
-            .map_err(|e| UpsertSyncError::Vectorization(e.0))?;
+            .map_err(|e| UpsertSyncError::Validation(e.0))?;
     }
 
     // Acquire per-doc locks for all documents upfront (in stable order to avoid deadlock).
@@ -1392,6 +1495,45 @@ pub(crate) async fn document_upsert_bulk_internal(
         guards.push(guard);
     }
 
+    // Re-verify queue rows still exist under lock (concurrent delete may have drained them).
+    // Missing rows must NOT be reported as successful apply — poller would ack-delete them.
+    let mut skipped: Vec<String> = vec![];
+    let mut drained: Vec<String> = vec![];
+    if queue_verifies.iter().any(|q| q.is_some()) {
+        let qids: Vec<String> = queue_verifies
+            .iter()
+            .filter_map(|q| q.as_ref().map(|v| v.queue_id.clone()))
+            .collect();
+        let still = db.get_from_queue(&qids, true).await?;
+        let still_ids: HashSet<String> = still.into_iter().map(|q| q.queue_id).collect();
+        if still_ids.len() != qids.len() {
+            tracing::warn!(
+                requested = qids.len(),
+                found = still_ids.len(),
+                collection = %collection_name,
+                "Queue re-verify under lock: some entries missing"
+            );
+        }
+        let mut kept = Vec::with_capacity(documents.len());
+        for (i, doc) in documents.into_iter().enumerate() {
+            match queue_verifies.get(i).and_then(|q| q.as_ref()) {
+                Some(qv) if !still_ids.contains(&qv.queue_id) => {
+                    tracing::info!(
+                        queue_id = %qv.queue_id,
+                        doc_id = %doc.id,
+                        "Queue entry already removed (concurrent delete); not applying upsert"
+                    );
+                    drained.push(doc.id);
+                }
+                _ => kept.push(doc),
+            }
+        }
+        documents = kept;
+        if documents.is_empty() {
+            return Ok(BulkUpsertOutcome { skipped, drained });
+        }
+    }
+
     // Batch fetch existing documents.
     let all_ids: Vec<&str> = documents.iter().map(|d| d.id.as_str()).collect();
     let existing_results = db
@@ -1404,7 +1546,6 @@ pub(crate) async fn document_upsert_bulk_internal(
         .collect();
 
     // Partition into stale (skip), patch-only, and to-vectorize.
-    let mut skipped: Vec<String> = vec![];
     let mut to_vectorize: Vec<&Document> = vec![];
     let mut to_patch: Vec<&Document> = vec![];
     let mut is_new_flags: Vec<bool> = vec![];
@@ -1443,8 +1584,7 @@ pub(crate) async fn document_upsert_bulk_internal(
     if !to_patch.is_empty() {
         let mut patch_docs: Vec<Document> = to_patch.iter().map(|d| (*d).clone()).collect();
         for doc in &mut patch_docs {
-            normalize_document_metadata_inplace(doc)
-                .map_err(UpsertSyncError::Vectorization)?;
+            normalize_document_metadata_inplace(doc).map_err(UpsertSyncError::Validation)?;
         }
         db.patch_documents(collection_name, &patch_docs, collection_config.store_content)
             .await
@@ -1452,7 +1592,7 @@ pub(crate) async fn document_upsert_bulk_internal(
     }
 
     if to_vectorize.is_empty() {
-        return Ok(skipped);
+        return Ok(BulkUpsertOutcome { skipped, drained });
     }
 
     // Build avgdl_dict with defaults for custom-tokenization fields.
@@ -1469,8 +1609,7 @@ pub(crate) async fn document_upsert_bulk_internal(
 
     let mut docs_owned: Vec<Document> = to_vectorize.iter().map(|d| (*d).clone()).collect();
     for doc in &mut docs_owned {
-        normalize_document_metadata_inplace(doc)
-            .map_err(UpsertSyncError::Vectorization)?;
+        normalize_document_metadata_inplace(doc).map_err(UpsertSyncError::Validation)?;
     }
     let vectors_cfg = collection_config.vectors.clone();
 
@@ -1550,7 +1689,7 @@ pub(crate) async fn document_upsert_bulk_internal(
         stats_batcher.enqueue(collection_name, updates).await?;
     }
 
-    Ok(skipped)
+    Ok(BulkUpsertOutcome { skipped, drained })
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,6 +1699,9 @@ pub(crate) async fn document_upsert_bulk_internal(
 /// Deletes a document and updates collection stats with negative token lengths.
 /// Returns `Ok(skipped_ids)` — non-empty when the delete was stale and not applied.
 /// Missing documents return `Ok(vec![])` (idempotent success).
+///
+/// When `queue` is set, checks `collection_id` and re-verifies the queue row under the
+/// doc lock so a drained entry is not applied.
 pub async fn document_delete_sync(
     db: &QdrantDb,
     stats_batcher: &StatsUpdateBatcher,
@@ -1568,12 +1710,44 @@ pub async fn document_delete_sync(
     collection_name: &str,
     document_id: &str,
     request_timestamp: DateTime<Utc>,
+    queue: Option<&QueueVerify>,
 ) -> Result<Vec<String>, UpsertSyncError> {
+    if let Some(qv) = queue {
+        let config = match db.get_collection_info_internal(collection_name).await {
+            Ok(c) => c,
+            Err(DbError::NotFound(_)) => {
+                return Err(UpsertSyncError::NotFound(
+                    "Collection configuration not found".to_string(),
+                ))
+            }
+            Err(e) => return Err(UpsertSyncError::Db(e)),
+        };
+        if config.collection_id != qv.collection_id {
+            return Err(UpsertSyncError::QueueCollectionMismatch(format!(
+                "Collection configuration changed during processing. Documents were queued for collection_id {}, \
+                 but current collection has collection_id {}. Please re-upload the documents.",
+                qv.collection_id, config.collection_id
+            )));
+        }
+    }
+
     let t0 = std::time::Instant::now();
     let _doc_guard = doc_locks
         .lock_doc(collection_name, document_id)
         .await
         .map_err(|e| UpsertSyncError::Db(DbError::Config(e)))?;
+
+    if let Some(qv) = queue {
+        let still = db.get_from_queue(&[qv.queue_id.clone()], true).await?;
+        if still.is_empty() {
+            tracing::info!(
+                queue_id = %qv.queue_id,
+                doc_id = %document_id,
+                "Queue entry already removed; not applying delete"
+            );
+            return Err(UpsertSyncError::QueueEntryGone);
+        }
+    }
 
     let existing = db
         .get_documents(collection_name, &[document_id], true, false, None)
@@ -1595,6 +1769,13 @@ pub async fn document_delete_sync(
         Ok(()) => {}
         Err(DbError::NotFound(_)) => return Ok(vec![]),
         Err(e) => return Err(UpsertSyncError::Db(e)),
+    }
+
+    if let Err(e) = db
+        .delete_upserts_from_queue(collection_name, document_id, request_timestamp)
+        .await
+    {
+        return Err(UpsertSyncError::Db(e));
     }
 
     let mut updates: HashMap<String, TokenLengthUpdate> = HashMap::new();
