@@ -1715,7 +1715,8 @@ pub(crate) async fn document_upsert_bulk_internal(
 
 /// Deletes a document and updates collection stats with negative token lengths.
 /// Returns `Ok(skipped_ids)` — non-empty when the delete was stale and not applied.
-/// Missing documents return `Ok(vec![])` (idempotent success).
+/// Missing documents return `Ok(vec![])` (idempotent success) after cancelling any
+/// superseded pending upserts in the queue.
 ///
 /// When `queue` is set, checks `collection_id` and re-verifies the queue row under the
 /// doc lock so a drained entry is not applied.
@@ -1773,6 +1774,15 @@ pub async fn document_delete_sync(
         .next()
         .flatten();
 
+    // Always cancel superseded pending upserts under the lock — including when the live
+    // point is missing (async upsert may still be queued and would otherwise resurrect).
+    if let Err(e) = db
+        .delete_upserts_from_queue(collection_name, document_id, request_timestamp)
+        .await
+    {
+        return Err(UpsertSyncError::Db(e));
+    }
+
     let existing_doc = match existing {
         Some(d) => d,
         None => return Ok(vec![]),
@@ -1786,13 +1796,6 @@ pub async fn document_delete_sync(
         Ok(()) => {}
         Err(DbError::NotFound(_)) => return Ok(vec![]),
         Err(e) => return Err(UpsertSyncError::Db(e)),
-    }
-
-    if let Err(e) = db
-        .delete_upserts_from_queue(collection_name, document_id, request_timestamp)
-        .await
-    {
-        return Err(UpsertSyncError::Db(e));
     }
 
     let mut updates: HashMap<String, TokenLengthUpdate> = HashMap::new();
