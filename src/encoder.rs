@@ -728,7 +728,6 @@ impl UpsertIngress {
                             let doc_locks = doc_locks.clone();
                             let metrics = metrics.clone();
                             inflight.spawn(async move {
-                                let t0 = std::time::Instant::now();
                                 // Split into chunks and run each concurrently.
                                 let chunks: Vec<Vec<Document>> = documents
                                     .chunks(BULK_UPSERT_CHUNK_SIZE)
@@ -778,14 +777,7 @@ impl UpsertIngress {
                                     Some(e) => Err(e),
                                     None => Ok(all_skipped),
                                 };
-                                if let Some(m) = &metrics {
-                                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                    m.record(crate::metrics::keys::INDEX_BULK_BATCHES, &[], 1.0, None);
-                                    m.record(crate::metrics::keys::INDEX_BULK_JOB_MS, &[], elapsed_ms, Some(1));
-                                    if out.is_err() {
-                                        m.record(crate::metrics::keys::INDEX_BULK_FAILED, &[], 1.0, None);
-                                    }
-                                }
+                                // No INDEX_BULK_*: those keys mean Encoder async bulk drain.
                                 let _ = reply.send(out);
                             });
                         }
@@ -1268,6 +1260,7 @@ async fn respond_single_microbatch_for_collection(
     }
 
     let n_merged = merged.len();
+    let from_queue = queue_verifies.iter().any(|q| q.is_some());
     let t0 = std::time::Instant::now();
     let result = document_upsert_bulk_internal(
         db,
@@ -1280,11 +1273,19 @@ async fn respond_single_microbatch_for_collection(
         &queue_verifies,
     )
     .await;
-    if let Some(ref m) = metrics {
-        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        m.record(crate::metrics::keys::INDEX_QUEUE_JOB_MS, &[], elapsed_ms / n_merged as f64, Some(n_merged as i64));
-        if result.is_err() {
-            m.record(crate::metrics::keys::INDEX_QUEUE_FAILED, &[], 1.0, None);
+    // index_queue_* = async queue drain only (not sync ingress). Embeds still use `metrics`.
+    if from_queue {
+        if let Some(ref m) = metrics {
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            m.record(
+                crate::metrics::keys::INDEX_QUEUE_JOB_MS,
+                &[],
+                elapsed_ms / n_merged as f64,
+                Some(n_merged as i64),
+            );
+            if result.is_err() {
+                m.record(crate::metrics::keys::INDEX_QUEUE_FAILED, &[], 1.0, None);
+            }
         }
     }
     match result {
@@ -1424,6 +1425,9 @@ pub async fn document_upsert_bulk(
 /// When `queue_verifies` is non-empty, entries with `Some` are checked for `collection_id`
 /// match before locks, then re-fetched under the doc lock so concurrent deletes cannot
 /// resurrect drained queue rows.
+///
+/// `metrics` is always used for embed_* recording. `index_queue_*` counters are emitted only
+/// when at least one `queue_verifies` entry is `Some` (async queue drain), matching amgix-server.
 pub(crate) async fn document_upsert_bulk_internal(
     db: &QdrantDb,
     cache: &CollectionConfigCache,
@@ -1437,6 +1441,7 @@ pub(crate) async fn document_upsert_bulk_internal(
     if documents.is_empty() {
         return Ok(BulkUpsertOutcome::default());
     }
+    let record_index_queue = queue_verifies.iter().any(|q| q.is_some());
 
     let mut collection_config = match get_collection_info_for_write(db, cache, collection_name).await {
         Ok(c) => c,
@@ -1570,14 +1575,16 @@ pub(crate) async fn document_upsert_bulk_internal(
         }
     }
 
-    if !skipped.is_empty() {
-        if let Some(ref m) = metrics {
-            m.record(
-                crate::metrics::keys::INDEX_QUEUE_DOCS_SKIPPED_STALE,
-                &[],
-                skipped.len() as f64,
-                None,
-            );
+    if record_index_queue {
+        if !skipped.is_empty() {
+            if let Some(ref m) = metrics {
+                m.record(
+                    crate::metrics::keys::INDEX_QUEUE_DOCS_SKIPPED_STALE,
+                    &[],
+                    skipped.len() as f64,
+                    None,
+                );
+            }
         }
     }
 
@@ -1649,15 +1656,25 @@ pub(crate) async fn document_upsert_bulk_internal(
     let new_doc_count_batch = is_new_flags.iter().filter(|&&n| n).count() as i64;
     let update_doc_count_batch = is_new_flags.iter().filter(|&&n| !n).count() as i64;
 
-    if let Some(m) = metrics_for_post {
-        let n = docs_with_vectors.len() as f64;
-        if new_doc_count_batch > 0 {
-            m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_NEW, &[], new_doc_count_batch as f64, None);
+    if record_index_queue {
+        if let Some(m) = metrics_for_post {
+            if new_doc_count_batch > 0 {
+                m.record(
+                    crate::metrics::keys::INDEX_QUEUE_DOCS_NEW,
+                    &[],
+                    new_doc_count_batch as f64,
+                    None,
+                );
+            }
+            if update_doc_count_batch > 0 {
+                m.record(
+                    crate::metrics::keys::INDEX_QUEUE_DOCS_UPDATED,
+                    &[],
+                    update_doc_count_batch as f64,
+                    None,
+                );
+            }
         }
-        if update_doc_count_batch > 0 {
-            m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_UPDATED, &[], update_doc_count_batch as f64, None);
-        }
-        m.record(crate::metrics::keys::INDEX_BULK_BATCH_SIZE, &[], n, Some(1));
     }
 
     let mut updates: HashMap<String, TokenLengthUpdate> = HashMap::new();
@@ -1793,10 +1810,18 @@ pub async fn document_delete_sync(
         stats_batcher.enqueue(collection_name, updates).await?;
     }
 
-    if let Some(m) = metrics {
-        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_DELETED, &[], 1.0, None);
-        m.record(crate::metrics::keys::INDEX_QUEUE_DELETE_JOB_MS, &[], elapsed_ms, Some(1));
+    // index_queue_delete_* only for async queue deletes (poller), not sync HTTP delete.
+    if queue.is_some() {
+        if let Some(m) = metrics {
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            m.record(crate::metrics::keys::INDEX_QUEUE_DOCS_DELETED, &[], 1.0, None);
+            m.record(
+                crate::metrics::keys::INDEX_QUEUE_DELETE_JOB_MS,
+                &[],
+                elapsed_ms,
+                Some(1),
+            );
+        }
     }
 
     Ok(vec![])
