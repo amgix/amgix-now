@@ -600,6 +600,9 @@ pub struct Document {
     pub description: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    /// Hash of content for revectorization when store_content=false (server-managed).
+    #[serde(default)]
+    pub content_hash: Option<String>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(default)]

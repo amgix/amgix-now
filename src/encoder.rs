@@ -20,7 +20,7 @@ use crate::common::{
     DocumentField, VectorType, DEFAULT_SEARCH_LIMIT, DEFAULT_WMTR_TRIGRAM_WEIGHT,
     MAX_INDEXED_METADATA_VALUE_LENGTH,
 };
-use crate::functions::normalize_document_metadata_inplace;
+use crate::functions::{normalize_document_metadata_inplace, set_content_hash};
 use crate::models::{
     CollectionConfigInternal, Document, ModelValidationResponse,
     ModelValidationResult, SearchOutcome, SearchQuery, SearchQuerySettings, VectorConfigInternal,
@@ -38,15 +38,14 @@ fn needs_revectorization(
     if incoming.custom_vectors.is_some() {
         return true;
     }
-    let content_indexed = collection_config
-        .vectors
-        .iter()
-        .any(|v| v.index_fields.contains(&DocumentField::Content));
-    if content_indexed && !collection_config.store_content {
-        return true;
-    }
     for v in &collection_config.vectors {
         for field in &v.index_fields {
+            if *field == DocumentField::Content && !collection_config.store_content {
+                if incoming.content_hash != existing.content_hash {
+                    return true;
+                }
+                continue;
+            }
             let incoming_val: Option<&str> = match field {
                 DocumentField::Name => incoming.name.as_deref(),
                 DocumentField::Description => incoming.description.as_deref(),
@@ -1536,6 +1535,12 @@ pub(crate) async fn document_upsert_bulk_internal(
         documents = kept;
         if documents.is_empty() {
             return Ok(BulkUpsertOutcome { skipped, drained });
+        }
+    }
+
+    if !collection_config.store_content {
+        for doc in &mut documents {
+            set_content_hash(doc);
         }
     }
 

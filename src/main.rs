@@ -1167,6 +1167,7 @@ async fn delete_document(
         name: Some("__delete__".into()),
         description: None,
         content: None,
+        content_hash: None,
         metadata: None,
         custom_vectors: None,
         joined: None,

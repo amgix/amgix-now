@@ -1,8 +1,19 @@
 use std::collections::HashMap;
 
+use murmurhash3::murmurhash3_x64_128;
+
 use crate::common::MAX_METADATA_VALUE_LENGTH;
 use crate::models::{Document, SearchResult, VectorScore};
 use crate::qdrant::DbError;
+
+/// Set `document.content_hash` from UTF-8 content (mmh3 128-bit hex).
+/// Matches Python `format(mmh3.hash128(content.encode("utf-8"), signed=False), "032x")`.
+/// Overwrites any client-supplied value.
+pub fn set_content_hash(document: &mut Document) {
+    let content = document.content.as_deref().unwrap_or("");
+    let (h1, h2) = murmurhash3_x64_128(content.as_bytes(), 0);
+    document.content_hash = Some(format!("{h2:016x}{h1:016x}"));
+}
 
 // ---------------------------------------------------------------------------
 // Multi-retriever fusion — mirrors `amgix-server` `DatabaseBase`
@@ -323,5 +334,50 @@ pub fn split_first_underscore(s: &str) -> (&str, &str) {
     match s.find('_') {
         Some(pos) => (&s[..pos], &s[pos + 1..]),
         None => (s, ""),
+    }
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::set_content_hash;
+    use crate::models::Document;
+    use chrono::Utc;
+
+    fn doc_with_content(content: Option<&str>) -> Document {
+        Document {
+            id: "t".into(),
+            timestamp: Utc::now(),
+            tags: None,
+            name: None,
+            description: None,
+            content: content.map(str::to_owned),
+            content_hash: None,
+            metadata: None,
+            custom_vectors: None,
+            joined: None,
+            vectors: None,
+            token_lengths: Default::default(),
+        }
+    }
+
+    /// Values from Python: format(mmh3.hash128(s.encode("utf-8"), signed=False), "032x")
+    #[test]
+    fn matches_python_mmh3_hash128() {
+        let cases = [
+            ("", "00000000000000000000000000000000"),
+            ("hello world", "ab97467d60eb63b1533f6046eb7f610e"),
+            ("hello world!", "edf56b1420cea7e75aa80377fe21bbe3"),
+            ("café", "0acaaa4789576479a2e7c22a053364dd"),
+        ];
+        for (content, expected) in cases {
+            let mut d = doc_with_content(Some(content));
+            set_content_hash(&mut d);
+            assert_eq!(d.content_hash.as_deref(), Some(expected), "content={content:?}");
+        }
+        let mut none_doc = doc_with_content(None);
+        let mut empty_doc = doc_with_content(Some(""));
+        set_content_hash(&mut none_doc);
+        set_content_hash(&mut empty_doc);
+        assert_eq!(none_doc.content_hash, empty_doc.content_hash);
     }
 }

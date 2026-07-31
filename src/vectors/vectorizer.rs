@@ -519,6 +519,7 @@ impl Vectorizer {
                 name: doc.name.clone(),
                 description: doc.description.clone(),
                 content: doc.content.clone(),
+                content_hash: doc.content_hash.clone(),
                 metadata: doc.metadata.clone(),
                 custom_vectors: doc.custom_vectors.clone(),
                 joined: None,
