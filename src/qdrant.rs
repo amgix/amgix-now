@@ -1997,7 +1997,14 @@ fn fuse_arms(
     if query.settings.fusion_mode == "linear" {
         linear_weighted_score_fuse(scored_lists, arm_weights, limit, query.settings.score_threshold)
     } else {
-        rrf_fuse(id_lists, arm_weights, limit, query.settings.score_threshold, 2)
+        rrf_fuse(
+            id_lists,
+            arm_weights,
+            scored_lists,
+            limit,
+            query.settings.score_threshold,
+            2,
+        )
     }
 }
 

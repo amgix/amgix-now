@@ -22,9 +22,13 @@ pub fn set_content_hash(document: &mut Document) {
 
 /// Reciprocal rank fusion: `weight / (k + rank)` summed per id across arms.
 /// `rank` here is **1-based** (`rank_idx + 1` matches Python `enumerate(..., start=1)`).
+///
+/// Tie-break (does not affect returned score): higher unweighted raw-score sum,
+/// then lower fuse-key id. Mirrors `DatabaseBase.rrf_fuse`.
 pub fn rrf_fuse(
     id_lists: &[Vec<String>],
     weights: &[f64],
+    scored_lists: &[Vec<(String, f64)>],
     limit: usize,
     score_threshold: Option<f64>,
     k: usize,
@@ -36,17 +40,33 @@ pub fn rrf_fuse(
             *fused.entry(item_id.clone()).or_insert(0.0) += weight / (k + rank_idx + 1) as f64;
         }
     }
-    let mut items: Vec<(String, f64)> = fused
+    let mut raw_sums: HashMap<String, f64> = HashMap::new();
+    for arm in scored_lists {
+        for (item_id, score) in arm {
+            *raw_sums.entry(item_id.clone()).or_insert(0.0) += score;
+        }
+    }
+    let mut items: Vec<(String, f64, f64)> = fused
         .into_iter()
         .filter(|(_, s)| score_threshold.map_or(true, |t| *s >= t))
+        .map(|(id, rrf)| {
+            let raw = raw_sums.get(&id).copied().unwrap_or(0.0);
+            (id, rrf, raw)
+        })
         .collect();
-    items.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     items.truncate(limit);
-    items
+    items.into_iter().map(|(id, rrf, _)| (id, rrf)).collect()
 }
 
 /// Min-max normalizes each arm's scores, then sums `weight * normalized_score`.
 /// If min == max for an arm, normalized score is **1.0** for each id.
+/// Equal fused scores are broken by lower fuse-key id (determinism only).
 pub fn linear_weighted_score_fuse(
     scored_lists: &[Vec<(String, f64)>],
     weights: &[f64],
@@ -77,7 +97,11 @@ pub fn linear_weighted_score_fuse(
         .into_iter()
         .filter(|(_, s)| score_threshold.map_or(true, |t| *s >= t))
         .collect();
-    items.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     items.truncate(limit);
     items
 }
@@ -334,6 +358,41 @@ pub fn split_first_underscore(s: &str) -> (&str, &str) {
     match s.find('_') {
         Some(pos) => (&s[..pos], &s[pos + 1..]),
         None => (s, ""),
+    }
+}
+
+#[cfg(test)]
+mod rrf_fuse_tests {
+    use super::rrf_fuse;
+
+    #[test]
+    fn tie_breaks_on_raw_sum_then_id() {
+        // Same RRF: both appear at rank 1 in one arm and rank 2 in the other (k=2).
+        // weight/(2+1) + weight/(2+2) = 1/3 + 1/4 for both.
+        let id_lists = vec![
+            vec!["b".to_string(), "a".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+        ];
+        let weights = vec![1.0, 1.0];
+        let scored_lists = vec![
+            vec![("b".to_string(), 0.9), ("a".to_string(), 0.1)],
+            vec![("a".to_string(), 0.5), ("b".to_string(), 0.4)],
+        ];
+        // raw sums: a=0.6, b=1.3 → b wins on raw sum
+        let out = rrf_fuse(&id_lists, &weights, &scored_lists, 10, None, 2);
+        assert_eq!(out.len(), 2);
+        assert!((out[0].1 - out[1].1).abs() < 1e-12);
+        assert_eq!(out[0].0, "b");
+        assert_eq!(out[1].0, "a");
+
+        // Equal RRF and equal raw sums → lower id wins
+        let scored_equal = vec![
+            vec![("b".to_string(), 0.5), ("a".to_string(), 0.5)],
+            vec![("a".to_string(), 0.5), ("b".to_string(), 0.5)],
+        ];
+        let out2 = rrf_fuse(&id_lists, &weights, &scored_equal, 10, None, 2);
+        assert_eq!(out2[0].0, "a");
+        assert_eq!(out2[1].0, "b");
     }
 }
 
