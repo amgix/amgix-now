@@ -15,7 +15,7 @@ Visit our detailed [Amgix Now Benchmarks Series](https://amgix.io/blog/2026/05/2
 ## Get Started
 
 ```bash
-docker run -d -p 8235:8235 -v <path/on/host>:/data amgixio/amgix-now:0
+docker run -d -p 8235:8235 -v <path/on/host>:/data amgixio/amgix-now:1
 ```
 
 ## The Amgix Family
@@ -24,7 +24,7 @@ docker run -d -p 8235:8235 -v <path/on/host>:/data amgixio/amgix-now:0
 |---|:---:|:---:|:---:|
 | Hybrid search | engine * | system | system |
 | Single container | ✓ | ✓ | |
-| Async ingestion pipeline | | ✓ | ✓ |
+| Async ingestion pipeline | ✓ | ✓ | ✓ |
 | Dashboard & metrics | ✓ ** | ✓ | ✓ |
 | PostgreSQL/MariaDB | | ✓ | ✓ |
 | High availability | ✓ * | ✓ *** | ✓ |
@@ -39,6 +39,8 @@ docker run -d -p 8235:8235 -v <path/on/host>:/data amgixio/amgix-now:0
 - \*\*\* Multiple Amgix One instances can be deployed with external RabbitMQ and database instances, but it's awkward and better served by a full-scale Amgix cluster deployment
 
 Same REST API and storage format across all three.
+
+For more information on various deployment options see [Amgix Building Blocks](https://docs.amgix.io/amgix-building-blocks/)
 
 ## Documentation
 
