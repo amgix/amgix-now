@@ -1,7 +1,8 @@
 //! Encoder-layer logic — mirrors `src/encoder/encoder.py` (`update_collection_stats`,
-//! `validate_models`, `document_upsert_sync`). Ingress uses [`UpsertIngress`]: REST bulk hits the
-//! bulk channel (immediate internal); singles use a separate channel drained into micro-batches
-//! with bounded concurrency ([`SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX`] pipelines in flight).
+//! `validate_models`, `document_upsert_sync`). Ingress uses [`UpsertIngress`]: REST bulk and the
+//! standalone queue poller hit the bulk channel (queue poller waits when full and carries queue
+//! tickets); singles use a separate channel drained into micro-batches with bounded concurrency
+//! ([`SINGLE_UPSERT_CONCURRENT_MICROBATCH_MAX`] pipelines in flight).
 //! Search uses [`SearchIngress`]: a separate bounded queue and the same micro-batch / concurrent
 //! pipeline pattern ([`SEARCH_INGRESS_*`] constants).
 
@@ -600,9 +601,9 @@ impl std::fmt::Display for UpsertSyncError {
     }
 }
 
-/// Outcome of [`document_upsert_bulk_internal`].
+/// Outcome of [`document_upsert_bulk_internal`] / [`document_upsert_bulk_blocking`].
 #[derive(Debug, Default)]
-pub(crate) struct BulkUpsertOutcome {
+pub struct BulkUpsertOutcome {
     pub skipped: Vec<String>,
     /// Doc ids whose queue rows were missing under lock — reply [`UpsertSyncError::QueueEntryGone`].
     pub drained: Vec<String>,
@@ -625,7 +626,9 @@ pub struct QueueVerify {
 struct BulkIngressJob {
     collection_name: String,
     documents: Vec<Document>,
-    reply: oneshot::Sender<Result<Vec<String>, UpsertSyncError>>,
+    /// Parallel to `documents`. Empty / all-`None` for REST sync bulk (no queue rows).
+    queue_verifies: Vec<Option<QueueVerify>>,
+    reply: oneshot::Sender<Result<BulkUpsertOutcome, UpsertSyncError>>,
 }
 
 struct SingleIngressJob {
@@ -719,6 +722,7 @@ impl UpsertIngress {
                         Some(BulkIngressJob {
                             collection_name,
                             documents,
+                            queue_verifies,
                             reply,
                         }) => {
                             let db = Arc::clone(&db);
@@ -727,54 +731,95 @@ impl UpsertIngress {
                             let doc_locks = doc_locks.clone();
                             let metrics = metrics.clone();
                             inflight.spawn(async move {
-                                // Split into chunks and run each concurrently.
-                                let chunks: Vec<Vec<Document>> = documents
-                                    .chunks(BULK_UPSERT_CHUNK_SIZE)
-                                    .map(|c| c.to_vec())
-                                    .collect();
-                                let mut chunk_set = JoinSet::new();
-                                for chunk in chunks {
-                                    let db = Arc::clone(&db);
-                                    let cache = cache.clone();
-                                    let stats_batcher = stats_batcher.clone();
-                                    let doc_locks = doc_locks.clone();
-                                    let metrics = metrics.clone();
-                                    let collection_name = collection_name.clone();
-                                    chunk_set.spawn(async move {
-                                        document_upsert_bulk_internal(
-                                            &db,
-                                            &cache,
-                                            &stats_batcher,
-                                            &doc_locks,
-                                            metrics.clone(),
-                                            &collection_name,
-                                            chunk,
+                                let from_queue = queue_verifies.iter().any(|q| q.is_some());
+                                let out = if from_queue {
+                                    // Keep docs + queue tickets aligned in one call (no concurrent
+                                    // chunk split) so partial apply cannot race ack/delete.
+                                    let t0 = std::time::Instant::now();
+                                    let n = documents.len();
+                                    let result = document_upsert_bulk_internal(
+                                        &db,
+                                        &cache,
+                                        &stats_batcher,
+                                        &doc_locks,
+                                        metrics.clone(),
+                                        &collection_name,
+                                        documents,
+                                        &queue_verifies,
+                                    )
+                                    .await;
+                                    if let Some(ref m) = metrics {
+                                        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                        m.record(
+                                            crate::metrics::keys::INDEX_QUEUE_JOB_MS,
                                             &[],
-                                        )
-                                        .await
-                                    });
-                                }
-                                // Collect all chunk results; fail fast on first error.
-                                let mut all_skipped: Vec<String> = Vec::new();
-                                let mut first_err: Option<UpsertSyncError> = None;
-                                while let Some(res) = chunk_set.join_next().await {
-                                    match res {
-                                        Ok(Ok(outcome)) => {
-                                            all_skipped.extend(outcome.skipped);
-                                        }
-                                        Ok(Err(e)) => {
-                                            if first_err.is_none() {
-                                                first_err = Some(e);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("bulk chunk task panicked: {e}");
+                                            elapsed_ms / n.max(1) as f64,
+                                            Some(n as i64),
+                                        );
+                                        if result.is_err() {
+                                            m.record(
+                                                crate::metrics::keys::INDEX_QUEUE_FAILED,
+                                                &[],
+                                                1.0,
+                                                None,
+                                            );
                                         }
                                     }
-                                }
-                                let out = match first_err {
-                                    Some(e) => Err(e),
-                                    None => Ok(all_skipped),
+                                    result
+                                } else {
+                                    // REST sync bulk: split into chunks and run concurrently.
+                                    let chunks: Vec<Vec<Document>> = documents
+                                        .chunks(BULK_UPSERT_CHUNK_SIZE)
+                                        .map(|c| c.to_vec())
+                                        .collect();
+                                    let mut chunk_set = JoinSet::new();
+                                    for chunk in chunks {
+                                        let db = Arc::clone(&db);
+                                        let cache = cache.clone();
+                                        let stats_batcher = stats_batcher.clone();
+                                        let doc_locks = doc_locks.clone();
+                                        let metrics = metrics.clone();
+                                        let collection_name = collection_name.clone();
+                                        chunk_set.spawn(async move {
+                                            document_upsert_bulk_internal(
+                                                &db,
+                                                &cache,
+                                                &stats_batcher,
+                                                &doc_locks,
+                                                metrics.clone(),
+                                                &collection_name,
+                                                chunk,
+                                                &[],
+                                            )
+                                            .await
+                                        });
+                                    }
+                                    let mut all_skipped: Vec<String> = Vec::new();
+                                    let mut all_drained: Vec<String> = Vec::new();
+                                    let mut first_err: Option<UpsertSyncError> = None;
+                                    while let Some(res) = chunk_set.join_next().await {
+                                        match res {
+                                            Ok(Ok(outcome)) => {
+                                                all_skipped.extend(outcome.skipped);
+                                                all_drained.extend(outcome.drained);
+                                            }
+                                            Ok(Err(e)) => {
+                                                if first_err.is_none() {
+                                                    first_err = Some(e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("bulk chunk task panicked: {e}");
+                                            }
+                                        }
+                                    }
+                                    match first_err {
+                                        Some(e) => Err(e),
+                                        None => Ok(BulkUpsertOutcome {
+                                            skipped: all_skipped,
+                                            drained: all_drained,
+                                        }),
+                                    }
                                 };
                                 // No INDEX_BULK_*: those keys mean Encoder async bulk drain.
                                 let _ = reply.send(out);
@@ -1401,12 +1446,49 @@ pub async fn document_upsert_bulk(
         .try_send(BulkIngressJob {
             collection_name: collection_name.to_string(),
             documents,
+            queue_verifies: vec![],
             reply: reply_tx,
         })
         .map_err(|_| {
             UpsertSyncError::IngressQueueFull(format!(
                 "Bulk ingest queue full (capacity {BULK_UPSERT_QUEUE_CAPACITY}); retry later.",
             ))
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| UpsertSyncError::IngressWorkerExited("Bulk ingest worker stopped.".into()))?
+        .map(|outcome| outcome.skipped)
+}
+
+/// Like [`document_upsert_bulk`], but **blocks** when the bulk ingress is full and carries
+/// per-document queue tickets for re-verify under lock.
+///
+/// Used by the standalone queue poller.
+pub async fn document_upsert_bulk_blocking(
+    ingress: &UpsertIngress,
+    collection_name: &str,
+    documents: Vec<Document>,
+    queue_verifies: Vec<Option<QueueVerify>>,
+) -> Result<BulkUpsertOutcome, UpsertSyncError> {
+    if documents.is_empty() {
+        return Ok(BulkUpsertOutcome::default());
+    }
+    debug_assert!(
+        queue_verifies.is_empty() || queue_verifies.len() == documents.len(),
+        "queue_verifies must be empty or aligned with documents"
+    );
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ingress
+        .bulk_tx
+        .send(BulkIngressJob {
+            collection_name: collection_name.to_string(),
+            documents,
+            queue_verifies,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            UpsertSyncError::IngressWorkerExited("Bulk ingest worker stopped.".into())
         })?;
     reply_rx
         .await

@@ -66,7 +66,7 @@ pub const MAX_DB_RETRIES: u32 = 200;
 /// Cap for queue retry backoff sleep (seconds). Mirrors encoder.py `_MAX_RETRY_SLEEP_SECONDS`.
 pub const MAX_RETRY_SLEEP_SECONDS: f64 = 20.0;
 /// How many queue rows the standalone poller reads per iteration.
-pub const QUEUE_POLLER_BATCH_SIZE: u64 = 32;
+pub const QUEUE_POLLER_BATCH_SIZE: u64 = 96;
 /// Idle sleep when the standalone poller finds nothing eligible (ms).
 pub const QUEUE_POLLER_IDLE_MS: u64 = 1000;
 

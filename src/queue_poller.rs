@@ -1,9 +1,10 @@
 //! Standalone async ingestion poller — drains `amgix_sys_queue` when RabbitMQ is unset.
 //!
-//! Upserts go through [`document_upsert_blocking`] (singles MPSC, waits when full) so
-//! downstream micro-batching still applies and ingress backpressure does not fail queue rows.
-//! Multiple standalone instances against one Qdrant are unsupported.
+//! Upserts are grouped by collection and sent through the bulk ingress (waits when full) with
+//! per-document queue tickets so re-verify under lock still applies. Multiple standalone
+//! instances against one Qdrant are unsupported.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,11 +18,11 @@ use crate::common::{
     QUEUE_POLLER_IDLE_MS,
 };
 use crate::encoder::{
-    document_delete_sync, document_upsert_blocking, LockBackend, QueueVerify, StatsUpdateBatcher,
-    UpsertIngress, UpsertSyncError,
+    document_delete_sync, document_upsert_bulk_blocking, LockBackend, QueueVerify,
+    StatsUpdateBatcher, UpsertIngress, UpsertSyncError,
 };
 use crate::metrics::MetricsCollector;
-use crate::models::{QueueDocument, QueueOperationType, QueuedDocumentStatus};
+use crate::models::{Document, QueueDocument, QueueOperationType, QueuedDocumentStatus};
 use crate::qdrant::QdrantDb;
 
 fn retry_delay_secs(try_count: u32) -> f64 {
@@ -74,7 +75,7 @@ async fn mark_outcome(
 }
 
 /// Drop / await after HTTP serve returns and **before** upsert ingress shutdown so in-flight
-/// queue work can still complete through the singles MPSC.
+/// queue work can still complete through the bulk MPSC.
 pub struct QueuePollerShutdown {
     stop_tx: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
@@ -167,6 +168,12 @@ pub fn spawn_queue_poller(
     QueuePollerShutdown { stop_tx, join }
 }
 
+/// One claimed upsert ready to send on the bulk path.
+struct UpsertWork {
+    entry: QueueDocument,
+    document: Document,
+}
+
 async fn process_batch(
     db: &QdrantDb,
     upsert_ingress: &UpsertIngress,
@@ -184,8 +191,8 @@ async fn process_batch(
         }
     }
 
-    // Pipeline upserts through singles MPSC concurrently so micro-batching can form.
-    let mut handles = Vec::with_capacity(upserts.len());
+    // Group upserts by collection for the bulk ingress.
+    let mut by_collection: HashMap<String, Vec<UpsertWork>> = HashMap::new();
     for entry in upserts {
         let Some(document) = entry.document.clone() else {
             warn!(
@@ -200,41 +207,101 @@ async fn process_batch(
             .await?;
             continue;
         };
-        let collection_name = entry.collection_name.clone();
-        let ingress = upsert_ingress.clone();
-        let queue = Some(QueueVerify {
-            queue_id: entry.queue_id.clone(),
-            collection_id: entry.collection_id.clone(),
-        });
-        handles.push(tokio::spawn(async move {
-            let result =
-                document_upsert_blocking(&ingress, &collection_name, document, queue).await;
-            (entry, result)
-        }));
+        by_collection
+            .entry(entry.collection_name.clone())
+            .or_default()
+            .push(UpsertWork { entry, document });
     }
 
-    for handle in handles {
-        match handle.await {
-            Ok((entry, Ok(_))) => {
-                if let Err(e) = db.delete_from_queue(&[entry.queue_id.clone()]).await {
-                    error!("Failed to delete queue entry {}: {e}", entry.queue_id);
+    for (collection_name, mut works) in by_collection {
+        // Same doc_id twice in one claim: keep newest timestamp, ack-delete the rest as stale.
+        works.sort_by(|a, b| {
+            a.document
+                .id
+                .cmp(&b.document.id)
+                .then(a.document.timestamp.cmp(&b.document.timestamp))
+        });
+        let mut winners: Vec<UpsertWork> = Vec::with_capacity(works.len());
+        let mut superseded: Vec<QueueDocument> = Vec::new();
+        for work in works {
+            if let Some(prev) = winners.last_mut() {
+                if prev.document.id == work.document.id {
+                    // `works` sorted ascending by timestamp — newer replaces older.
+                    superseded.push(std::mem::replace(prev, work).entry);
+                    continue;
                 }
             }
-            Ok((entry, Err(UpsertSyncError::QueueEntryGone))) => {
-                // Row already drained (or re-verify miss). Do not ack-delete or mark_outcome —
-                // true drain means the point is gone; a false miss must remain for retry.
-                debug!(
-                    "Queue upsert {} entry gone under lock; leaving queue row alone",
+            winners.push(work);
+        }
+        for entry in superseded {
+            if let Err(e) = db.delete_from_queue(&[entry.queue_id.clone()]).await {
+                error!(
+                    "Failed to delete superseded queue entry {}: {e}",
                     entry.queue_id
                 );
             }
-            Ok((entry, Err(e))) => {
-                debug!("Queue upsert {} failed: {e}", entry.queue_id);
-                if let Err(ue) = mark_outcome(db, &entry, &e).await {
-                    error!("Failed to update queue status for {}: {ue}", entry.queue_id);
+        }
+
+        if winners.is_empty() {
+            continue;
+        }
+
+        let documents: Vec<Document> = winners.iter().map(|w| w.document.clone()).collect();
+        let queue_verifies: Vec<Option<QueueVerify>> = winners
+            .iter()
+            .map(|w| {
+                Some(QueueVerify {
+                    queue_id: w.entry.queue_id.clone(),
+                    collection_id: w.entry.collection_id.clone(),
+                })
+            })
+            .collect();
+
+        match document_upsert_bulk_blocking(
+            upsert_ingress,
+            &collection_name,
+            documents,
+            queue_verifies,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let drained: std::collections::HashSet<&str> =
+                    outcome.drained.iter().map(|s| s.as_str()).collect();
+                let mut to_delete = Vec::new();
+                for work in &winners {
+                    if drained.contains(work.document.id.as_str()) {
+                        debug!(
+                            "Queue upsert {} entry gone under lock; leaving queue row alone",
+                            work.entry.queue_id
+                        );
+                    } else {
+                        to_delete.push(work.entry.queue_id.clone());
+                    }
+                }
+                if !to_delete.is_empty() {
+                    if let Err(e) = db.delete_from_queue(&to_delete).await {
+                        error!("Failed to delete queue entries after bulk upsert: {e}");
+                    }
                 }
             }
-            Err(e) => error!("Queue upsert task join error: {e}"),
+            Err(UpsertSyncError::QueueEntryGone) => {
+                // Whole-batch variant should not appear from bulk_internal; treat as no-op.
+                debug!(
+                    "Bulk queue upsert for {collection_name} reported QueueEntryGone; leaving rows"
+                );
+            }
+            Err(e) => {
+                debug!("Bulk queue upsert for {collection_name} failed: {e}");
+                for work in &winners {
+                    if let Err(ue) = mark_outcome(db, &work.entry, &e).await {
+                        error!(
+                            "Failed to update queue status for {}: {ue}",
+                            work.entry.queue_id
+                        );
+                    }
+                }
+            }
         }
     }
 
