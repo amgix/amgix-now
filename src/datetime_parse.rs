@@ -1,26 +1,45 @@
 //! Centralized ISO 8601 datetime parsing for API inputs, metadata, and search filters.
+//!
+//! Accepts the formats generated clients commonly emit (RFC 3339, Python
+//! `+0000` offsets, chrono `Display` with a space instead of `T`), matching
+//! what amgix-server / `datetime.fromisoformat` already accepts.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 
-const ZONED_WITH_FRAC: &str = "%Y-%m-%dT%H:%M:%S%.f%z";
-const ZONED: &str = "%Y-%m-%dT%H:%M:%S%z";
-const NAIVE_WITH_FRAC: &str = "%Y-%m-%dT%H:%M:%S%.f";
-const NAIVE: &str = "%Y-%m-%dT%H:%M:%S";
+const ZONED_FMTS: &[&str] = &[
+    "%Y-%m-%dT%H:%M:%S%.f%z",
+    "%Y-%m-%dT%H:%M:%S%z",
+    // Space date/time separator (chrono FixedOffset Display, Python fromisoformat).
+    "%Y-%m-%d %H:%M:%S%.f%z",
+    "%Y-%m-%d %H:%M:%S%z",
+    // chrono Display puts a space before the offset: "...456 +00:00".
+    "%Y-%m-%d %H:%M:%S%.f %z",
+    "%Y-%m-%d %H:%M:%S %z",
+];
+const NAIVE_FMTS: &[&str] = &[
+    "%Y-%m-%dT%H:%M:%S%.f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S",
+];
 const DATE: &str = "%Y-%m-%d";
 
 fn parse_zoned_datetime(s: &str) -> Option<DateTime<FixedOffset>> {
     let s = s.trim();
     DateTime::parse_from_rfc3339(s)
         .ok()
-        .or_else(|| DateTime::parse_from_str(s, ZONED_WITH_FRAC).ok())
-        .or_else(|| DateTime::parse_from_str(s, ZONED).ok())
+        .or_else(|| {
+            ZONED_FMTS
+                .iter()
+                .find_map(|fmt| DateTime::parse_from_str(s, fmt).ok())
+        })
 }
 
 fn parse_naive_datetime(s: &str) -> Option<NaiveDateTime> {
     let s = s.trim();
-    NaiveDateTime::parse_from_str(s, NAIVE_WITH_FRAC)
-        .ok()
-        .or_else(|| NaiveDateTime::parse_from_str(s, NAIVE).ok())
+    NAIVE_FMTS
+        .iter()
+        .find_map(|fmt| NaiveDateTime::parse_from_str(s, fmt).ok())
 }
 
 fn parse_date(s: &str) -> Option<NaiveDate> {
