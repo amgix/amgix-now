@@ -732,22 +732,77 @@ impl UpsertIngress {
                             let metrics = metrics.clone();
                             inflight.spawn(async move {
                                 let from_queue = queue_verifies.iter().any(|q| q.is_some());
-                                let out = if from_queue {
-                                    // Keep docs + queue tickets aligned in one call (no concurrent
-                                    // chunk split) so partial apply cannot race ack/delete.
-                                    let t0 = std::time::Instant::now();
-                                    let n = documents.len();
-                                    let result = document_upsert_bulk_internal(
-                                        &db,
-                                        &cache,
-                                        &stats_batcher,
-                                        &doc_locks,
-                                        metrics.clone(),
-                                        &collection_name,
-                                        documents,
-                                        &queue_verifies,
-                                    )
-                                    .await;
+                                let n = documents.len();
+                                let t0 = std::time::Instant::now();
+
+                                // Same chunk split for REST and queue: zip tickets with docs so
+                                // each chunk's verifies stay aligned. Any chunk Err → whole job
+                                // Err (caller must not ack); all Ok → merge skipped/drained.
+                                let chunks: Vec<(Vec<Document>, Vec<Option<QueueVerify>>)> =
+                                    if queue_verifies.is_empty() {
+                                        documents
+                                            .chunks(BULK_UPSERT_CHUNK_SIZE)
+                                            .map(|c| (c.to_vec(), Vec::new()))
+                                            .collect()
+                                    } else {
+                                        documents
+                                            .chunks(BULK_UPSERT_CHUNK_SIZE)
+                                            .zip(queue_verifies.chunks(BULK_UPSERT_CHUNK_SIZE))
+                                            .map(|(d, v)| (d.to_vec(), v.to_vec()))
+                                            .collect()
+                                    };
+
+                                let mut chunk_set = JoinSet::new();
+                                for (chunk, chunk_verifies) in chunks {
+                                    let db = Arc::clone(&db);
+                                    let cache = cache.clone();
+                                    let stats_batcher = stats_batcher.clone();
+                                    let doc_locks = doc_locks.clone();
+                                    let metrics = metrics.clone();
+                                    let collection_name = collection_name.clone();
+                                    chunk_set.spawn(async move {
+                                        document_upsert_bulk_internal(
+                                            &db,
+                                            &cache,
+                                            &stats_batcher,
+                                            &doc_locks,
+                                            metrics.clone(),
+                                            &collection_name,
+                                            chunk,
+                                            &chunk_verifies,
+                                        )
+                                        .await
+                                    });
+                                }
+
+                                let mut all_skipped: Vec<String> = Vec::new();
+                                let mut all_drained: Vec<String> = Vec::new();
+                                let mut first_err: Option<UpsertSyncError> = None;
+                                while let Some(res) = chunk_set.join_next().await {
+                                    match res {
+                                        Ok(Ok(outcome)) => {
+                                            all_skipped.extend(outcome.skipped);
+                                            all_drained.extend(outcome.drained);
+                                        }
+                                        Ok(Err(e)) => {
+                                            if first_err.is_none() {
+                                                first_err = Some(e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("bulk chunk task panicked: {e}");
+                                        }
+                                    }
+                                }
+                                let out = match first_err {
+                                    Some(e) => Err(e),
+                                    None => Ok(BulkUpsertOutcome {
+                                        skipped: all_skipped,
+                                        drained: all_drained,
+                                    }),
+                                };
+
+                                if from_queue {
                                     if let Some(ref m) = metrics {
                                         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                                         m.record(
@@ -756,7 +811,7 @@ impl UpsertIngress {
                                             elapsed_ms / n.max(1) as f64,
                                             Some(n as i64),
                                         );
-                                        if result.is_err() {
+                                        if out.is_err() {
                                             m.record(
                                                 crate::metrics::keys::INDEX_QUEUE_FAILED,
                                                 &[],
@@ -765,62 +820,7 @@ impl UpsertIngress {
                                             );
                                         }
                                     }
-                                    result
-                                } else {
-                                    // REST sync bulk: split into chunks and run concurrently.
-                                    let chunks: Vec<Vec<Document>> = documents
-                                        .chunks(BULK_UPSERT_CHUNK_SIZE)
-                                        .map(|c| c.to_vec())
-                                        .collect();
-                                    let mut chunk_set = JoinSet::new();
-                                    for chunk in chunks {
-                                        let db = Arc::clone(&db);
-                                        let cache = cache.clone();
-                                        let stats_batcher = stats_batcher.clone();
-                                        let doc_locks = doc_locks.clone();
-                                        let metrics = metrics.clone();
-                                        let collection_name = collection_name.clone();
-                                        chunk_set.spawn(async move {
-                                            document_upsert_bulk_internal(
-                                                &db,
-                                                &cache,
-                                                &stats_batcher,
-                                                &doc_locks,
-                                                metrics.clone(),
-                                                &collection_name,
-                                                chunk,
-                                                &[],
-                                            )
-                                            .await
-                                        });
-                                    }
-                                    let mut all_skipped: Vec<String> = Vec::new();
-                                    let mut all_drained: Vec<String> = Vec::new();
-                                    let mut first_err: Option<UpsertSyncError> = None;
-                                    while let Some(res) = chunk_set.join_next().await {
-                                        match res {
-                                            Ok(Ok(outcome)) => {
-                                                all_skipped.extend(outcome.skipped);
-                                                all_drained.extend(outcome.drained);
-                                            }
-                                            Ok(Err(e)) => {
-                                                if first_err.is_none() {
-                                                    first_err = Some(e);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("bulk chunk task panicked: {e}");
-                                            }
-                                        }
-                                    }
-                                    match first_err {
-                                        Some(e) => Err(e),
-                                        None => Ok(BulkUpsertOutcome {
-                                            skipped: all_skipped,
-                                            drained: all_drained,
-                                        }),
-                                    }
-                                };
+                                }
                                 // No INDEX_BULK_*: those keys mean Encoder async bulk drain.
                                 let _ = reply.send(out);
                             });
@@ -1473,10 +1473,6 @@ pub async fn document_upsert_bulk_blocking(
     if documents.is_empty() {
         return Ok(BulkUpsertOutcome::default());
     }
-    debug_assert!(
-        queue_verifies.is_empty() || queue_verifies.len() == documents.len(),
-        "queue_verifies must be empty or aligned with documents"
-    );
     let (reply_tx, reply_rx) = oneshot::channel();
     ingress
         .bulk_tx
