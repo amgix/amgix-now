@@ -187,6 +187,22 @@ pub fn set_hf_home() {
     }
 }
 
+/// Hugging Face Hub token from `HF_TOKEN` (private / gated models).
+fn hf_token() -> Option<String> {
+    std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+/// HF Hub API: prefer `HF_TOKEN` when set; otherwise keep hf-hub's token-file default.
+fn hf_api() -> Result<hf_hub::api::sync::Api, String> {
+    let mut builder = ApiBuilder::new().with_progress(false);
+    if let Some(token) = hf_token() {
+        builder = builder.with_token(Some(token));
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HF API: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Dense model cache
 // ---------------------------------------------------------------------------
@@ -194,10 +210,7 @@ pub fn set_hf_home() {
 const ST_POOLING_CONFIG_PATH: &str = "1_Pooling/config.json";
 
 fn read_hf_config_json(model_id: &str, revision: Option<&str>) -> Result<Value, String> {
-    let api = ApiBuilder::new()
-        .with_progress(false)
-        .build()
-        .map_err(|e| format!("Failed to build HF API: {e}"))?;
+    let api = hf_api()?;
     let repo = match revision {
         Some(rev) => Repo::with_revision(model_id.to_string(), RepoType::Model, rev.to_string()),
         None => Repo::new(model_id.to_string(), RepoType::Model),
@@ -223,13 +236,15 @@ fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModel
         .and_then(|a| a.first())
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let token = hf_token();
+    let token = token.as_deref();
 
     if architecture == "BertModel" {
         let pooling = load_st_pooling_config(model_id, revision);
         let embedder = BertEmbedder::new(
             model_id.to_string(),
             revision.map(|s| s.to_string()),
-            None,
+            token,
             None,
         )
         .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
@@ -239,7 +254,7 @@ fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModel
         let embedder = ModernBertEmbedder::new(
             model_id.to_string(),
             revision.map(|s| s.to_string()),
-            None,
+            token,
             None,
         )
         .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?;
@@ -249,7 +264,7 @@ fn load_dense_model(model_id: &str, revision: Option<&str>) -> Result<DenseModel
             architecture,
             model_id,
             revision,
-            None,
+            token,
             None,
             None,
         )
@@ -287,7 +302,7 @@ fn dense_pooling_config(hf_config: &Value, model_id: &str, revision: Option<&str
 
 fn try_load_st_pooling_config(model_id: &str, revision: Option<&str>) -> Option<StPoolingConfig> {
     set_hf_home();
-    let api = ApiBuilder::new().with_progress(false).build().ok()?;
+    let api = hf_api().ok()?;
     let repo = match revision {
         Some(rev) => Repo::with_revision(model_id.to_string(), RepoType::Model, rev.to_string()),
         None => Repo::new(model_id.to_string(), RepoType::Model),
@@ -298,7 +313,7 @@ fn try_load_st_pooling_config(model_id: &str, revision: Option<&str>) -> Option<
 
 fn load_st_pooling_config(model_id: &str, revision: Option<&str>) -> StPoolingConfig {
     set_hf_home();
-    let Ok(api) = ApiBuilder::new().with_progress(false).build() else {
+    let Ok(api) = hf_api() else {
         return StPoolingConfig::mean_only();
     };
     let repo = match revision {
@@ -592,11 +607,12 @@ impl SparseModelCache {
         let revision = revision.map(|s| s.to_string());
         load_with_inflight(&self.inner, &self.inflight, self.max_size, key, || {
             set_hf_home();
+            let token = hf_token();
             let embedder = Arc::new(
                 SparseBertEmbedder::new(
                     model_id.clone(),
                     revision.clone(),
-                    None,
+                    token.as_deref(),
                 )
                 .map_err(|e| format!("Failed to load model '{model_id}': {e}"))?,
             );
