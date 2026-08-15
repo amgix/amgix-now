@@ -1,20 +1,31 @@
 //! Centralized ISO 8601 datetime parsing for API inputs, metadata, and search filters.
 //!
 //! Accepts the formats generated clients commonly emit (RFC 3339, Python
-//! `+0000` offsets, chrono `Display` with a space instead of `T`), matching
-//! what amgix-server / `datetime.fromisoformat` already accepts.
+//! `+0000` / `+00:00` offsets, chrono `Display` with a space before a colon
+//! offset), matching what amgix-server / `datetime.fromisoformat` accepts.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 
 const ZONED_FMTS: &[&str] = &[
+    // %z = +0000 / +00:00; %:z = +00:00 (chrono FixedOffset Display).
     "%Y-%m-%dT%H:%M:%S%.f%z",
     "%Y-%m-%dT%H:%M:%S%z",
-    // Space date/time separator (chrono FixedOffset Display, Python fromisoformat).
+    "%Y-%m-%dT%H:%M:%S%.f%:z",
+    "%Y-%m-%dT%H:%M:%S%:z",
+    // Space date/time separator (Python fromisoformat).
     "%Y-%m-%d %H:%M:%S%.f%z",
     "%Y-%m-%d %H:%M:%S%z",
-    // chrono Display puts a space before the offset: "...456 +00:00".
+    "%Y-%m-%d %H:%M:%S%.f%:z",
+    "%Y-%m-%d %H:%M:%S%:z",
+    // chrono Display: space before offset, e.g. "2026-08-15 13:40:24.891115219 +00:00".
     "%Y-%m-%d %H:%M:%S%.f %z",
     "%Y-%m-%d %H:%M:%S %z",
+    "%Y-%m-%d %H:%M:%S%.f %:z",
+    "%Y-%m-%d %H:%M:%S %:z",
+    "%Y-%m-%dT%H:%M:%S%.f %z",
+    "%Y-%m-%dT%H:%M:%S %z",
+    "%Y-%m-%dT%H:%M:%S%.f %:z",
+    "%Y-%m-%dT%H:%M:%S %:z",
 ];
 const NAIVE_FMTS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%S%.f",
