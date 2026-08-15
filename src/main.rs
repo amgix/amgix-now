@@ -5,6 +5,7 @@ mod lock_client;
 mod metrics;
 mod common;
 mod datetime_parse;
+mod templates;
 mod platform;
 mod encoder;
 mod filter_parser;

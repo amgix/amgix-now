@@ -185,6 +185,35 @@ fn get_field_text(document: &Document, field: DocumentField) -> String {
         DocumentField::Name => document.name.clone().unwrap_or_default(),
         DocumentField::Description => document.description.clone().unwrap_or_default(),
         DocumentField::Content => document.content.clone().unwrap_or_default(),
+        DocumentField::Template => String::new(),
+    }
+}
+
+fn text_for_slot(
+    config: &VectorConfigInternal,
+    document: &Document,
+    field: DocumentField,
+) -> Result<String, String> {
+    if field == DocumentField::Template {
+        let tmpl = config.doc_template.as_deref().ok_or_else(|| {
+            format!(
+                "Vector '{}' slot 'template' requires doc_template",
+                config.name
+            )
+        })?;
+        return crate::templates::render_doc_template(tmpl, document);
+    }
+    Ok(get_field_text(document, field))
+}
+
+fn query_text_for_config(config: &VectorConfigInternal, query: &str) -> Result<String, String> {
+    if crate::templates::uses_templates(config) {
+        let tmpl = config.query_template.as_deref().ok_or_else(|| {
+            format!("Vector '{}' requires query_template", config.name)
+        })?;
+        Ok(crate::templates::render_query_template(tmpl, query))
+    } else {
+        Ok(query.to_string())
     }
 }
 
@@ -229,6 +258,10 @@ fn vectorize_single_config(
     let n = documents.len();
     let mut vectors: Vec<Vec<VectorData>> = vec![Vec::new(); n];
     let mut token_lengths: Vec<HashMap<String, usize>> = vec![HashMap::new(); n];
+    let slots = match crate::templates::vector_index_fields(config) {
+        Ok(s) => s,
+        Err(e) => return Err(e),
+    };
 
     let result: Result<(), String> = (|| {
         match config.vector_type {
@@ -236,13 +269,13 @@ fn vectorize_single_config(
                 let mut embed_slots: Vec<(usize, DocumentField)> = Vec::new();
                 let mut texts: Vec<String> = Vec::new();
                 for doc_idx in 0..n {
-                    for field in &config.index_fields {
+                    for field in &slots {
                         let key = (config.name.clone(), *field);
                         if let Some(vd) = provided_maps[doc_idx].get(&key) {
                             vectors[doc_idx].push(vd.clone());
                         } else {
                             embed_slots.push((doc_idx, *field));
-                            texts.push(get_field_text(&documents[doc_idx], *field));
+                            texts.push(text_for_slot(config, &documents[doc_idx], *field)?);
                         }
                     }
                 }
@@ -289,7 +322,7 @@ fn vectorize_single_config(
             VectorType::DenseCustom => {
                 let per_doc = CustomDenseVector::extract_for_documents(config, documents)?;
                 for (doc_idx, field_map) in per_doc {
-                    for field in &config.index_fields {
+                    for field in &slots {
                         let field_key = field.to_string();
                         let vec = field_map.get(&field_key).ok_or_else(|| {
                             format!(
@@ -311,7 +344,7 @@ fn vectorize_single_config(
             VectorType::SparseCustom => {
                 let per_doc = CustomSparseVector::extract_for_documents(config, documents)?;
                 for (doc_idx, field_map) in per_doc {
-                    for field in &config.index_fields {
+                    for field in &slots {
                         let field_key = field.to_string();
                         let pair = field_map.get(&field_key).ok_or_else(|| {
                             format!(
@@ -346,14 +379,14 @@ fn vectorize_single_config(
                 let mut avgdls: Vec<f64> = Vec::new();
                 let is_custom = config.vector_type.is_custom_tokenization();
                 for doc_idx in 0..n {
-                    for field in &config.index_fields {
+                    for field in &slots {
                         let key = (config.name.clone(), *field);
                         if let Some(vd) = provided_maps[doc_idx].get(&key) {
                             vectors[doc_idx].push(vd.clone());
                             record_sparse_token_length(&mut token_lengths[doc_idx], vd);
                         } else {
                             embed_slots.push((doc_idx, *field));
-                            texts.push(get_field_text(&documents[doc_idx], *field));
+                            texts.push(text_for_slot(config, &documents[doc_idx], *field)?);
                             if is_custom {
                                 let field_vector_name = format!("{}_{}", field, config.name);
                                 let table = avgdl_dict.ok_or_else(|| {
@@ -424,8 +457,7 @@ fn vectorize_single_config(
             format!(
                 "Failed to generate vector '{}' for fields {:?}: {e}",
                 config.name,
-                config
-                    .index_fields
+                slots
                     .iter()
                     .map(|f| f.to_string())
                     .collect::<Vec<_>>()
@@ -574,44 +606,69 @@ impl Vectorizer {
 
         let mut vectors_to_generate: HashSet<(String, DocumentField)> = HashSet::new();
 
+        let config_map: HashMap<String, &VectorConfigInternal> = vector_configs
+            .iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
+
+        let option_map: HashMap<(String, DocumentField), &VectorSearchOption>;
+
         if !settings.vector_options.is_empty() {
+            let mut map = HashMap::new();
             for option in &settings.vector_options {
-                if option.weight != 0.0 {
-                    vectors_to_generate
-                        .insert((option.vector_name.clone(), option.field));
+                if option.weight == 0.0 {
+                    continue;
                 }
+                let config = config_map.get(&option.vector_name).ok_or_else(|| {
+                    format!(
+                        "Vector configuration '{}' not found. Available vectors: {}",
+                        option.vector_name,
+                        config_map.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                })?;
+                let field = crate::templates::resolve_search_field(config, option.field)?;
+                vectors_to_generate.insert((option.vector_name.clone(), field));
+                map.insert((option.vector_name.clone(), field), option);
             }
+            option_map = map;
         } else {
             for config in vector_configs {
-                for field in &config.index_fields {
-                    vectors_to_generate.insert((config.name.clone(), *field));
+                for field in crate::templates::vector_index_fields(config)? {
+                    vectors_to_generate.insert((config.name.clone(), field));
                 }
             }
             if !vectors_to_generate.is_empty() {
-                let equal_weight =
-                    1.0_f64 / (vectors_to_generate.len() as f64);
+                let equal_weight = 1.0_f64 / (vectors_to_generate.len() as f64);
                 settings.vector_options = vectors_to_generate
                     .iter()
                     .map(|(name, field)| VectorSearchOption {
                         vector_name: name.clone(),
-                        field: *field,
+                        field: if *field == DocumentField::Template {
+                            None
+                        } else {
+                            Some(*field)
+                        },
                         weight: equal_weight,
                         wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
                     })
                     .collect();
             }
+            option_map = settings
+                .vector_options
+                .iter()
+                .map(|o| {
+                    let config = config_map
+                        .get(&o.vector_name)
+                        .expect("option vector_name from config_map");
+                    let field = if crate::templates::uses_templates(config) {
+                        DocumentField::Template
+                    } else {
+                        o.field.expect("non-template auto option has field")
+                    };
+                    ((o.vector_name.clone(), field), o)
+                })
+                .collect();
         }
-
-        let option_map: HashMap<(String, DocumentField), &VectorSearchOption> = settings
-            .vector_options
-            .iter()
-            .map(|o| ((o.vector_name.clone(), o.field), o))
-            .collect();
-
-        let config_map: HashMap<String, &VectorConfigInternal> = vector_configs
-            .iter()
-            .map(|c| (c.name.clone(), c))
-            .collect();
 
         // Group non-WMTR vectors by name; WMTR gets one task per field (trigram weight is per option).
         let mut normal_groups: HashMap<String, Vec<DocumentField>> = HashMap::new();
@@ -623,14 +680,11 @@ impl Vectorizer {
                     config_map.keys().cloned().collect::<Vec<_>>().join(", ")
                 )
             })?;
-            if !config.index_fields.contains(&field) {
+            let slots = crate::templates::vector_index_fields(config)?;
+            if !slots.contains(&field) {
                 return Err(format!(
                     "Field '{field}' is not configured for vector '{vector_name}'. Available fields: {:?}",
-                    config
-                        .index_fields
-                        .iter()
-                        .map(|f| f.to_string())
-                        .collect::<Vec<_>>()
+                    slots.iter().map(|f| f.to_string()).collect::<Vec<_>>()
                 ));
             }
             if config.vector_type == VectorType::Wmtr {
@@ -654,11 +708,12 @@ impl Vectorizer {
 
         for (vector_name, fields, _) in &work_items {
             let config = config_map.get(vector_name).expect("validated above");
+            let slots = crate::templates::vector_index_fields(config)?;
             for field in fields {
-                if !config.index_fields.contains(field) {
+                if !slots.contains(field) {
                     return Err(format!(
                         "Field '{field}' is not configured for vector '{vector_name}'. Available fields: {:?}",
-                        config.index_fields.iter().map(|f| f.to_string()).collect::<Vec<_>>()
+                        slots.iter().map(|f| f.to_string()).collect::<Vec<_>>()
                     ));
                 }
             }
@@ -728,6 +783,10 @@ impl Vectorizer {
     ) -> Result<Vec<Vec<VectorData>>, String> {
         let n = query_texts.len();
         let mut per_query: Vec<Vec<VectorData>> = vec![Vec::new(); n];
+        let effective_texts: Vec<String> = query_texts
+            .iter()
+            .map(|q| query_text_for_config(config, q))
+            .collect::<Result<Vec<_>, _>>()?;
 
         match config.vector_type {
             VectorType::DenseModel => {
@@ -735,7 +794,7 @@ impl Vectorizer {
 
                 let RoutedEmbed::Dense(dense_batch) = route_embed_dispatch(
                     &effective_config,
-                    query_texts,
+                    &effective_texts,
                     None,
                     DEFAULT_WMTR_TRIGRAM_WEIGHT,
                     metrics,
@@ -836,7 +895,7 @@ impl Vectorizer {
                 let routed = if config.vector_type.is_custom_tokenization() {
                     route_embed_dispatch(
                         &effective_config,
-                        query_texts,
+                        &effective_texts,
                         Some(avgdls_5.as_slice()),
                         trigram_weight,
                         metrics,
@@ -844,7 +903,7 @@ impl Vectorizer {
                 } else {
                     route_embed_dispatch(
                         &effective_config,
-                        query_texts,
+                        &effective_texts,
                         None,
                         trigram_weight,
                         metrics,

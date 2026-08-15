@@ -363,8 +363,13 @@ pub struct VectorConfig {
     pub top_k: u32,
     #[serde(default = "default_wmtr_word_ratio", alias = "wmtr_word_weight")]
     pub wmtr_word_ratio: u32,
-    #[serde(default = "default_index_fields")]
-    pub index_fields: Vec<DocumentField>,
+    /// Mutually exclusive with `doc_template` / `query_template`. Defaults to `[content]` when both templates are absent.
+    #[serde(default)]
+    pub index_fields: Option<Vec<DocumentField>>,
+    #[serde(default)]
+    pub doc_template: Option<String>,
+    #[serde(default)]
+    pub query_template: Option<String>,
     #[serde(default = "default_language_code")]
     pub language_default_code: String,
     #[serde(default)]
@@ -390,7 +395,9 @@ fn default_noop_vectors() -> Vec<VectorConfig> {
         dimensions: None,
         top_k: default_top_k(),
         wmtr_word_ratio: default_wmtr_word_ratio(),
-        index_fields: default_index_fields(),
+        index_fields: Some(vec![DocumentField::Name]),
+        doc_template: None,
+        query_template: None,
         language_default_code: default_language_code(),
         language_detect: false,
         language_confidence: default_language_confidence(),
@@ -468,8 +475,12 @@ pub struct VectorConfigInternal {
     pub top_k: u32,
     #[serde(default = "default_wmtr_word_ratio", alias = "wmtr_word_weight")]
     pub wmtr_word_ratio: u32,
-    #[serde(default = "default_index_fields")]
-    pub index_fields: Vec<DocumentField>,
+    #[serde(default)]
+    pub index_fields: Option<Vec<DocumentField>>,
+    #[serde(default)]
+    pub doc_template: Option<String>,
+    #[serde(default)]
+    pub query_template: Option<String>,
     #[serde(default = "default_language_code")]
     pub language_default_code: String,
     #[serde(default)]
@@ -488,6 +499,16 @@ impl From<VectorConfig> for VectorConfigInternal {
     fn from(v: VectorConfig) -> Self {
         let vector_type = canonical_vector_type(v.vector_type);
         let normalization = apply_normalization_default(v.normalization, &vector_type);
+        let (index_fields, doc_template, query_template) =
+            if v.doc_template.is_some() || v.query_template.is_some() {
+                (None, v.doc_template, v.query_template)
+            } else {
+                (
+                    Some(v.index_fields.unwrap_or_else(default_index_fields)),
+                    None,
+                    None,
+                )
+            };
         VectorConfigInternal {
             version: 1_u32,
             name: v.name,
@@ -499,7 +520,9 @@ impl From<VectorConfig> for VectorConfigInternal {
             dimensions: v.dimensions,
             top_k: v.top_k,
             wmtr_word_ratio: v.wmtr_word_ratio,
-            index_fields: v.index_fields,
+            index_fields,
+            doc_template,
+            query_template,
             language_default_code: v.language_default_code,
             language_detect: v.language_detect,
             language_confidence: v.language_confidence,
@@ -513,10 +536,11 @@ impl From<VectorConfig> for VectorConfigInternal {
 impl From<VectorConfigInternal> for VectorConfig {
     /// Mirrors `vector.py` `internal_to_user_config`: exposed API omits stored
     /// `query_model` / `query_revision` / `keep_case` — they are reset to defaults
-    /// (`None`, `None`, `False`).
+    /// (`None`, `None`, `False`). Template mode omits `index_fields`.
     fn from(v: VectorConfigInternal) -> Self {
         let vector_type = canonical_vector_type(v.vector_type);
         let normalization = apply_normalization_default(v.normalization, &vector_type);
+        let uses_tmpl = v.doc_template.is_some();
         VectorConfig {
             name: v.name,
             vector_type,
@@ -527,7 +551,13 @@ impl From<VectorConfigInternal> for VectorConfig {
             dimensions: v.dimensions,
             top_k: v.top_k,
             wmtr_word_ratio: v.wmtr_word_ratio,
-            index_fields: v.index_fields,
+            index_fields: if uses_tmpl {
+                None
+            } else {
+                v.index_fields.or_else(|| Some(default_index_fields()))
+            },
+            doc_template: v.doc_template,
+            query_template: v.query_template,
             language_default_code: v.language_default_code,
             language_detect: v.language_detect,
             language_confidence: v.language_confidence,
@@ -664,7 +694,9 @@ pub struct VectorSearchOption {
     pub vector_name: String,
     #[serde(default = "default_weight")]
     pub weight: f64,
-    pub field: DocumentField,
+    /// Optional for template-based vectors (ignored if present).
+    #[serde(default)]
+    pub field: Option<DocumentField>,
     #[serde(default = "default_wmtr_trigram_weight")]
     pub wmtr_trigram_weight: f64,
 }

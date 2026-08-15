@@ -284,6 +284,8 @@ pub enum DocumentField {
     Name,
     Description,
     Content,
+    /// Synthetic storage slot for VectorConfig doc_template / query_template mode.
+    Template,
 }
 
 impl std::fmt::Display for DocumentField {
@@ -292,8 +294,20 @@ impl std::fmt::Display for DocumentField {
             DocumentField::Name => "name",
             DocumentField::Description => "description",
             DocumentField::Content => "content",
+            DocumentField::Template => "template",
         };
         write!(f, "{s}")
+    }
+}
+
+impl DocumentField {
+    /// Fields allowed in API `index_fields` (excludes synthetic `template`).
+    pub fn indexable() -> &'static [DocumentField] {
+        &[
+            DocumentField::Name,
+            DocumentField::Description,
+            DocumentField::Content,
+        ]
     }
 }
 

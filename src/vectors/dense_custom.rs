@@ -41,11 +41,11 @@ impl CustomDenseVector {
                     config.name
                 )
             })?;
-            for field in &config.index_fields {
+            for field in crate::templates::vector_index_fields(config)? {
                 let field_str = field.to_string();
                 let cv = custom_vectors
                     .iter()
-                    .find(|cv| cv.vector_name == config.name && cv.field == *field)
+                    .find(|cv| cv.vector_name == config.name && cv.field == field)
                     .ok_or_else(|| {
                         format!(
                             "Custom dense vector '{}' for field '{}' not provided",

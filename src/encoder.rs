@@ -39,27 +39,60 @@ fn needs_revectorization(
     if incoming.custom_vectors.is_some() {
         return true;
     }
+
+    let mut indexed_fields: HashSet<DocumentField> = HashSet::new();
+    let mut has_template = false;
     for v in &collection_config.vectors {
-        for field in &v.index_fields {
-            if *field == DocumentField::Content && !collection_config.store_content {
-                if incoming.content_hash != existing.content_hash {
-                    return true;
-                }
-                continue;
-            }
-            let incoming_val: Option<&str> = match field {
-                DocumentField::Name => incoming.name.as_deref(),
-                DocumentField::Description => incoming.description.as_deref(),
-                DocumentField::Content => incoming.content.as_deref(),
-            };
-            let existing_val: Option<&str> = match field {
-                DocumentField::Name => existing.name.as_deref(),
-                DocumentField::Description => existing.description.as_deref(),
-                DocumentField::Content => existing.content.as_deref(),
-            };
-            if incoming_val != existing_val {
+        if crate::templates::uses_templates(v) {
+            has_template = true;
+            continue;
+        }
+        match crate::templates::vector_index_fields(v) {
+            Ok(slots) => indexed_fields.extend(slots),
+            Err(_) => continue,
+        }
+    }
+
+    for field in &indexed_fields {
+        if *field == DocumentField::Content && !collection_config.store_content {
+            if incoming.content_hash != existing.content_hash {
                 return true;
             }
+            continue;
+        }
+        let incoming_val: Option<&str> = match field {
+            DocumentField::Name => incoming.name.as_deref(),
+            DocumentField::Description => incoming.description.as_deref(),
+            DocumentField::Content => incoming.content.as_deref(),
+            DocumentField::Template => None,
+        };
+        let existing_val: Option<&str> = match field {
+            DocumentField::Name => existing.name.as_deref(),
+            DocumentField::Description => existing.description.as_deref(),
+            DocumentField::Content => existing.content.as_deref(),
+            DocumentField::Template => None,
+        };
+        if incoming_val != existing_val {
+            return true;
+        }
+    }
+
+    if has_template {
+        if incoming.name != existing.name {
+            return true;
+        }
+        if incoming.description != existing.description {
+            return true;
+        }
+        if !collection_config.store_content {
+            if incoming.content_hash != existing.content_hash {
+                return true;
+            }
+        } else if incoming.content != existing.content {
+            return true;
+        }
+        if incoming.metadata != existing.metadata {
+            return true;
         }
     }
     false
@@ -1689,7 +1722,10 @@ pub(crate) async fn document_upsert_bulk_internal(
     let mut stats = db.get_collection_stats(collection_name).await?;
     for config in &collection_config.vectors {
         if config.vector_type.is_custom_tokenization() {
-            for field in &config.index_fields {
+            let Ok(slots) = crate::templates::vector_index_fields(config) else {
+                continue;
+            };
+            for field in slots {
                 let field_vector_name = format!("{}_{}", field, config.name);
                 stats.avgdls.entry(field_vector_name).or_insert(50.0);
             }
@@ -1937,16 +1973,17 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
     let vector_options: Vec<VectorSearchOption> = vector_configs
         .iter()
         .flat_map(|config| {
-            config
-                .index_fields
-                .iter()
-                .copied()
-                .map(move |field| VectorSearchOption {
-                    vector_name: config.name.clone(),
-                    weight: 1.0,
-                    field,
-                    wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
-                })
+            let slots = crate::templates::vector_index_fields(config).unwrap_or_default();
+            slots.into_iter().map(move |field| VectorSearchOption {
+                vector_name: config.name.clone(),
+                weight: 1.0,
+                field: if field == DocumentField::Template {
+                    None
+                } else {
+                    Some(field)
+                },
+                wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
+            })
         })
         .collect();
 

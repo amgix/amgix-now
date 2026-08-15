@@ -138,8 +138,8 @@ pub fn validate_document_vectors(
         if config.vector_type.is_custom_vectors() {
             continue;
         }
-        for field in &config.index_fields {
-            expected.insert((config.name.clone(), *field), config);
+        for field in crate::templates::vector_index_fields(config).map_err(err)? {
+            expected.insert((config.name.clone(), field), config);
         }
     }
 
@@ -575,6 +575,7 @@ fn validate_vector_config(v: &VectorConfig) -> VResult {
     validate_model_requirements(v)?;
     validate_custom_vector_config(v)?;
     validate_language_config(v)?;
+    validate_templates_and_index_fields(v)?;
     if let Some(ref model) = v.model {
         validate_model_name_length("model", model)?;
     }
@@ -588,6 +589,50 @@ fn validate_vector_config(v: &VectorConfig) -> VResult {
         validate_model_name_length("query_revision", qr)?;
     }
     Ok(())
+}
+
+fn validate_templates_and_index_fields(v: &VectorConfig) -> VResult {
+    let has_doc = v.doc_template.is_some();
+    let has_query = v.query_template.is_some();
+    if has_doc || has_query {
+        if !has_doc || !has_query {
+            return Err(err(
+                "doc_template and query_template must both be specified together",
+            ));
+        }
+        if v.index_fields.is_some() {
+            return Err(err(
+                "index_fields cannot be set when doc_template and query_template are set",
+            ));
+        }
+        if v.vector_type.is_custom_vectors() || v.vector_type == VectorType::Noop {
+            return Err(err(format!(
+                "doc_template/query_template are not supported for vector type '{}'",
+                v.vector_type
+            )));
+        }
+        crate::templates::validate_doc_template(v.doc_template.as_deref().unwrap()).map_err(err)?;
+        crate::templates::validate_query_template(v.query_template.as_deref().unwrap())
+            .map_err(err)?;
+        return Ok(());
+    }
+
+    match &v.index_fields {
+        None => Ok(()), // defaulted to [content] when converting to Internal
+        Some(fields) if fields.is_empty() => Err(err("index_fields cannot be empty")),
+        Some(fields) => {
+            let allowed = DocumentField::indexable();
+            for field in fields {
+                if !allowed.contains(field) {
+                    return Err(err(format!(
+                        "Index field must be one of {:?}",
+                        allowed.iter().map(|f| f.to_string()).collect::<Vec<_>>()
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_model_name_length(field: &str, s: &str) -> VResult {

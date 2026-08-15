@@ -38,7 +38,7 @@ use crate::models::{
     CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse, DocumentStatus,
     DocumentStatusResponse, MetadataFilter, MetadataIndex, QueueDocument, QueueInfo,
     QueueOperationType, QueuedDocumentStatus, SearchOutcome, SearchQueryWithVectors, SearchResult,
-    VectorData, VectorScore,
+    VectorConfigInternal, VectorData, VectorScore,
 };
 use crate::search_facet::compute_facet_counts;
 
@@ -345,7 +345,7 @@ impl QdrantDb {
                     DenseDistance::Dot => Distance::Dot,
                     DenseDistance::Euclid => Distance::Euclid,
                 };
-                for field in &vc.index_fields {
+                for field in crate::templates::vector_index_fields(vc).map_err(DbError::Config)? {
                     dense_params.insert(
                         format!("{field}_{vname}"),
                         VectorParams {
@@ -361,7 +361,7 @@ impl QdrantDb {
                 } else {
                     None
                 };
-                for field in &vc.index_fields {
+                for field in crate::templates::vector_index_fields(vc).map_err(DbError::Config)? {
                     sparse_params.insert(
                         format!("{field}_{vname}"),
                         SparseVectorParams {
@@ -1233,7 +1233,7 @@ impl QdrantDb {
 
         let mut vectors = Vec::new();
         for vector in &collection_config.vectors {
-            for field in &vector.index_fields {
+            for field in crate::templates::vector_index_fields(vector).map_err(DbError::Config)? {
                 let field_vector_name = format!("{field}_{}", vector.name);
                 let raw = named.get(&field_vector_name).ok_or_else(|| {
                     DbError::Config(format!("Missing stored vector '{field_vector_name}'"))
@@ -1249,7 +1249,7 @@ impl QdrantDb {
                     };
                     vectors.push(VectorData {
                         vector_name: vector.name.clone(),
-                        field: *field,
+                        field,
                         vector_type: vector.vector_type.clone(),
                         dense_vector: Some(d.data.clone()),
                         sparse_indices: None,
@@ -1266,7 +1266,7 @@ impl QdrantDb {
                     };
                     vectors.push(VectorData {
                         vector_name: vector.name.clone(),
-                        field: *field,
+                        field,
                         vector_type: vector.vector_type.clone(),
                         dense_vector: None,
                         sparse_indices: Some(s.indices.clone()),
@@ -1566,13 +1566,25 @@ impl QdrantDb {
             }
         }
 
-        // weight_lookup: (vector_name, field) → weight — mirrors Python lines 585-586.
-        let weight_lookup: HashMap<(String, String), f64> = query
-            .settings
-            .vector_options
-            .iter()
-            .map(|w| ((w.vector_name.clone(), w.field.to_string()), w.weight))
-            .collect();
+        // weight_lookup: (vector_name, field) → weight — field resolved like search options
+        // (template vectors omit field in options; storage slot is still `template`).
+        let weight_lookup: HashMap<(String, String), f64> = {
+            let configs: HashMap<&str, &VectorConfigInternal> = collection_config
+                .vectors
+                .iter()
+                .map(|v| (v.name.as_str(), v))
+                .collect();
+            query
+                .settings
+                .vector_options
+                .iter()
+                .filter_map(|w| {
+                    let config = configs.get(w.vector_name.as_str())?;
+                    let field = crate::templates::resolve_search_field(config, w.field).ok()?;
+                    Some(((w.vector_name.clone(), field.to_string()), w.weight))
+                })
+                .collect()
+        };
 
         let mut prefetch_limit = search_prefetch_limit(query.settings.limit);
         if query.settings.facets {
