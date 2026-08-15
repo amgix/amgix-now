@@ -76,6 +76,9 @@ fn embed_dense_batch(
         DenseModelHandle::ModernBert { embedder, pooling } => {
             embed_dense_batch_modernbert(embedder, pooling, docs, normalize, model_id)
         }
+        DenseModelHandle::Model2Vec(embedder) => {
+            embed_dense_batch_model2vec(embedder, docs, normalize, model_id)
+        }
         DenseModelHandle::Generic(embedder) => {
             embed_dense_batch_generic(embedder, docs, normalize, model_id)
         }
@@ -233,6 +236,28 @@ fn embed_dense_batch_modernbert(
             .map_err(|e| format!("to_vec2 failed: {e}"))?;
 
         results.extend(batch_vecs);
+    }
+
+    Ok(results)
+}
+
+/// Static / Model2Vec path — sync encode via model2vec-rs (no Tokio).
+fn embed_dense_batch_model2vec(
+    model: &model2vec_rs::model::StaticModel,
+    docs: &[String],
+    normalize: bool,
+    _model_id: &str,
+) -> Result<Vec<Vec<f32>>, String> {
+    let mut results: Vec<Vec<f32>> = Vec::with_capacity(docs.len());
+
+    for chunk in docs.chunks(DENSE_MODEL_BATCH_SIZE) {
+        let texts: Vec<String> = chunk.to_vec();
+        for mut vec in model.encode(&texts) {
+            if normalize {
+                l2_normalize_vec(&mut vec);
+            }
+            results.push(vec);
+        }
     }
 
     Ok(results)

@@ -104,6 +104,7 @@ dependencies = [
  "hf-hub 0.4.3",
  "isolang",
  "lapin",
+ "model2vec-rs",
  "murmurhash3",
  "nu-ansi-term",
  "nvml-wrapper",

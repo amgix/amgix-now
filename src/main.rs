@@ -1486,6 +1486,16 @@ async fn main() {
     platform::init();
     init_tracing_from_env();
 
+    // Pin HF downloads to Amgix cache before any model / Hub client is created
+    // (covers our hf-hub 0.4 client and embed_anything's hf-hub 1.x).
+    vectors::model_cache::set_hf_home();
+    tracing::info!(
+        amgix_cache = %common::cache_base_dir().display(),
+        hf_home = %std::env::var("HF_HOME").unwrap_or_default(),
+        hf_hub_cache = %vectors::model_cache::hf_hub_cache_dir().display(),
+        "HuggingFace cache configured"
+    );
+
     let db_url = std::env::var("AMGIX_DATABASE_URL")
         .unwrap_or_else(|_| "qdrant://localhost:6334".to_string());
 
