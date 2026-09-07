@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::common::{
     MAX_DB_RETRIES, MAX_QUEUE_DELIVERY_ATTEMPTS, MAX_RETRY_SLEEP_SECONDS, QUEUE_POLLER_BATCH_SIZE,
-    QUEUE_POLLER_IDLE_MS,
+    QUEUE_POLLER_IDLE_MAX_MS, QUEUE_POLLER_IDLE_MS,
 };
 use crate::encoder::{
     document_delete_sync, document_upsert_bulk_blocking, LockBackend, QueueVerify,
@@ -92,7 +92,7 @@ impl QueuePollerShutdown {
 }
 
 /// Returns `true` when the poller should exit.
-async fn idle_or_stop(stop_rx: &mut watch::Receiver<bool>) -> bool {
+async fn idle_or_stop(stop_rx: &mut watch::Receiver<bool>, idle: Duration) -> bool {
     if *stop_rx.borrow() {
         return true;
     }
@@ -100,10 +100,14 @@ async fn idle_or_stop(stop_rx: &mut watch::Receiver<bool>) -> bool {
         result = stop_rx.changed() => {
             result.is_err() || *stop_rx.borrow()
         }
-        _ = sleep(Duration::from_millis(QUEUE_POLLER_IDLE_MS)) => {
+        _ = sleep(idle) => {
             *stop_rx.borrow()
         }
     }
+}
+
+fn next_idle_ms(idle_ms: u64) -> u64 {
+    idle_ms.saturating_mul(2).min(QUEUE_POLLER_IDLE_MAX_MS)
 }
 
 pub fn spawn_queue_poller(
@@ -116,6 +120,7 @@ pub fn spawn_queue_poller(
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let join = tokio::spawn(async move {
         info!("Standalone queue poller started");
+        let mut idle_ms = QUEUE_POLLER_IDLE_MS;
         loop {
             if *stop_rx.borrow() {
                 break;
@@ -125,9 +130,10 @@ pub fn spawn_queue_poller(
                 Ok(p) => p,
                 Err(e) => {
                     error!("Queue poller claim failed: {e}");
-                    if idle_or_stop(&mut stop_rx).await {
+                    if idle_or_stop(&mut stop_rx, Duration::from_millis(idle_ms)).await {
                         break;
                     }
+                    idle_ms = next_idle_ms(idle_ms);
                     continue;
                 }
             };
@@ -137,16 +143,26 @@ pub fn spawn_queue_poller(
                 break;
             }
 
+            let pending_empty = pending.is_empty();
             let eligible: Vec<_> = pending.into_iter().filter(backoff_elapsed).collect();
             if eligible.is_empty() {
-                if idle_or_stop(&mut stop_rx).await {
+                // Empty queue: exponential idle. Rows waiting on per-row retry: keep 1s.
+                let sleep_ms = if pending_empty {
+                    idle_ms
+                } else {
+                    QUEUE_POLLER_IDLE_MS
+                };
+                if idle_or_stop(&mut stop_rx, Duration::from_millis(sleep_ms)).await {
                     break;
+                }
+                if pending_empty {
+                    idle_ms = next_idle_ms(idle_ms);
                 }
                 continue;
             }
 
             // Finish the whole batch before re-checking stop so ack/delete stay consistent.
-            if let Err(e) = process_batch(
+            match process_batch(
                 &db,
                 &upsert_ingress,
                 &stats_batcher,
@@ -156,9 +172,15 @@ pub fn spawn_queue_poller(
             )
             .await
             {
-                error!("Queue poller batch failed: {e}");
-                if idle_or_stop(&mut stop_rx).await {
-                    break;
+                Ok(()) => {
+                    idle_ms = QUEUE_POLLER_IDLE_MS;
+                }
+                Err(e) => {
+                    error!("Queue poller batch failed: {e}");
+                    if idle_or_stop(&mut stop_rx, Duration::from_millis(idle_ms)).await {
+                        break;
+                    }
+                    idle_ms = next_idle_ms(idle_ms);
                 }
             }
         }

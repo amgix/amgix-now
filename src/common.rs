@@ -67,8 +67,10 @@ pub const MAX_DB_RETRIES: u32 = 200;
 pub const MAX_RETRY_SLEEP_SECONDS: f64 = 20.0;
 /// How many queue rows the standalone poller reads per iteration.
 pub const QUEUE_POLLER_BATCH_SIZE: u64 = 192;
-/// Idle sleep when the standalone poller finds nothing eligible (ms).
+/// Initial idle sleep and retry-wait poll interval for the standalone poller (ms).
 pub const QUEUE_POLLER_IDLE_MS: u64 = 1000;
+/// Cap for empty-queue / error exponential idle backoff (ms): 1, 2, 4, 8, 16s.
+pub const QUEUE_POLLER_IDLE_MAX_MS: u64 = 16_000;
 
 /// Product line label for `/v1/version` and `/v1/system/info` (formerly `AMGIX_VARIANT`).
 pub const AMGIX_VARIANT: &str = "Amgix-Now";
