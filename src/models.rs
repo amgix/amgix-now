@@ -699,6 +699,11 @@ pub struct VectorSearchOption {
     pub field: Option<DocumentField>,
     #[serde(default = "default_wmtr_trigram_weight")]
     pub wmtr_trigram_weight: f64,
+    /// Optional minimum raw similarity score for this vector option.
+    /// Results scoring below this threshold are excluded from this vector's arm
+    /// at the database query level, before fusion.
+    #[serde(default)]
+    pub raw_score_threshold: Option<f64>,
 }
 
 impl PartialEq for VectorSearchOption {
@@ -707,6 +712,7 @@ impl PartialEq for VectorSearchOption {
             && self.field == other.field
             && self.weight.to_bits() == other.weight.to_bits()
             && self.wmtr_trigram_weight.to_bits() == other.wmtr_trigram_weight.to_bits()
+            && opt_f64_eq(&self.raw_score_threshold, &other.raw_score_threshold)
     }
 }
 
@@ -718,6 +724,7 @@ impl Hash for VectorSearchOption {
         self.weight.to_bits().hash(state);
         self.field.hash(state);
         self.wmtr_trigram_weight.to_bits().hash(state);
+        hash_opt_f64(&self.raw_score_threshold, state);
     }
 }
 

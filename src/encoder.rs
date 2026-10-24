@@ -1983,6 +1983,7 @@ fn validate_models_inner(vector_configs: &[VectorConfigInternal]) -> ModelValida
                     Some(field)
                 },
                 wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                raw_score_threshold: None,
             })
         })
         .collect();

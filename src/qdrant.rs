@@ -38,7 +38,7 @@ use crate::models::{
     CollectionConfigInternal, Document, DocumentFetchRequest, DocumentFetchResponse, DocumentStatus,
     DocumentStatusResponse, MetadataFilter, MetadataIndex, QueueDocument, QueueInfo,
     QueueOperationType, QueuedDocumentStatus, SearchOutcome, SearchQueryWithVectors, SearchResult,
-    VectorConfigInternal, VectorData, VectorScore,
+    VectorConfigInternal, VectorData, VectorScore, VectorSearchOption,
 };
 use crate::search_facet::compute_facet_counts;
 
@@ -1566,9 +1566,10 @@ impl QdrantDb {
             }
         }
 
-        // weight_lookup: (vector_name, field) → weight — field resolved like search options
+        // option_lookup: (vector_name, field) → option — field resolved like search options
         // (template vectors omit field in options; storage slot is still `template`).
-        let weight_lookup: HashMap<(String, String), f64> = {
+        // Serves both arm weights and per-arm raw_score_threshold.
+        let option_lookup: HashMap<(String, String), &VectorSearchOption> = {
             let configs: HashMap<&str, &VectorConfigInternal> = collection_config
                 .vectors
                 .iter()
@@ -1581,7 +1582,7 @@ impl QdrantDb {
                 .filter_map(|w| {
                     let config = configs.get(w.vector_name.as_str())?;
                     let field = crate::templates::resolve_search_field(config, w.field).ok()?;
-                    Some(((w.vector_name.clone(), field.to_string()), w.weight))
+                    Some(((w.vector_name.clone(), field.to_string()), w))
                 })
                 .collect()
         };
@@ -1608,16 +1609,17 @@ impl QdrantDb {
             let field_vector_name =
                 format!("{}_{}", vector_data.field, vector_data.vector_name);
 
-            let weight = weight_lookup
+            let option = option_lookup
                 .get(&(vector_data.vector_name.clone(), vector_data.field.to_string()))
-                .copied()
-                .unwrap_or(1.0);
+                .copied();
+            let weight = option.map(|o| o.weight).unwrap_or(1.0);
 
             // Skip weight-0 vectors — they contribute nothing (Python line 610).
             if weight == 0.0 {
                 continue;
             }
             weight_map.insert(field_vector_name.clone(), weight);
+            let raw_score_threshold = option.and_then(|o| o.raw_score_threshold);
 
             let query_variant = if vector_data.vector_type.is_dense() {
                 let dv = vector_data.dense_vector.clone().unwrap_or_default();
@@ -1653,6 +1655,10 @@ impl QdrantDb {
 
             if let Some(ref f) = final_filter {
                 qb = qb.filter(f.clone());
+            }
+
+            if let Some(t) = raw_score_threshold {
+                qb = qb.score_threshold(t as f32);
             }
 
             batch_requests.push(qb.build());

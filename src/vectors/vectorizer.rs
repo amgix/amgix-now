@@ -650,6 +650,7 @@ impl Vectorizer {
                         },
                         weight: equal_weight,
                         wmtr_trigram_weight: DEFAULT_WMTR_TRIGRAM_WEIGHT,
+                        raw_score_threshold: None,
                     })
                     .collect();
             }
