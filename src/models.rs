@@ -702,7 +702,7 @@ pub struct VectorSearchOption {
     /// Optional minimum raw similarity score for this vector option.
     /// Results scoring below this threshold are excluded from this vector's arm
     /// at the database query level, before fusion.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_raw_score_threshold")]
     pub raw_score_threshold: Option<f64>,
 }
 
@@ -730,6 +730,19 @@ impl Hash for VectorSearchOption {
 
 fn default_weight() -> f64 {
     1.0
+}
+
+/// Type errors inside `#[serde(flatten)]` payloads lose the field path in the
+/// serde error, so name the field explicitly in the message.
+fn deserialize_raw_score_threshold<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(d).map_err(|_| {
+        <D::Error as serde::de::Error>::custom(
+            "vector_options.raw_score_threshold: Raw score threshold must be a number",
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
